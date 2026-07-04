@@ -1,0 +1,1 @@
+Compute (387*92+1241) and print exactly 'Final value: <number>'

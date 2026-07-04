@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Omniforge Monitoring Dashboard</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #e4e4e7;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    header {
+      margin-bottom: 30px;
+      text-align: center;
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      background: linear-gradient(90deg, #60a5fa, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 10px;
+    }
+
+    .subtitle {
+      color: #a1a1aa;
+      font-size: 1rem;
+    }
+
+    .last-updated {
+      color: #71717a;
+      font-size: 0.875rem;
+      margin-top: 5px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      margin-bottom: 30px;
+    }
+
+    .card {
+      background: rgba(39, 39, 42, 0.8);
+      border: 1px solid rgba(63, 63, 70, 0.5);
+      border-radius: 12px;
+      padding: 20px;
+      backdrop-filter: blur(10px);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 15px;
+    }
+
+    .card-title {
+      font-size: 1.125rem;
+      font-weight: 600;
+      color: #f4f4f5;
+    }
+
+    .card-icon {
+      font-size: 1.5rem;
+    }
+
+    .metric-value {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+
+    .metric-label {
+      color: #a1a1aa;
+      font-size: 0.875rem;
+    }
+
+    .metric-trend {
+      font-size: 0.875rem;
+      margin-top: 10px;
+    }
+
+    .trend-up {
+      color: #4ade80;
+    }
+
+    .trend-down {
+      color: #f87171;
+    }
+
+    .status-healthy {
+      color: #4ade80;
+    }
+
+    .status-degraded {
+      color: #fbbf24;
+    }
+
+    .status-unhealthy {
+      color: #f87171;
+    }
+
+    .model-list {
+      list-style: none;
+      margin-top: 10px;
+    }
+
+    .model-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(63, 63, 70, 0.5);
+    }
+
+    .model-item:last-child {
+      border-bottom: none;
+    }
+
+    .model-name {
+      color: #d4d4d8;
+      font-size: 0.875rem;
+    }
+
+    .model-count {
+      color: #a1a1aa;
+      font-size: 0.875rem;
+    }
+
+    .status-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .status-badge.healthy {
+      background: rgba(74, 222, 128, 0.2);
+      color: #4ade80;
+    }
+
+    .status-badge.degraded {
+      background: rgba(251, 191, 36, 0.2);
+      color: #fbbf24;
+    }
+
+    .status-badge.unhealthy {
+      background: rgba(248, 113, 113, 0.2);
+      color: #f87171;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: #a1a1aa;
+    }
+
+    .error {
+      background: rgba(239, 68, 68, 0.2);
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      border-radius: 8px;
+      padding: 16px;
+      color: #fca5a5;
+      margin-bottom: 20px;
+    }
+
+    .refresh-btn {
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .refresh-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+    }
+
+    .refresh-btn:active {
+      transform: translateY(0);
+    }
+
+    .header-actions {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-top: 15px;
+    }
+
+    .workflow-status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .workflow-status-item {
+      background: rgba(63, 63, 70, 0.3);
+      padding: 10px;
+      border-radius: 6px;
+      text-align: center;
+    }
+
+    .workflow-status-value {
+      font-size: 1.25rem;
+      font-weight: 700;
+    }
+
+    .workflow-status-label {
+      font-size: 0.75rem;
+      color: #a1a1aa;
+      margin-top: 2px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>⚡ Omniforge Monitoring</h1>
+      <p class="subtitle">Dashboard de Monitoramento em Tempo Real</p>
+      <p class="last-updated" id="lastUpdated">Carregando...</p>
+      <div class="header-actions">
+        <button class="refresh-btn" onclick="fetchData()">🔄 Atualizar</button>
+      </div>
+    </header>
+
+    <div id="error" class="error" style="display: none;"></div>
+
+    <div id="loading" class="loading">
+      <p>Carregando métricas...</p>
+    </div>
+
+    <div id="dashboard" style="display: none;">
+      <div class="grid">
+        <!-- Workflows Ativos -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Workflows Ativos</h2>
+            <span class="card-icon">📊</span>
+          </div>
+          <div class="metric-value" id="activeWorkflows">0</div>
+          <div class="metric-label">Total de workflows ativos</div>
+          <div class="workflow-status-grid" id="workflowStatusGrid"></div>
+        </div>
+
+        <!-- Taxa de Sucesso -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Taxa de Sucesso</h2>
+            <span class="card-icon">✅</span>
+          </div>
+          <div class="metric-value" id="successRate">0%</div>
+          <div class="metric-label">Última hora</div>
+          <div class="metric-trend" id="successRateTrend"></div>
+        </div>
+
+        <!-- Custo Recente -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Custo (Última Hora)</h2>
+            <span class="card-icon">💰</span>
+          </div>
+          <div class="metric-value" id="recentCost">$0.00</div>
+          <div class="metric-label">Custo acumulado</div>
+        </div>
+
+        <!-- Tasks Paralelas -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Tasks Paralelas</h2>
+            <span class="card-icon">⚡</span>
+          </div>
+          <div class="metric-value" id="parallelTasks">0</div>
+          <div class="metric-label">Tasks em execução</div>
+          <div class="metric-trend">
+            <span class="trend-up">Completadas (1h): <span id="completedTasks">0</span></span>
+          </div>
+          <div class="metric-trend">
+            <span class="trend-down">Falhadas (1h): <span id="failedTasks">0</span></span>
+          </div>
+        </div>
+
+        <!-- Health Status -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Daemon Health</h2>
+            <span class="card-icon">❤️</span>
+          </div>
+          <div id="daemonStatus">
+            <span class="status-badge healthy">Healthy</span>
+          </div>
+          <div class="metric-label" style="margin-top: 10px;">Heartbeat: <span id="heartbeatAge">-</span></div>
+        </div>
+
+        <!-- Modelos Mais Usados -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Top 5 Modelos</h2>
+            <span class="card-icon">🤖</span>
+          </div>
+          <ul class="model-list" id="modelList"></ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = window.location.origin;
+    const UPDATE_INTERVAL = 30000; // 30 segundos
+
+    async function fetchData() {
+      const loadingEl = document.getElementById('loading');
+      const dashboardEl = document.getElementById('dashboard');
+      const errorEl = document.getElementById('error');
+
+      loadingEl.style.display = 'block';
+      dashboardEl.style.display = 'none';
+      errorEl.style.display = 'none';
+
+      try {
+        const token = getAuthToken();
+        const response = await fetch(`${API_BASE}/api/monitoring/summary`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        updateDashboard(data);
+
+        loadingEl.style.display = 'none';
+        dashboardEl.style.display = 'block';
+
+        document.getElementById('lastUpdated').textContent = `Última atualização: ${new Date().toLocaleString('pt-BR')}`;
+      } catch (error) {
+        loadingEl.style.display = 'none';
+        errorEl.style.display = 'block';
+        errorEl.textContent = `Erro ao carregar dados: ${error.message}`;
+        console.error('Error fetching monitoring data:', error);
+      }
+    }
+
+    function getAuthToken() {
+      // Tenta obter o token de várias fontes
+      const cookieMatch = document.cookie.match(/omniforge_daemon_token=([^;]+)/);
+      if (cookieMatch) return cookieMatch[1];
+
+      const urlParams = new URLSearchParams(window.location.search);
+      const tokenParam = urlParams.get('token');
+      if (tokenParam) return tokenParam;
+
+      // Fallback para localStorage ou prompt
+      const storedToken = localStorage.getItem('omniforge_daemon_token');
+      if (storedToken) return storedToken;
+
+      const promptedToken = prompt('Digite o token do daemon Omniforge:');
+      if (promptedToken) {
+        localStorage.setItem('omniforge_daemon_token', promptedToken);
+        return promptedToken;
+      }
+
+      return '';
+    }
+
+    function updateDashboard(data) {
+      // Workflows ativos
+      document.getElementById('activeWorkflows').textContent = data.workflows.active_count;
+
+      // Status dos workflows
+      const statusGrid = document.getElementById('workflowStatusGrid');
+      statusGrid.innerHTML = '';
+      for (const [status, count] of Object.entries(data.workflows.active_by_status)) {
+        const item = document.createElement('div');
+        item.className = 'workflow-status-item';
+        item.innerHTML = `
+          <div class="workflow-status-value">${count}</div>
+          <div class="workflow-status-label">${status}</div>
+        `;
+        statusGrid.appendChild(item);
+      }
+
+      // Taxa de sucesso
+      const successRate = data.workflows.recent_success_rate.toFixed(1);
+      document.getElementById('successRate').textContent = `${successRate}%`;
+      const successTrend = document.getElementById('successRateTrend');
+      if (data.workflows.recent_success_rate >= 70) {
+        successTrend.innerHTML = '<span class="trend-up">✓ Acima do threshold (70%)</span>';
+      } else {
+        successTrend.innerHTML = '<span class="trend-down">⚠ Abaixo do threshold (70%)</span>';
+      }
+
+      // Custo recente
+      document.getElementById('recentCost').textContent = `$${data.workflows.recent_cost_usd.toFixed(4)}`;
+
+      // Tasks paralelas
+      document.getElementById('parallelTasks').textContent = data.tasks.parallel_active;
+      document.getElementById('completedTasks').textContent = data.tasks.completed_last_hour;
+      document.getElementById('failedTasks').textContent = data.tasks.failed_last_hour;
+
+      // Daemon health
+      const daemonStatusEl = document.getElementById('daemonStatus');
+      const statusClass = data.daemon_health.status;
+      daemonStatusEl.innerHTML = `<span class="status-badge ${statusClass}">${statusClass.toUpperCase()}</span>`;
+      document.getElementById('heartbeatAge').textContent = 
+        data.daemon_health.heartbeat_age_ms ? `${(data.daemon_health.heartbeat_age_ms / 1000).toFixed(1)}s` : '-';
+
+      // Modelos mais usados
+      const modelList = document.getElementById('modelList');
+      modelList.innerHTML = '';
+      if (data.models.top_5.length === 0) {
+        modelList.innerHTML = '<li class="model-item"><span class="model-name">Nenhum dado disponível</span></li>';
+      } else {
+        for (const model of data.models.top_5) {
+          const li = document.createElement('li');
+          li.className = 'model-item';
+          li.innerHTML = `
+            <span class="model-name">${model.model}</span>
+            <span class="model-count">${model.count}x</span>
+          `;
+          modelList.appendChild(li);
+        }
+      }
+    }
+
+    // Carregar dados iniciais
+    fetchData();
+
+    // Atualizar automaticamente a cada 30 segundos
+    setInterval(fetchData, UPDATE_INTERVAL);
+  </script>
+</body>
+</html>

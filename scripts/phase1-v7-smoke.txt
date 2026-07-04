@@ -1,0 +1,25 @@
+Smoke test PAL consensus + multi-CLI dispatch (round 7, após fix de aliases).
+
+Contexto: as rounds anteriores (v5 e v6) falharam no PAL consensus por dois motivos sequenciais — primeiro schema strict-mode rejeitou os args base, depois OpenRouter rejeitou os IDs Omniroute. O fix recém-shippado (commit 73bec29) troca os IDs por aliases nativos do PAL (sonnet/gpt54/gc-pro) que roteiam via Custom/Local API → Omniroute. Esta workflow valida ponta-a-ponta.
+
+Plano sugerido (decomposer livre para refinar):
+
+t0: HITL plan-review gate (depends_on=[], hitl=true) — operador aprova o plano antes de gastar tokens.
+
+t1: PAL consensus (kind=pal_call, executor_hint=pal:consensus) — pergunta: "Qual a melhor ordem de execução para a Fase 1 do roadmap Omniforge (7 melhorias estratégicas: Glob/Grep nativo, WebFetch/WebSearch, apply-patch, image routing, project rules, Ollama fallback, docs consolidation)? Justifique trade-offs entre paralelismo e dependências." Modelos consultados internamente: sonnet, gpt54, gc-pro (configurados no executor via aliases PAL).
+
+t2 (depends_on=[t1]): Claude Sonnet 4.6 (kind=cli_spawn, executor_hint=cli:claude) — escreve RFC curto (~200 palavras) sobre Native Glob/Grep tools no Omniforge. Foco em integração com src/v2/tools/core/.
+
+t3 (depends_on=[t1]): Codex GPT 5.4 (kind=cli_spawn, executor_hint=cli:codex) — escreve RFC curto sobre WebFetch/WebSearch wrappers. Foco em segurança SSRF e timeout policies.
+
+t4 (depends_on=[t1]): Gemini 3.1 Pro (kind=cli_spawn, executor_hint=cli:gemini) — escreve RFC curto sobre image routing para multimodal LLMs (qual rota usa multimodal vs text-only).
+
+t5 (depends_on=[t2,t3,t4]): Consolidator (kind=llm_call) — agrega os 3 RFCs em um relatório único com seção "ordem recomendada" derivada da resposta do consensus em t1.
+
+Acceptance criteria:
+- t1 PAL consensus retorna resposta sem HTTP 400 / "Additional properties" / "not a valid model ID".
+- t2/t3/t4 produzem RFCs em paralelo (mostram que cli_spawn funciona com 3 binários distintos).
+- t5 consolida tudo em <500 palavras.
+- Workflow completo termina em status=completed sem retries adicionais.
+
+Workspace: internal. Sem auto-approve (manual review do plano).

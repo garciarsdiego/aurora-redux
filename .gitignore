@@ -1,0 +1,55 @@
+node_modules/
+dist/
+*.db
+*.db-*
+*.tsbuildinfo
+workspaces/*/.env
+workspaces/*/runs/
+data/*
+!data/.gitkeep
+.env
+.env.workspace.local
+.npmrc
+__pycache__/
+out/
+tmp/
+test-results/
+_artifacts/
+audit_pack_tmp/
+test-output/
+.DS_Store
+/data/artifacts/
+workspaces/*/artifacts/
+_external/
+tetris*.html
+tetris*.yaml
+coverage/
+*.log
+*.pid
+
+# Hermes — runtime artifacts (OS-specific, never commit)
+hermes/.venv/
+hermes-gateway*.log
+workspaces/*/.hitl.json
+scripts/omniroute-mcp*
+
+# Dispatch artifacts — per-onda kickoff scripts and workflow id snapshots
+.claude/onda*-dispatch.mjs
+.claude/onda*-workflow-id*.json
+.claude/onda*-bodies/
+
+# Worktrees — never commit nested worktree contents back to main
+.claude/worktrees/
+.claire/
+.codex/
+apps/desktop/src-tauri/target/
+pnpm-lock.yaml.bak
+
+# Nexus — temporary working directory
+.nexus/
+
+# Reports — temporary execution artifacts
+reports/
+
+# Backup files — never commit (BRAIN-06/DB-06)
+*.backup*

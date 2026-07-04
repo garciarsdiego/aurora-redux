@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "omniroute": {
+      "url": "http://localhost:20228/api/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer CHANGE_ME"
+      }
+    },
+    "omniforge": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./bin/omniforge",
+        "mcp-server"
+      ],
+      "env": {
+        "DOTENV_CONFIG_QUIET": "true"
+      }
+    }
+  }
+}

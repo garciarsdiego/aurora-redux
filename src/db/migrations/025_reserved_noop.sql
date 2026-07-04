@@ -1,0 +1,3 @@
+-- Reserved migration number.
+-- No schema change. Kept so migration ordering remains continuous after
+-- parallel Onda branches landed migrations 028-032 first.

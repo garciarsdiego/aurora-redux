@@ -1,0 +1,118 @@
+{
+  "name": "omniforge",
+  "version": "0.3.0",
+  "type": "module",
+  "bin": {
+    "omniforge": "./bin/omniforge"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.repl.json --noEmit && tsup && node scripts/copy-schema.mjs && node scripts/stamp-version.mjs && node scripts/copy-monitoring-dashboard.mjs",
+    "build:legacy": "tsc && node scripts/copy-schema.mjs",
+    "test": "vitest run",
+    "test:legacy-forks": "vitest run --pool=forks --maxWorkers=1",
+    "test:security": "vitest run tests/security/",
+    "secret:scan": "tsx scripts/secret-scan.ts",
+    "security:scan": "node scripts/security-scan.mjs",
+    "smoke:launch": "tsx scripts/smoke-launch.ts",
+    "smoke:quality-gates": "tsx scripts/smoke-quality-gates.ts",
+    "smoke:runtime-adapter-probes": "tsx scripts/probe-runtime-adapters.ts --dry-run",
+    "eval:golden": "tsx scripts/run-golden-evals.ts",
+    "eval:run": "node scripts/run-eval-suite.mjs",
+    "eval:quick": "node scripts/run-eval-suite.mjs --mode quick",
+    "eval:full": "node scripts/run-eval-suite.mjs --mode full",
+    "eval:regression": "node scripts/run-eval-suite.mjs --mode regression",
+    "eval:update-baseline": "node scripts/update-baseline.mjs",
+    "dev": "tsx src/cli/index.ts",
+    "dev:repl": "tsx watch --clear-screen=false src/repl/index.tsx",
+    "dev:daemon": "node scripts/dev-daemon.mjs",
+    "dev:daemon:isolated": "tsx scripts/start-isolated-http-daemon.ts",
+    "perf:benchmark": "node scripts/performance-benchmark.mjs",
+    "setup:omniroute-sandbox": "node scripts/setup-omniroute-sandbox.mjs",
+    "seed:test-fixtures": "node scripts/seed-test-fixtures.mjs",
+    "docs:validate-links": "node scripts/validate-docs-links.mjs",
+    "check:todos": "node scripts/check-todos.mjs",
+    "analyze:complexity": "node scripts/analyze-complexity.mjs",
+    "lint": "eslint src",
+    "lint:fix": "eslint --fix src",
+    "plan:status": "node -e \"const fs=require('fs');const t=fs.readFileSync('docs/UPGRADE-PLAN.md','utf8');const d=(t.match(/\\[x\\]/gi)||[]).length;const u=(t.match(/\\[ \\]/gi)||[]).length;const total=d+u;const pct=total?Math.round(d/total*100):0;console.log('\\n📊 Omniforge Plan Status');console.log('Done: '+d+' / '+total+' tasks ('+pct+'%)');console.log('Remaining: '+u+' tasks\\n');\"",
+    "plan:week": "node -e \"const fs=require('fs');try{const t=fs.readFileSync('docs/UPGRADE-PLAN.md','utf8');const m=t.match(/### WEEK 1[^#]+/);console.log(m?m[0]:'See docs/UPGRADE-PLAN.md');}catch(e){console.log('See docs/UPGRADE-PLAN.md');}\"",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "src/**/*.ts": [
+      "eslint --fix"
+    ],
+    "apps/dashboard-v2/src/**/*.{ts,tsx}": [
+      "eslint --fix"
+    ]
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "@inkjs/ui": "2.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tanstack/react-query": "^5.100.5",
+    "@xyflow/react": "^12.10.2",
+    "archiver": "^7.0.1",
+    "better-sqlite3": "^12.9.0",
+    "chokidar": "^4.0.1",
+    "commander": "^14.0.3",
+    "dotenv": "^17.4.2",
+    "eventsource-parser": "^3.0.1",
+    "ink": "5.2.1",
+    "ink-gradient": "3.0.0",
+    "ink-syntax-highlight": "2.0.2",
+    "js-yaml": "^4.1.1",
+    "lucide-react": "^1.11.0",
+    "pino": "^10.3.1",
+    "react": "18.3.1",
+    "react-dom": "^18.3.1",
+    "react-resizable-panels": "^4.10.0",
+    "tree-kill": "^1.2.2",
+    "undici": "^8.3.0",
+    "zod": "^4.3.6",
+    "zustand": "4.5.7"
+  },
+  "devDependencies": {
+    "@alloc/quick-lru": "^5.2.0",
+    "@playwright/test": "^1.59.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/archiver": "^6.0.3",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^25.6.0",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/coverage-v8": "^4.1.4",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "husky": "^9.1.7",
+    "ink-testing-library": "^4.0.0",
+    "jsdom": "^29.1.0",
+    "lint-staged": "^17.0.5",
+    "picocolors": "^1.1.1",
+    "strip-ansi": "^7.1.0",
+    "tsup": "^8.3.5",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.59.4",
+    "vite": "^8.0.10",
+    "vitest": "^4.1.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ],
+    "overrides": {
+      "react": "18.3.1",
+      "ip-address": "10.1.1",
+      "@types/react": "18.3.12",
+      "@types/react-dom": "18.3.1"
+    }
+  },
+  "description": "Aurora-Redux — personal multi-CLI/multi-provider LLM orchestration engine (runs without a gateway service).",
+  "license": "MIT"
+}

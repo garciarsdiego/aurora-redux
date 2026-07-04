@@ -1,0 +1,19 @@
+Multi-CLI parallel dispatch smoke test (round 8 — sem PAL, direto cli_spawn).
+
+Round 7 (wf_6ef3fd71) falhou no PAL consensus pelo prefix mismatch entre PAL custom_models.json (claude_cli/) e Omniroute (cc/). Issue documentada em docs/notes/2026-04-30-pal-omniroute-prefix-mismatch.md. v8 valida apenas a parte mais importante da Fase 1: cli_spawn paralelo com 3 CLIs distintos, sem dependência de PAL.
+
+Plano sugerido (decomposer livre, mas espera-se shape parecida):
+
+t0: HITL plan-review gate (depends_on=[], hitl=true).
+
+t1 (depends_on=[t0]): kind=cli_spawn, executor_hint=cli:claude — Claude Code escreve um arquivo Markdown curto (~80 palavras) chamado workspaces/internal/runs/<wfId>/rfc-glob-grep.md descrevendo "Native Glob/Grep tools for Omniforge: por que vale a pena adicionar como tool_call kind, qual schema args teria (pattern + path), trade-off vs cli_spawn shell+grep". Acceptance criteria: arquivo existe, contém pelo menos 50 palavras, menciona "Glob" e "Grep".
+
+t2 (depends_on=[t0]): kind=cli_spawn, executor_hint=cli:codex — Codex GPT 5.4 escreve workspaces/internal/runs/<wfId>/rfc-webfetch-ssrf.md (~80 palavras) sobre "WebFetch/WebSearch wrappers: SSRF risk surface (file://, localhost, RFC1918), timeout policy (30s default, 60s max), allowlist domains". Acceptance criteria: arquivo existe, ≥50 palavras, menciona "SSRF" e "timeout".
+
+t3 (depends_on=[t0]): kind=cli_spawn, executor_hint=cli:gemini — Gemini 3.1 Pro escreve workspaces/internal/runs/<wfId>/rfc-image-routing.md (~80 palavras) sobre "Image routing for multimodal LLMs: detect input has image attachments, filter omniroute model catalog by capabilities.vision=true, prefer cc/claude-sonnet-4-6 ou gemini-cli/gemini-3.1-pro-preview". Acceptance criteria: arquivo existe, ≥50 palavras, menciona "multimodal" e "vision".
+
+t4 (depends_on=[t1,t2,t3]): kind=llm_call, model=cc/claude-sonnet-4-6 — Consolidator lê os 3 RFCs (via input_selectors automáticos do executor) e emite um Phase-1 strategy report curto (<400 palavras) com seções: ## Resumo dos 3 RFCs / ## Ordem recomendada de implementação / ## Riscos cruzados. Acceptance criteria: output ≥200 palavras, ≤400 palavras, contém as 3 seções nomeadas, cita explicitamente os 3 RFCs upstream.
+
+Workspace: internal. Sem auto-approve (operador aprova plano em t0). Sem PAL — esta é a versão "hardware-only" que valida o multi-CLI dispatch diretamente.
+
+Sucesso = workflow completo terminar em status=completed sem retries; t1, t2, t3 rodam em paralelo (decomposer DEVE colocar todos com depends_on=[t0]); t4 só dispara após os 3 RFCs prontos.

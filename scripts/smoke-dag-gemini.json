@@ -1,0 +1,13 @@
+{
+  "tasks": [
+    {
+      "id": "t1",
+      "name": "Generate haiku via Gemini",
+      "kind": "cli_spawn",
+      "depends_on": [],
+      "executor_hint": "cli:gemini",
+      "model": "gemini-cli/gemini-2.5-pro",
+      "acceptance_criteria": "Output contains exactly 3 lines forming a haiku, with non-empty content per line."
+    }
+  ]
+}

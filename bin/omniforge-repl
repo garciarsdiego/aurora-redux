@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+// Direct REPL entry — bypasses TTY routing of `bin/omniforge`.
+// Useful for: dev mode, --debug runs, scripted smoke tests in CI.
+//
+// Production usage: prefer `omniforge` (auto-detects TTY → routes here).
+import('../dist/repl/bundle.js');

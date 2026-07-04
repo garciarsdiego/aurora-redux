@@ -1,0 +1,13 @@
+{
+  "_comment": "A task with acceptance_criteria auto-triggers the reviewer (REVIEWER_MODEL). Run: omniforge run-dag examples/03-auto-review.json -w internal --auto-approve",
+  "tasks": [
+    {
+      "id": "t1",
+      "name": "Write ONE sentence recommending the best HTTP caching strategy for a read-heavy public API, explicitly choosing among ETag, Cache-Control max-age, and stale-while-revalidate.",
+      "kind": "llm_call",
+      "depends_on": [],
+      "model": "glm/glm-5.2",
+      "acceptance_criteria": "The answer must recommend ONE specific strategy and justify it in at least one clause; it must not merely list all three without choosing."
+    }
+  ]
+}

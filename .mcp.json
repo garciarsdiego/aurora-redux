@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "omniforge": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./bin/omniforge", "mcp-server"],
+      "env": {
+        "DOTENV_CONFIG_QUIET": "true"
+      }
+    }
+  }
+}

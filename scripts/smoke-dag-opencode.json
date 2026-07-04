@@ -1,0 +1,13 @@
+{
+  "tasks": [
+    {
+      "id": "t1",
+      "name": "Generate haiku via Opencode",
+      "kind": "cli_spawn",
+      "depends_on": [],
+      "executor_hint": "cli:opencode",
+      "model": "zai-coding-plan/glm-4.7",
+      "acceptance_criteria": "Output contains exactly 3 lines forming a haiku, with non-empty content per line."
+    }
+  ]
+}

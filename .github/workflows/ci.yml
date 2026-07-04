@@ -1,0 +1,306 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual triggering for testing
+
+env:
+  NODE_VERSION: 22
+  PNPM_VERSION: 10.26.0
+
+jobs:
+  # Sprint 7 Enhancement: Performance test suite
+  performance-tests:
+    name: performance tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Run performance tests
+        run: pnpm test tests/performance/ --reporter=verbose
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-results
+          path: |
+            coverage/
+            performance-results.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Sprint 7 Enhancement: Security test suite
+  security-tests:
+    name: security tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Run security tests
+        run: pnpm test tests/security/ --reporter=verbose
+
+      - name: Secret scan
+        run: pnpm secret:scan
+
+      - name: Dependency vulnerability audit
+        run: |
+          echo "=== Production Dependency Audit ==="
+          pnpm audit --prod || true
+          echo "=== Development Dependency Audit ==="
+          pnpm audit || true
+
+      - name: Upload security results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-results
+          path: |
+            coverage/
+            security-results.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Sprint 0 Enhancement: Security scanning job (CodeQL)
+  security-scan-codeql:
+    name: security scan (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          languages: javascript, typescript
+
+  build-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Secret scan
+        run: pnpm secret:scan
+
+      - name: Golden evals
+        run: pnpm eval:golden
+
+      - name: Test (with coverage)
+        run: pnpm test --coverage --reporter=verbose
+
+      - name: Upload coverage summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: |
+            coverage/coverage-summary.json
+            coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Production dependency audit
+        run: pnpm audit --prod
+
+      # Sprint 7 Enhancement: Coverage thresholds (>90%)
+      - name: Check coverage thresholds
+        if: always()
+        run: |
+          echo "=== Coverage Threshold Check (Sprint 7) ==="
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "Coverage summary generated successfully"
+            # Check for >90% coverage
+            cat coverage/coverage-summary.json | jq '.total.lines.pct'
+            COVERAGE=$(cat coverage/coverage-summary.json | jq '.total.lines.pct')
+            if (( $(echo "$COVERAGE < 90" | bc -l) )); then
+              echo "❌ Coverage below 90%: $COVERAGE%"
+              exit 1
+            else
+              echo "✅ Coverage meets threshold: $COVERAGE%"
+            fi
+          else
+            echo "Warning: Coverage summary not found"
+          fi
+
+  e2e:
+    name: playwright e2e
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Wave 3 (M1-W3-C): allow the e2e job to fail while we wire it up.
+    # Remove `continue-on-error: true` once the e2e job is green for 5
+    # consecutive runs on main.
+    continue-on-error: true
+    env:
+      # CI has no Omniroute instance; skip the startup catalog validation
+      # that would otherwise block the daemon from binding :20129.
+      OMNIFORGE_SKIP_MODEL_VALIDATION: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Build
+        run: pnpm build
+
+      - name: Prepare data dir
+        run: mkdir -p data
+
+      - name: Start daemon (background) + capture token
+        run: |
+          # Bind a stable token so Playwright's _helpers.ts can read it.
+          export OMNIFORGE_DAEMON_TOKEN="ci-e2e-$(openssl rand -hex 16)"
+          echo "$OMNIFORGE_DAEMON_TOKEN" > data/daemon-token.txt
+          echo "OMNIFORGE_DAEMON_TOKEN=$OMNIFORGE_DAEMON_TOKEN" >> $GITHUB_ENV
+          # Start the daemon in background; redirect logs to file we can dump
+          # on failure for triage.
+          nohup node ./bin/omniforge daemon start > data/daemon-stdout.log 2>&1 &
+          # Write the nohup shell PID to a SEPARATE file so it does not
+          # collide with data/daemon.pid, which the daemon manages itself.
+          # Pre-writing data/daemon.pid caused the daemon to read its own
+          # nohup PID, see the process as alive, and exit with "Daemon
+          # already running" before the HTTP server ever bound to :20129.
+          echo $! > data/ci-nohup.pid
+          # Wait for /health to come up (max ~60s).
+          # 60s budget: SQLite runs 46 migrations on first boot in CI,
+          # which can take 20-30s on a cold runner.
+          for i in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:20129/health" > /dev/null; then
+              echo "[ci] daemon ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf "http://127.0.0.1:20129/health" > /dev/null; then
+            echo '[ci] daemon never came up'
+            echo '--- daemon-stdout.log (parent launcher output) ---'
+            tail -100 data/daemon-stdout.log || true
+            echo '--- daemon.log (child HTTP server output) ---'
+            tail -200 data/daemon.log || echo '(not found)'
+            exit 1
+          fi
+
+      - name: Seed E2E fixtures
+        run: |
+          # Run the seed once up-front so FK / schema issues surface here
+          # rather than inside a Playwright `beforeAll` (every spec also
+          # self-seeds, so this is belt+suspenders).
+          pnpm exec tsx -e "(async () => { const m = await import('./tests/e2e/_helpers.js'); await m.seedE2EFixtures(); console.log('[ci] e2e fixtures seeded'); })().catch(e => { console.error(e); process.exit(1); });"
+
+      - name: Run Playwright E2E specs
+        env:
+          OMNIFORGE_DAEMON_TOKEN: ${{ env.OMNIFORGE_DAEMON_TOKEN }}
+        run: pnpm exec playwright test tests/e2e/ --workers=1
+
+      - name: Stop daemon (always)
+        if: always()
+        run: |
+          node ./bin/omniforge daemon stop || true
+          # Fallback: kill the nohup shell we tracked in ci-nohup.pid.
+          # (data/daemon.pid is owned by the daemon itself.)
+          if [ -f data/ci-nohup.pid ]; then
+            kill "$(cat data/ci-nohup.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            tests/e2e-result.json
+            data/daemon-stdout.log
+            data/daemon.log
+          if-no-files-found: ignore
+          retention-days: 14

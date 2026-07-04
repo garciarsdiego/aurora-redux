@@ -1,0 +1,12 @@
+{
+  "_comment": "Delegate a task to a full coding-agent CLI (claude/codex/gemini) in an isolated git worktree. Change executor_hint to cli:claude or cli:codex as desired. Run: omniforge run-dag examples/04-cli-spawn-agent.json -w internal --auto-approve",
+  "tasks": [
+    {
+      "id": "t1",
+      "name": "Create a file named hello-redux.txt in the current working directory containing exactly the line: aurora-redux works",
+      "kind": "cli_spawn",
+      "depends_on": [],
+      "executor_hint": "cli:gemini"
+    }
+  ]
+}

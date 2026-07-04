@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// Omniforge entry shim (D-H2.022 + D-H2.031).
+//
+// Routing:
+//   omniforge                      → REPL TUI (if TTY) or help (non-TTY)
+//   omniforge <subcommand> [args]  → Commander legacy/atomic mode
+//   omniforge --no-tui             → forced legacy
+//   omniforge --version            → bypasses both
+//
+// Pre-Ink banner (~85ms): single raw write so user sees feedback in <100ms
+// even before Ink/React/Yoga finish loading (~600-900ms cold).
+
+// Example smoke test 2026-04-30: when this binary is spawned by a host that
+// doesn't honor `cwd` in MCP config (Claude Desktop on Windows is the
+// observed case — it spawns MCP servers from C:\Windows\system32), the
+// daemon then tries to mkdir `data/...` under that system path and fails
+// with EPERM. Many Omniforge paths resolve relative to process.cwd()
+// (`data/omniforge.db`, `workspaces/<ws>/runs/<wfId>/`, etc.). Pin cwd to
+// the repo root (this script's parent dir) so bin/omniforge is
+// path-agnostic regardless of who spawned it. Operators who need a
+// different cwd can set OMNIFORGE_REPO_ROOT to override.
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const repoRoot = process.env.OMNIFORGE_REPO_ROOT
+  ? resolve(process.env.OMNIFORGE_REPO_ROOT)
+  : resolve(__dirname, '..');
+try {
+  process.chdir(repoRoot);
+} catch (err) {
+  process.stderr.write(`[omniforge] WARN: could not chdir to ${repoRoot}: ${err.message}\n`);
+}
+
+const args = process.argv.slice(2);
+const noTui = process.env.OMNIFORGE_NO_TUI === '1' || args.includes('--no-tui');
+const versionOnly = args.length === 1 && (args[0] === '--version' || args[0] === '-V');
+const helpOnly = args.length === 1 && (args[0] === '--help' || args[0] === '-h');
+const noSubcommand = args.length === 0 || args.every(a => a.startsWith('-'));
+const isTTY = process.stdout.isTTY === true && process.stdin.isTTY === true;
+
+// Atomic / legacy paths bypass REPL entirely.
+if (versionOnly || helpOnly || noTui || !noSubcommand || !isTTY) {
+  await import('../dist/cli/index.js');
+} else {
+  // REPL: write banner before importing the heavy bundle.
+  process.stdout.write('omniforge\n');
+  process.env.OMNIFORGE_BANNER_PRINTED = '1';
+  // Default workspace = 'internal' — same default as `omniforge run`.
+  // Explicit overrides via `omniforge repl --workspace <X>` go through Commander.
+  if (!process.env.OMNIFORGE_REPL_WORKSPACE) {
+    process.env.OMNIFORGE_REPL_WORKSPACE = 'internal';
+  }
+  try {
+    await import('../dist/repl/bundle.js');
+  } catch (err) {
+    // Fallback to legacy if REPL bundle is missing (e.g. user hasn't built yet).
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[omniforge] REPL bundle unavailable (${msg}); falling back to legacy CLI.\n`);
+    process.stderr.write(`[omniforge] Run \`pnpm build\` to enable REPL mode.\n`);
+    await import('../dist/cli/index.js');
+  }
+}

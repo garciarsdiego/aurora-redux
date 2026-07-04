@@ -1,0 +1,321 @@
+name: Agent Harness Evals
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      eval_mode:
+        description: 'Eval mode: quick (subset), full (all), regression (golden only)'
+        required: true
+        default: 'quick'
+        type: choice
+        options:
+          - quick
+          - full
+          - regression
+      workspace:
+        description: 'Workspace to run evals in'
+        required: true
+        default: 'ci'
+        type: string
+  schedule:
+    # Run daily regression check at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  NODE_VERSION: 22
+  PNPM_VERSION: 10.26.0
+  # CI has no Omniroute instance; skip model validation
+  OMNIFORGE_SKIP_MODEL_VALIDATION: "true"
+  # Use placeholder API keys for CI (evals use deterministic metrics where possible)
+  OMNIROUTE_API_KEY: "ci-placeholder-key"
+  TELEGRAM_BOT_TOKEN: "ci-placeholder-token"
+
+jobs:
+  eval-suite:
+    name: eval suite (${{ github.event.inputs.eval_mode || 'quick' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build project
+        run: pnpm build
+
+      - name: Run database migrations
+        run: |
+          # Ensure data directory exists
+          mkdir -p data
+          # Run migrations (handled automatically by DB client on first access)
+          echo "Migrations will run automatically on first DB access"
+
+      - name: Prepare data directory
+        run: mkdir -p data dist
+
+      - name: Run eval suite
+        id: evals
+        env:
+          EVAL_MODE: ${{ github.event.inputs.eval_mode || 'quick' }}
+          EVAL_WORKSPACE: ${{ github.event.inputs.workspace || 'ci' }}
+          # Cost threshold in USD
+          EVAL_MAX_COST_USD: 2.00
+          # Regression threshold (fail if score drop > 5%)
+          EVAL_REGRESSION_THRESHOLD: 0.05
+        run: |
+          node scripts/run-eval-suite.mjs \
+            --mode "$EVAL_MODE" \
+            --workspace "$EVAL_WORKSPACE" \
+            --max-cost "$EVAL_MAX_COST_USD" \
+            --regression-threshold "$EVAL_REGRESSION_THRESHOLD" \
+            --output dist/eval-report.json
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.sha }}
+          path: dist/eval-report.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload eval logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-logs-${{ github.sha }}
+          path: |
+            data/omniforge.db
+            data/eval-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Post results to PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'dist/eval-report.json';
+            
+            let comment = '## 🧪 Agent Harness Eval Results\n\n';
+            
+            if (fs.existsSync(reportPath)) {
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              
+              comment += `**Mode:** ${report.mode}\n`;
+              comment += `**Workspace:** ${report.workspace}\n`;
+              comment += `**Status:** ${report.passed ? '✅ PASSED' : '❌ FAILED'}\n\n`;
+              
+              comment += '### Summary\n\n';
+              comment += `| Metric | Score | Threshold | Passed |\n`;
+              comment += `|--------|-------|-----------|--------|\n`;
+              
+              for (const [metric, data] of Object.entries(report.metrics)) {
+                const score = (data.mean * 100).toFixed(1);
+                const threshold = (data.threshold * 100).toFixed(1);
+                const passed = data.passRate >= data.threshold ? '✅' : '❌';
+                comment += `| ${metric} | ${score}% | ${threshold}% | ${passed} |\n`;
+              }
+              
+              comment += `\n**Total Cost:** $${report.totalCostUsd.toFixed(4)} USD\n`;
+              comment += `**Duration:** ${(report.durationMs / 1000).toFixed(1)}s\n`;
+              
+              if (report.regressions && report.regressions.length > 0) {
+                comment += '\n### ⚠️ Regressions Detected\n\n';
+                for (const reg of report.regressions) {
+                  comment += `- ${reg.metric}: ${reg.baselineMean.toFixed(3)} → ${reg.currentMean.toFixed(3)} (${reg.deltaPct > 0 ? '+' : ''}${reg.deltaPct.toFixed(1)}%)\n`;
+                }
+              }
+              
+              if (report.failedCases && report.failedCases.length > 0) {
+                comment += `\n### Failed Cases (${report.failedCases.length})\n\n`;
+                for (const failure of report.failedCases.slice(0, 5)) {
+                  comment += `- ${failure.name}: ${failure.reason}\n`;
+                }
+                if (report.failedCases.length > 5) {
+                  comment += `... and ${report.failedCases.length - 5} more\n`;
+                }
+              }
+            } else {
+              comment += '⚠️ Eval report not found. Check the workflow logs for details.\n';
+            }
+            
+            comment += '\n---\n';
+            comment += '*Full details available in workflow artifacts.*';
+            
+            // Post comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('Agent Harness Eval Results')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+
+  # Separate job for A/B test validation (only runs on manual dispatch or when variants change)
+  ab-test-validation:
+    name: A/B test validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[ab-test]'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build project
+        run: pnpm build
+
+      - name: Prepare data directory
+        run: mkdir -p data dist
+
+      - name: Run A/B test validation
+        env:
+          EVAL_WORKSPACE: ${{ github.event.inputs.workspace || 'ci' }}
+          EVAL_MAX_COST_USD: 2.00
+        run: |
+          # This would run the A/B test runner when implemented
+          # For now, skip with a message
+          echo "A/B test validation not yet implemented"
+          echo "This job will run the A/B test runner from src/v2/evals/runners/ab-test.ts"
+
+  # Daily regression check (separate job for clearer reporting)
+  daily-regression:
+    name: daily regression check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build project
+        run: pnpm build
+
+      - name: Prepare data directory
+        run: mkdir -p data dist
+
+      - name: Run regression evals
+        env:
+          EVAL_MODE: regression
+          EVAL_WORKSPACE: ci
+          EVAL_MAX_COST_USD: 2.00
+          EVAL_REGRESSION_THRESHOLD: 0.05
+        run: |
+          node scripts/run-eval-suite.mjs \
+            --mode regression \
+            --workspace ci \
+            --max-cost 2.00 \
+            --regression-threshold 0.05 \
+            --output dist/eval-report.json
+
+      - name: Upload regression report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-report-${{ github.sha }}
+          path: dist/eval-report.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Create issue on regression failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'dist/eval-report.json';
+            
+            let body = '## 🚨 Daily Regression Check Failed\n\n';
+            body += `**Commit:** ${context.sha}\n`;
+            body += `**Branch:** ${context.ref}\n`;
+            body += `**Run:** ${context.runNumber}\n\n`;
+            
+            if (fs.existsSync(reportPath)) {
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              body += `**Status:** ${report.passed ? '✅ PASSED' : '❌ FAILED'}\n\n`;
+              
+              if (report.regressions && report.regressions.length > 0) {
+                body += '### Regressions Detected\n\n';
+                for (const reg of report.regressions) {
+                  body += `- ${reg.metric}: ${reg.baselineMean.toFixed(3)} → ${reg.currentMean.toFixed(3)} (${reg.deltaPct > 0 ? '+' : ''}${reg.deltaPct.toFixed(1)}%)\n`;
+                }
+              }
+            }
+            
+            body += '\nPlease investigate the regression and update the baseline if needed.';
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Regression Check Failed - ${new Date().toISOString().split('T')[0]}`,
+              body: body,
+              labels: ['regression', 'evals', 'automated']
+            });

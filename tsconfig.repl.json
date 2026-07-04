@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "types": ["node", "react"],
+    "lib": ["ES2023", "DOM"],
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "noEmit": true
+  },
+  "include": ["src/repl/**/*", "src/v2/contracts/**/*", "src/brain/executor.ts", "src/brain/decomposer.ts", "src/brain/patternMatcher.ts", "src/brain/executor/types.ts"],
+  "exclude": ["node_modules", "dist", "tests"]
+}

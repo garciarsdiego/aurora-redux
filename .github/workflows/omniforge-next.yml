@@ -1,0 +1,47 @@
+name: omniforge-next CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:  # Allow manual triggering for testing
+
+env:
+  NODE_VERSION: 22
+  PNPM_VERSION: 10.26.0
+
+jobs:
+  build-test:
+    name: omniforge-next build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --dir packages/omniforge-next typecheck
+
+      # The package test suite imports @playwright/test for the client-shell
+      # tests, so Chromium must be installed before running the tests.
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Test
+        run: pnpm --dir packages/omniforge-next test
+
+      - name: Build
+        run: pnpm --dir packages/omniforge-next build

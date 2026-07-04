@@ -1,0 +1,9 @@
+{
+  "_comment": "Fan-out across three direct providers in parallel, then consolidate. Run: omniforge run-dag examples/02-consensus-3-providers.json -w internal --auto-approve",
+  "tasks": [
+    {"id": "t1", "name": "In one objective sentence, evaluate ETag / If-None-Match as an HTTP caching strategy.", "kind": "llm_call", "depends_on": [], "model": "kimi/kimi-for-coding"},
+    {"id": "t2", "name": "In one objective sentence, evaluate Cache-Control max-age as an HTTP caching strategy.", "kind": "llm_call", "depends_on": [], "model": "minimax/MiniMax-M3"},
+    {"id": "t3", "name": "In one objective sentence, evaluate stale-while-revalidate as an HTTP caching strategy.", "kind": "llm_call", "depends_on": [], "model": "glm/glm-5.2"},
+    {"id": "t4", "name": "Consolidate the three HTTP-caching evaluations from the previous steps into a single short recommendation.", "kind": "llm_call", "depends_on": ["t1", "t2", "t3"], "model": "glm/glm-5.2"}
+  ]
+}
