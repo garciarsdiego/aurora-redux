@@ -60,7 +60,9 @@ const DIRECT_PROVIDER_ROUTES: Record<DirectProviderName, DirectProviderRoute> = 
 export function resolveDirectProviderRoute(model: string): DirectProviderRoute | null {
   const slash = model.indexOf('/');
   if (slash <= 0) return null;
-  const prefix = model.slice(0, slash);
+  // Lowercase: paridade com os regexes /i de isCliModel — 'Kimi/x' e 'kimi/x'
+  // precisam rotear idêntico. (BAIXO-3, revisão 2026-07-04.)
+  const prefix = model.slice(0, slash).toLowerCase();
   // Object.hasOwn guards against prototype keys ('constructor/x' etc.). (B1.)
   return Object.hasOwn(DIRECT_PROVIDER_ROUTES, prefix)
     ? DIRECT_PROVIDER_ROUTES[prefix as DirectProviderName]
@@ -69,8 +71,11 @@ export function resolveDirectProviderRoute(model: string): DirectProviderRoute |
 
 /** Strip the routing prefix so the provider receives its native model id. */
 export function stripRoutePrefix(model: string, route: DirectProviderRoute): string {
-  const prefix = `${route.providerName}/`;
-  return model.startsWith(prefix) ? model.slice(prefix.length) : model;
+  const slash = model.indexOf('/');
+  if (slash <= 0) return model;
+  return model.slice(0, slash).toLowerCase() === route.providerName
+    ? model.slice(slash + 1)
+    : model;
 }
 
 /** Build the full completions URL, honoring an optional per-provider override. */

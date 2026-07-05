@@ -27,6 +27,7 @@ import { AgentRejectedError, AgentOutputError } from '../v2/agents/types.js';
 import { cliHintForModel, normalizeCliExecutorHintForModel } from '../utils/cli-routing.js';
 import { recallReflections, formatReflectionsForPrompt } from '../v2/reflection/store.js';
 import { trackDecomposerDecision, getDecomposerMetrics } from '../utils/config.js';
+import { spanContextStorage } from '../v2/observability/tracing.js';
 
 const SYSTEM_PROMPT = `You are Omniforge's task decomposer. Given an OBJECTIVE, produce a DAG of tasks as strict JSON.
 
@@ -1014,6 +1015,22 @@ const omnirouteInvoker: AgentInvoker = async (args) => {
   return result.content;
 };
 
+/**
+ * MÉDIO-4 (revisão adversarial 2026-07-04): quando o chamador forneceu
+ * options.db + options.workflowId, roda a chamada LLM do decomposer dentro de
+ * um span context com ledgerSource='decomposer' — o chokepoint
+ * (callOmnirouteWithUsage) então grava a linha em model_calls e abre o trace
+ * span llm_call:*. Sem db/workflowId (CLI puro, testes) a chamada roda sem
+ * contexto, exatamente como antes.
+ */
+const runWithLedger = <T>(options: DecomposeOptions, fn: () => Promise<T>): Promise<T> =>
+  options.db && options.workflowId
+    ? spanContextStorage.run(
+        { db: options.db, parentSpanId: null, workflowId: options.workflowId, ledgerSource: 'decomposer' },
+        fn,
+      )
+    : fn();
+
 async function compactDecomposerPrompt(
   text: string,
   model: string,
@@ -1346,7 +1363,8 @@ export async function decompose(
   // ── Feature-flag path ───────────────────────────────────────────────────────
   if (getUsePersonas()) {
     try {
-      const dag = await decomposeViaPersona(compactedObjective, options);
+      // MÉDIO-4: cobre o runAgent → omnirouteInvoker (chamada LLM da persona).
+      const dag = await runWithLedger(options, () => decomposeViaPersona(compactedObjective, options));
       backfillTaskTimeouts(dag, compactedObjective);
       return dag;
     } catch (err) {
@@ -1390,11 +1408,11 @@ export async function decompose(
     options,
     'decomposer_initial_prompt',
   );
-  const rawResult = await callOmnirouteWithUsage({
+  const rawResult = await runWithLedger(options, () => callOmnirouteWithUsage({
     systemPrompt,
     userPrompt: firstPrompt,
     model,
-  });
+  }));
   const raw = rawResult.content;
   try {
     const dag = parseDecomposerOutput(raw);
@@ -1431,11 +1449,11 @@ export async function decompose(
       options,
       'decomposer_retry_prompt',
     );
-    const retryRawResult = await callOmnirouteWithUsage({
+    const retryRawResult = await runWithLedger(options, () => callOmnirouteWithUsage({
       systemPrompt,
       userPrompt: compactedRetryPrompt,
       model,
-    });
+    }));
     const retryRaw = retryRawResult.content;
     try {
       const dag = parseDecomposerOutput(retryRaw);

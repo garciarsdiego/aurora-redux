@@ -48,6 +48,13 @@ export interface SpanContext {
   db: Database.Database;
   parentSpanId: string | null;
   workflowId?: string;
+  /**
+   * Quando setado, o chokepoint LLM (callOmnirouteWithUsage) grava uma linha
+   * em model_calls com este source. As tasks do executor NÃO setam isto —
+   * success-finalize.ts continua sendo o único escritor delas (evita
+   * double-count por construção). (MÉDIO-4, revisão adversarial 2026-07-04.)
+   */
+  ledgerSource?: 'decomposer' | 'reviewer' | 'consolidator';
 }
 
 export const spanContextStorage = new AsyncLocalStorage<SpanContext>();

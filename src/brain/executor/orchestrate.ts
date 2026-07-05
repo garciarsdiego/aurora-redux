@@ -43,7 +43,7 @@ import { buildTaskExecutionContext } from '../../utils/execution-context.js';
 import { runAutoCaptureHook } from '../../patterns/auto-capture.js';
 import { recordReflection } from '../../v2/reflection/store.js';
 import { loadWorkspaceProfile } from '../../utils/workspace-profile.js';
-import { startTraceSpan, endTraceSpan } from '../../v2/observability/tracing.js';
+import { startTraceSpan, endTraceSpan, spanContextStorage } from '../../v2/observability/tracing.js';
 import { waitForWorkflowControlCheckpoint } from '../../db/workflow-control.js';
 import { safeEnsureWorkflowContext } from '../../context/workflow-adapter.js';
 import { safeEnsureWorkflowWorkGraph } from '../../context/work-graph.js';
@@ -361,7 +361,18 @@ export async function runTaskLoop(
   const baseExecute = opts.executeTaskFn ?? dispatchDeterministic;
   const doExecute = baseExecute;
   const doSleep = opts.sleepFn ?? sleep;
-  const doReview = opts.reviewFn ?? reviewTask;
+  // MÉDIO-4 (revisão adversarial 2026-07-04): envolve o reviewer num span
+  // context com ledgerSource='reviewer' para que o chokepoint LLM grave a
+  // linha dele em model_calls (e abra trace spans llm_call:*). O run() do
+  // AsyncLocalStorage aninha e restaura o contexto anterior ao retornar, então
+  // o retry-loop do executor (que abre o próprio contexto SEM ledgerSource)
+  // não é afetado — sem double-count por construção.
+  const baseReview = opts.reviewFn ?? reviewTask;
+  const doReview: typeof baseReview = (task, output, ctx) =>
+    spanContextStorage.run(
+      { db, parentSpanId: null, workflowId: wfId, ledgerSource: 'reviewer' },
+      () => baseReview(task, output, ctx),
+    );
   const refineCostPerCallUsd = opts.refineCostPerCallUsd ?? getRefineCostPerCallUsd();
   const refineTimeoutMs = opts.refineTimeoutMs ?? getMaxRefineTimeMs();
   const doHitl = opts.hitlFn ?? promptApproval;
@@ -909,7 +920,12 @@ export async function executeWorkflow(
     await runTaskLoop(db, tasks, wfId, new Set<string>(), { ...opts, workspace, objective, workflowSpanId });
     // D35 — Final validation step. Runs AFTER tasks complete, BEFORE consolidator.
     await runFinalValidationStep(db, workflow, objective);
-    await runConsolidation(db, workflow, tasks, opts.consolidateFn ?? consolidateWorkflow);
+    // MÉDIO-4: ledgerSource='consolidator' → o chokepoint grava as chamadas
+    // LLM do consolidator (incl. o MAP step de OPP-C1) em model_calls.
+    await spanContextStorage.run(
+      { db, parentSpanId: null, workflowId: wfId, ledgerSource: 'consolidator' },
+      () => runConsolidation(db, workflow, tasks, opts.consolidateFn ?? consolidateWorkflow),
+    );
     const finalQualityReviewMode = getFinalQualityReviewMode();
     if (finalQualityReviewMode !== 'off') {
       await enforceFinalQualityReview(db, {
@@ -1239,7 +1255,13 @@ export async function continueWorkflowExecution(
   // D35 — same validation step as executeWorkflow
   await runFinalValidationStep(db, workflow, workflow.objective);
 
-  await runConsolidation(db, workflow, tasks, opts.consolidateFn ?? consolidateWorkflow);
+  // MÉDIO-4: mesmo wrap do caminho executeWorkflow — chamadas LLM do
+  // consolidator no resume também ficam visíveis em model_calls.
+  // (workflow.id ≡ wfId do outro site; esta função não tem um local wfId.)
+  await spanContextStorage.run(
+    { db, parentSpanId: null, workflowId: workflow.id, ledgerSource: 'consolidator' },
+    () => runConsolidation(db, workflow, tasks, opts.consolidateFn ?? consolidateWorkflow),
+  );
 
   const finalQualityReviewMode = getFinalQualityReviewMode();
   if (finalQualityReviewMode !== 'off') {

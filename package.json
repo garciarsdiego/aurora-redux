@@ -41,9 +41,6 @@
   "lint-staged": {
     "src/**/*.ts": [
       "eslint --fix"
-    ],
-    "apps/dashboard-v2/src/**/*.{ts,tsx}": [
-      "eslint --fix"
     ]
   },
   "dependencies": {

@@ -16,10 +16,9 @@
 // reviewer.ts) to avoid the cycle omniroute-call → cli-invoker → reviewer →
 // omniroute-call (reviewer imports callOmniroute).
 
-import { spawn, type SpawnOptionsWithoutStdio } from 'node:child_process';
+import { spawn, spawnSync, type SpawnOptionsWithoutStdio, type ChildProcess } from 'node:child_process';
 import { claudeBin, codexBin } from '../executors/cli/bin-resolver.js';
 import { resolveSpawnTarget, buildCliSpawnOptions } from '../executors/cli/spawn-common.js';
-import { buildCodexSpec } from '../executors/cli/adapters/codex.js';
 import { isCliSafeMode } from '../executors/cli/permission-context.js';
 import type { OmniroutePromptInput, OmnirouteCallResult } from './omniroute-call.js';
 
@@ -36,6 +35,24 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
+const PROVIDER_KEY_ENV_VARS = [
+  'KIMI_API_KEY', 'MINIMAX_API_KEY', 'GLM_API_KEY', 'OMNIROUTE_API_KEY',
+] as const;
+
+/**
+ * Brain-role CLIs autenticam via OAuth/keyring próprios — nunca precisam das
+ * keys dos provedores diretos nem da key do Omniroute. Removê-las do env do
+ * filho reduz o blast radius de um CLI comprometido/prompt-injected.
+ * Retorna um NOVO objeto (imutabilidade). (BAIXO-4, revisão 2026-07-04.)
+ */
+export function stripProviderKeysFromEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const out = { ...env };
+  for (const k of PROVIDER_KEY_ENV_VARS) delete out[k];
+  return out;
+}
+
 interface CliSpec {
   bin: string;
   args: string[];
@@ -43,7 +60,7 @@ interface CliSpec {
   timeoutMs: number;
 }
 
-function resolveCliSpec(model: string): CliSpec {
+export function resolveCliSpec(model: string): CliSpec {
   const safeMode = isCliSafeMode();
   if (CLAUDE_CLI_RE.test(model)) {
     // claude --print reads the prompt from stdin and prints the reply. No
@@ -57,11 +74,42 @@ function resolveCliSpec(model: string): CliSpec {
     const timeoutMs = envInt('CLAUDE_CLI_TIMEOUT_MS', 180_000);
     return { bin: claudeBin(), args, provider: 'claude', timeoutMs };
   }
-  // codex-cli/<model>: the suffix after the prefix is the codex model id.
+  // codex-cli/<model>: transporte brain-role — texto entra (stdin), texto sai.
+  // Diferente do agente cli_spawn (adapters/codex.ts), um brain role NÃO deve
+  // rodar com --dangerously-bypass-approvals-and-sandbox: ele só precisa ler
+  // o prompt e imprimir a resposta, então o sandbox read-only default do
+  // `codex exec` é a contenção certa contra prompt-injection vinda de diffs
+  // sob review. Mantemos --ignore-user-config: os plugins MCP do config do
+  // operador quebram o handshake quando o stdin está piped (ver
+  // adapters/codex.ts, wf_2d6abe11). Nota: --ignore-user-config agora é
+  // incondicional — antes era omitido em safeMode, o que deixava o brain-role
+  // exposto ao crash de handshake em daemon/MCP (safeMode default true); a
+  // mudança é intencional. (MÉDIO-3, revisão adversarial 2026-07-04.)
   const cliModel = model.slice('codex-cli/'.length).trim() || null;
-  const spec = buildCodexSpec({ cliModel, safeMode });
+  const args = ['exec', ...(cliModel ? ['--model', cliModel] : []), '--ignore-user-config'];
   const timeoutMs = envInt('CODEX_CLI_TIMEOUT_MS', 600_000);
-  return { bin: spec.bin, args: spec.args, provider: 'codex', timeoutMs };
+  return { bin: codexBin(), args, provider: 'codex', timeoutMs };
+}
+
+/**
+ * Mata o processo E seus descendentes. No Windows, `child.kill('SIGKILL')`
+ * é TerminateProcess só no handle direto — se o spawn caiu no tier-C
+ * (cmd.exe /c shim) ou o CLI criou subprocessos (codex faz isso), o neto
+ * fica órfão consumindo quota. `taskkill /T /F` derruba a árvore inteira.
+ * Exportado para teste. (MÉDIO-2, revisão adversarial 2026-07-04.)
+ */
+export function killProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid !== undefined && process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        timeout: 5_000,
+        windowsHide: true,
+      });
+    } catch { /* taskkill indisponível — cai no kill direto abaixo */ }
+  }
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
 }
 
 /** Spawn the CLI, feed `prompt` on stdin, collect stdout with a hard timeout. */
@@ -71,8 +119,13 @@ function spawnCliCollect(
   externalSignal?: AbortSignal,
 ): Promise<string> {
   const target = resolveSpawnTarget(spec.bin, spec.args);
+  const base = buildCliSpawnOptions();
   const options: SpawnOptionsWithoutStdio = {
-    ...buildCliSpawnOptions(),
+    ...base,
+    // Brain-role CLIs autenticam via OAuth/keyring — não precisam (e não
+    // devem receber) as keys dos provedores diretos nem a do Omniroute.
+    // (BAIXO-4, revisão 2026-07-04.)
+    env: stripProviderKeysFromEnv((base.env ?? process.env) as Record<string, string | undefined>),
     windowsVerbatimArguments: target.windowsVerbatimArguments,
     stdio: 'pipe',
   };
@@ -86,9 +139,7 @@ function spawnCliCollect(
       clearTimeout(timer);
       if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
     };
-    const kill = () => {
-      try { child.kill('SIGKILL'); } catch { /* already gone */ }
-    };
+    const kill = () => killProcessTree(child);
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
@@ -96,26 +147,11 @@ function spawnCliCollect(
       fn();
     };
 
-    const timer = setTimeout(() => {
-      kill();
-      finish(() => reject(new Error(
-        `${spec.provider} CLI timed out after ${spec.timeoutMs}ms`,
-      )));
-    }, spec.timeoutMs);
-
-    const onAbort = () => {
-      kill();
-      finish(() => {
-        const err = new Error(`${spec.provider} CLI aborted by external signal`);
-        (err as Error & { name: string }).name = 'AbortError';
-        reject(err);
-      });
-    };
-    if (externalSignal) {
-      if (externalSignal.aborted) { onAbort(); return; }
-      externalSignal.addEventListener('abort', onAbort, { once: true });
-    }
-
+    // MÉDIO-1 (revisão adversarial 2026-07-04): estes handlers PRECISAM estar
+    // registrados antes de qualquer early-return (o abort-na-entrada abaixo).
+    // Sem eles, um spawn 'error' assíncrono após o return vira uncaughtException
+    // e derruba o daemon inteiro durante um cancel (workflow abortado + bin
+    // quebrado). Ordem obrigatória: listeners → timer → abort-check → stdin write.
     child.stdout.on('data', (c: Buffer) => stdout.push(c));
     child.stderr.on('data', (c: Buffer) => stderr.push(c));
     // A large brain-role prompt exceeds the pipe buffer, so the stdin write
@@ -139,6 +175,26 @@ function spawnCliCollect(
       }
     });
 
+    const timer = setTimeout(() => {
+      kill();
+      finish(() => reject(new Error(
+        `${spec.provider} CLI timed out after ${spec.timeoutMs}ms`,
+      )));
+    }, spec.timeoutMs);
+
+    const onAbort = () => {
+      kill();
+      finish(() => {
+        const err = new Error(`${spec.provider} CLI aborted by external signal`);
+        (err as Error & { name: string }).name = 'AbortError';
+        reject(err);
+      });
+    };
+    if (externalSignal) {
+      if (externalSignal.aborted) { onAbort(); return; }
+      externalSignal.addEventListener('abort', onAbort, { once: true });
+    }
+
     try {
       child.stdin.write(prompt, 'utf8');
       child.stdin.end();
@@ -149,6 +205,26 @@ function spawnCliCollect(
       )));
     }
   });
+}
+
+/**
+ * codex exec às vezes reemite a resposta inteira uma segunda vez (retry de
+ * telemetria). Quando o conteúdo é EXATAMENTE duas cópias idênticas separadas
+ * por whitespace, devolve uma. Conservador de propósito: qualquer diferença
+ * entre as metades → retorna intacto. (BAIXO-2, revisão 2026-07-04.)
+ */
+function dedupeExactDouble(content: string): string {
+  const t = content.trim();
+  if (t.length < 2) return t;
+  const half = Math.floor(t.length / 2);
+  // Testa pontos de corte próximos ao meio; metades trimmed idênticas → duplo.
+  for (let cut = half - 2; cut <= half + 2; cut++) {
+    if (cut <= 0 || cut >= t.length) continue;
+    const a = t.slice(0, cut).trim();
+    const b = t.slice(cut).trim();
+    if (a !== '' && a === b) return a;
+  }
+  return t;
 }
 
 /**
@@ -171,12 +247,20 @@ export function extractCliContent(raw: string, provider: 'claude' | 'codex'): st
   for (let i = start >= 0 ? start : 0; i < lines.length; i++) {
     if (/^tokens used$/i.test(lines[i].trim())) { end = i; break; }
   }
-  if (start >= 0) return lines.slice(start, end).join('\n').trim();
-  // Fallback: strip obvious chrome lines and return the rest.
-  return lines
-    .filter((l) => !/^(tokens used|user|codex|warning:|reading additional input|openai codex|--------|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|[\d,]+)\b/i.test(l.trim()))
-    .join('\n')
-    .trim();
+  if (start >= 0) return dedupeExactDouble(lines.slice(start, end).join('\n').trim());
+  // Fallback: strip obvious chrome lines and return the rest. A linha
+  // numérica (contagem após 'tokens used') só é chrome quando é a linha
+  // INTEIRA — '3 passos...' é conteúdo. (BAIXO-1, revisão 2026-07-04.)
+  return dedupeExactDouble(
+    lines
+      .filter((l) => {
+        const t = l.trim();
+        if (/^[\d,]+$/.test(t)) return false;
+        return !/^(tokens used|user|codex|warning:|reading additional input|openai codex|--------|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:)\b/i.test(t);
+      })
+      .join('\n')
+      .trim(),
+  );
 }
 
 function estimateUsage(inputChars: number, outputChars: number) {

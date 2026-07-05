@@ -639,6 +639,35 @@ export async function callOmnirouteWithUsage(
     } catch { /* tracing must not break execution */ }
   }
 
+  // MÉDIO-4 (revisão adversarial 2026-07-04): brain-roles (decomposer /
+  // reviewer / consolidator) rodam fora do caminho de task do executor, então
+  // success-finalize nunca grava a linha deles em model_calls — reviews via
+  // codex-cli eram invisíveis no ledger. Quando o chamador optou-in via
+  // spanCtx.ledgerSource, gravamos aqui. O executor tem spanCtx SEM
+  // ledgerSource → pulado → sem double-count.
+  const ledgerWorkflowId = workflowId ?? spanCtx?.workflowId;
+  if (result && spanCtx?.db && spanCtx.ledgerSource && ledgerWorkflowId) {
+    try {
+      const { recordModelCall } = await import('../v2/llm-ledger/store.js');
+      recordModelCall(spanCtx.db, {
+        workflowId: ledgerWorkflowId,
+        taskId: taskId || undefined,
+        model: result.model_used,
+        inputTokens: result.usage?.input_tokens,
+        outputTokens: result.usage?.output_tokens,
+        costUsd: result.usage?.total_cost_usd,
+        latencyMs: Date.now() - callStart,
+        source: spanCtx.ledgerSource,
+        // kind alimenta só o hint de source do SSE cost_delta — não é coluna
+        // persistida em model_calls.
+        kind: 'llm_call',
+      });
+    } catch (err) {
+      // Ledger é best-effort: nunca quebra a chamada.
+      console.warn('[Ledger] Failed to record brain-role model_call:', err);
+    }
+  }
+
   // Finalize cost tracking and register in database
   if (result && trackingId) {
     try {
