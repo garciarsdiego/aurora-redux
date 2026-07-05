@@ -47,6 +47,27 @@ describe('getModelGuidance — family resolution', () => {
     expect(getModelGuidance('ollamacloud/kimi-k2-thinking').length).toBeGreaterThan(0);
   });
 
+  it('glm/glm-5.2 (CONSOLIDATOR default) → glm family, non-empty guidance', () => {
+    expect(resolveFamily('glm/glm-5.2')).toBe('glm');
+    const g = getModelGuidance('glm/glm-5.2');
+    expect(g.length).toBeGreaterThan(0);
+    expect(g).toMatch(/glm/i);
+  });
+
+  it('minimax/MiniMax-M3 → minimax family, non-empty guidance', () => {
+    expect(resolveFamily('minimax/MiniMax-M3')).toBe('minimax');
+    const g = getModelGuidance('minimax/MiniMax-M3');
+    expect(g.length).toBeGreaterThan(0);
+    expect(g).toMatch(/minimax/i);
+  });
+
+  it('glm and minimax do not collide with existing families', () => {
+    // Additive-only guarantee: pre-existing prefixes still resolve unchanged.
+    expect(resolveFamily('deepseek-coder')).toBe('deepseek');
+    expect(resolveFamily('kmc/kimi-k2.5')).toBe('kimi');
+    expect(resolveFamily('gemini-1.5-pro')).toBe('google');
+  });
+
   it('unknown-xyz → returns empty string without throwing', () => {
     expect(() => getModelGuidance('unknown-xyz')).not.toThrow();
     expect(getModelGuidance('unknown-xyz')).toBe('');

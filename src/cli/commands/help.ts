@@ -9,18 +9,18 @@ const COMMON_WORKFLOWS = [
   },
   {
     name: 'Plan Before Run',
-    description: 'Decompose objective into DAG before executing',
-    command: './bin/omniforge run "your objective" --workspace internal --plan-first',
+    description: 'Review DAG summary and confirm before executing (run-dag only)',
+    command: './bin/omniforge run-dag your-dag.yaml --workspace internal --plan',
   },
   {
     name: 'Monitor Progress',
-    description: 'Tail workflow progress in real-time',
-    command: 'node scripts/tail-wf.mjs <workflow_id>',
+    description: 'Check workflow status in real-time',
+    command: './bin/omniforge status <workflow_id>',
   },
   {
     name: 'Resume Stuck Workflow',
     description: 'Resume a workflow that was interrupted',
-    command: 'node scripts/resume-wf.mjs <workflow_id>',
+    command: './bin/omniforge resume <workflow_id>',
   },
   {
     name: 'Run from File',
@@ -39,8 +39,8 @@ const COMMON_ISSUES = [
     solution: 'Restart daemon: ./bin/omniforge daemon restart',
   },
   {
-    issue: 'Omniroute unreachable',
-    solution: 'Check Omniroute is running: curl http://localhost:20228/health',
+    issue: 'CLI/provider da task falhou',
+    solution: 'Rode ./bin/omniforge doctor e confira TASK_MODEL/REVIEWER_MODEL no .env',
   },
   {
     issue: 'CLI binary not found',

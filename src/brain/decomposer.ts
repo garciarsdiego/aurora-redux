@@ -1073,6 +1073,46 @@ function emitContextCompactionEvent(
 }
 
 /**
+ * Sprint T5 ITEM 2 (2026-07-04): surface non-fatal DAG validation warnings.
+ * parseDecomposerOutput only throws when validateDag reports severity 'error';
+ * 'warn' issues were silently discarded. Re-validate the accepted DAG and
+ * (a) emit one aggregated console.warn, (b) persist a 'decomposer_warnings'
+ * event when the caller provided db + workflowId. Best-effort observability
+ * only — this NEVER changes control flow or throws.
+ */
+function surfaceDagValidationWarnings(dag: Dag, options: DecomposeOptions): void {
+  try {
+    const validation = validateDag(dag);
+    if (!validation.valid || validation.warnings.length === 0) return;
+    const aggregated = validation.warnings
+      .map((w) => `[${w.rule}] ${w.message}`)
+      .join('; ');
+    console.warn(
+      `[decomposer] DAG accepted with ${validation.warnings.length} validation warning(s): ${aggregated}`,
+    );
+    if (options.db && options.workflowId) {
+      insertEvent(options.db, {
+        workflow_id: options.workflowId,
+        task_id: options.taskId ?? null,
+        type: 'decomposer_warnings',
+        payload: {
+          workflow_id: options.workflowId,
+          warning_count: validation.warnings.length,
+          warnings: validation.warnings.map((w) => ({
+            rule: w.rule,
+            message: w.message,
+            task_id: w.task_id ?? null,
+          })),
+        },
+      });
+    }
+  } catch {
+    // Best-effort: a failure to persist/log warnings must never break
+    // decomposition (the DAG already passed validation).
+  }
+}
+
+/**
  * Builds a minimal AgentContext for the decomposer from DecomposeOptions.
  */
 function buildDecomposerAgentContext(options: DecomposeOptions): AgentContext {
@@ -1416,6 +1456,7 @@ export async function decompose(
   const raw = rawResult.content;
   try {
     const dag = parseDecomposerOutput(raw);
+    surfaceDagValidationWarnings(dag, options);
     backfillTaskTimeouts(dag, compactedObjective);
     return dag;
   } catch (firstErr) {
@@ -1424,24 +1465,44 @@ export async function decompose(
     // "[max-chain-length] ..." messages with no path to recovery. Retry
     // ONCE with the validation issue fed back as explicit guidance.
     const message = firstErr instanceof Error ? firstErr.message : String(firstErr);
-    if (!message.includes('failed validation')) throw firstErr;
+    // Sprint T5 ITEM 1 (2026-07-04): parseDecomposerOutput also throws when
+    // the model emits prose or truncated JSON ("failed to parse LLM output
+    // as JSON") or JSON that misses the contract ("did not match DagSchema").
+    // Pre-fix those exceptions bypassed the retry entirely and surfaced raw
+    // to the operator. They are just as recoverable as validator rejections,
+    // so retry ONCE with an explicit "JSON only" instruction. Errors of any
+    // other nature (network, auth, timeout) still propagate without retry.
+    const isParseFailure =
+      /failed to parse LLM output as JSON|did not match DagSchema/i.test(message);
+    if (!message.includes('failed validation') && !isParseFailure) throw firstErr;
 
-    const retryPrompt = [
-      `OBJECTIVE: ${compactedObjective}`,
-      '',
-      'Your previous DAG was rejected by the validator:',
-      message,
-      '',
-      'Common causes and fixes:',
-      '- max-chain-length: parallelize independent feature implementations.',
-      '  Tasks that do not share data dependencies beyond the design phase',
-      '  MUST list the same depends_on (the design task) and run in parallel.',
-      '- vague-criteria: replace "should/must be <vague>" with observable',
-      '  checks ("file exists", "exit 0", "DOM contains selector X").',
-      '',
-      'Return a corrected DAG that fixes the validator issue while preserving',
-      'the original intent. Do NOT explain — emit only the JSON.',
-    ].join('\n');
+    const retryPrompt = isParseFailure
+      ? [
+          `OBJECTIVE: ${compactedObjective}`,
+          '',
+          'Your previous output was not valid JSON:',
+          message,
+          '',
+          'Re-emit ONLY the JSON object for the DAG — no markdown fences,',
+          'no prose, no explanation. The response must start with "{" and',
+          'match the DAG contract described in the system prompt.',
+        ].join('\n')
+      : [
+          `OBJECTIVE: ${compactedObjective}`,
+          '',
+          'Your previous DAG was rejected by the validator:',
+          message,
+          '',
+          'Common causes and fixes:',
+          '- max-chain-length: parallelize independent feature implementations.',
+          '  Tasks that do not share data dependencies beyond the design phase',
+          '  MUST list the same depends_on (the design task) and run in parallel.',
+          '- vague-criteria: replace "should/must be <vague>" with observable',
+          '  checks ("file exists", "exit 0", "DOM contains selector X").',
+          '',
+          'Return a corrected DAG that fixes the validator issue while preserving',
+          'the original intent. Do NOT explain — emit only the JSON.',
+        ].join('\n');
 
     const compactedRetryPrompt = await compactDecomposerPrompt(
       retryPrompt,
@@ -1457,6 +1518,7 @@ export async function decompose(
     const retryRaw = retryRawResult.content;
     try {
       const dag = parseDecomposerOutput(retryRaw);
+      surfaceDagValidationWarnings(dag, options);
       backfillTaskTimeouts(dag, compactedObjective);
       return dag;
     } catch (secondErr) {

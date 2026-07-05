@@ -6,7 +6,13 @@
 //
 // Checks (each independent, never throws — accumulates report):
 //   1. Node version
-//   2. .env file presence + critical envs
+//   2. .env file presence + gateway-free role envs (T3, 2026-07-04):
+//        - the 4 *_MODEL roles are warn-if-missing (never fail)
+//        - direct-provider prefixes (kimi/ minimax/ glm/) FAIL if their
+//          API key env (KIMI_API_KEY / MINIMAX_API_KEY / GLM_API_KEY) is unset
+//        - warn if OMNIFORGE_SKIP_MODEL_VALIDATION != 'true' while a role
+//          uses a direct/CLI prefix (legacy catalog validation may abort boot)
+//        - OMNIROUTE_URL/KEY are informational (only relevant for no-prefix ids)
 //   3. Daemon HTTP /health reachable
 //   4. SQLite DB reachable + integrity_check
 //   5. Migrations applied count
@@ -41,14 +47,162 @@ function checkNodeVersion(): CheckResult {
   return { name: 'Node version', severity: 'fail', detail: `v${v} — Omniforge requires Node 22+` };
 }
 
+// The four orchestration roles. Gateway-free: a missing role is a warning
+// (the engine falls back to defaults), never a hard failure.
+const ROLE_MODEL_ENVS = [
+  'DECOMPOSER_MODEL',
+  'REVIEWER_MODEL',
+  'TASK_MODEL',
+  'CONSOLIDATOR_MODEL',
+] as const;
+
+// Direct-HTTP provider prefixes → the API-key env each one requires.
+// Mirrors src/utils/provider-routes.ts (DIRECT_PROVIDER_ROUTES.envVar).
+const DIRECT_PREFIX_KEY_ENV: Record<string, string> = {
+  kimi: 'KIMI_API_KEY',
+  minimax: 'MINIMAX_API_KEY',
+  glm: 'GLM_API_KEY',
+};
+
+// CLI-transport prefixes (spawn a local binary; no API key env needed).
+const CLI_PREFIXES = new Set(['claude-cli', 'codex-cli']);
+
+/** Lowercased routing prefix of a model id, or null when it carries none. */
+function modelPrefix(model: string): string | null {
+  const slash = model.indexOf('/');
+  if (slash <= 0) return null;
+  return model.slice(0, slash).toLowerCase();
+}
+
+/**
+ * Parse a dotenv-style buffer into a key→value map. Merges over process.env so
+ * inline-env invocations (`KEY=v node bin/omniforge doctor`) are seen even when
+ * the value is not written to a .env file.
+ */
+function readEnvMap(content: string): Record<string, string> {
+  const map: Record<string, string> = { ...(process.env as Record<string, string>) };
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    map[key] = value;
+  }
+  return map;
+}
+
+/**
+ * Gateway-free env diagnostics. Given the resolved env map, report on the four
+ * *_MODEL roles, the direct-provider API keys they imply, legacy validation,
+ * and the now-informational Omniroute settings.
+ */
+export function checkGatewayFreeEnv(env: Record<string, string>): CheckResult[] {
+  const checks: CheckResult[] = [];
+
+  // (a) The four roles: warn-if-missing, never fail.
+  const activeModels: { role: string; model: string }[] = [];
+  for (const role of ROLE_MODEL_ENVS) {
+    const value = env[role]?.trim();
+    if (!value) {
+      checks.push({ name: `env ${role}`, severity: 'warn', detail: 'unset — role will use engine default' });
+    } else {
+      checks.push({ name: `env ${role}`, severity: 'ok', detail: value });
+      activeModels.push({ role, model: value });
+    }
+  }
+
+  // (b) Each direct-provider role needs its API key present → fail naming it.
+  const missingKeys = new Map<string, string[]>(); // keyEnv → roles needing it
+  let usesDirectOrCli = false;
+  let usesNoPrefix = false;
+  for (const { role, model } of activeModels) {
+    const prefix = modelPrefix(model);
+    if (prefix === null) {
+      usesNoPrefix = true;
+      continue;
+    }
+    if (CLI_PREFIXES.has(prefix)) {
+      usesDirectOrCli = true;
+      continue;
+    }
+    const keyEnv = DIRECT_PREFIX_KEY_ENV[prefix];
+    if (keyEnv) {
+      usesDirectOrCli = true;
+      if (!env[keyEnv]?.trim()) {
+        const roles = missingKeys.get(keyEnv) ?? [];
+        roles.push(role);
+        missingKeys.set(keyEnv, roles);
+      }
+    } else {
+      // Unknown prefix (e.g. 'cc/', 'cx/') → falls through to legacy Omniroute.
+      usesNoPrefix = true;
+    }
+  }
+  for (const [keyEnv, roles] of missingKeys) {
+    checks.push({
+      name: `env ${keyEnv}`,
+      severity: 'fail',
+      detail: `required by ${roles.join(', ')} (direct-provider prefix) but unset`,
+    });
+  }
+  // Positive confirmation for direct-provider keys that ARE present.
+  for (const keyEnv of new Set(
+    activeModels
+      .map((m) => DIRECT_PREFIX_KEY_ENV[modelPrefix(m.model) ?? ''])
+      .filter((k): k is string => Boolean(k)),
+  )) {
+    if (env[keyEnv]?.trim() && !missingKeys.has(keyEnv)) {
+      checks.push({ name: `env ${keyEnv}`, severity: 'ok', detail: 'set' });
+    }
+  }
+
+  // (c) Legacy model validation may abort boot when a direct/CLI prefix is used.
+  if (usesDirectOrCli && env['OMNIFORGE_SKIP_MODEL_VALIDATION']?.trim() !== 'true') {
+    checks.push({
+      name: 'env OMNIFORGE_SKIP_MODEL_VALIDATION',
+      severity: 'warn',
+      detail: "not 'true' — legacy catalog validation may abort boot for direct/CLI model ids; set OMNIFORGE_SKIP_MODEL_VALIDATION=true",
+    });
+  }
+
+  // Omniroute is now informational — only relevant for no-prefix model ids.
+  const omniUrl = env['OMNIROUTE_URL']?.trim();
+  if (usesNoPrefix) {
+    checks.push({
+      name: 'env OMNIROUTE_URL',
+      severity: omniUrl ? 'ok' : 'warn',
+      detail: omniUrl ? 'set (used by no-prefix model ids)' : 'unset — a *_MODEL uses no known prefix and will fall back to Omniroute',
+    });
+  } else {
+    checks.push({
+      name: 'env OMNIROUTE_URL',
+      severity: 'ok',
+      detail: omniUrl ? 'set (informational — all roles route gateway-free)' : 'unset (ok — all roles route gateway-free)',
+    });
+  }
+
+  return checks;
+}
+
 function checkEnvFile(): CheckResult[] {
   const envPath = resolve(process.cwd(), '.env');
   if (!existsSync(envPath)) {
-    return [{
+    const checks: CheckResult[] = [{
       name: '.env file',
       severity: 'warn',
-      detail: 'not found in cwd — daemon will use only process.env (Telegram + Omniroute likely fail)',
+      detail: 'not found in cwd — daemon will use only process.env',
     }];
+    // Still run the role/key checks against process.env (inline-env invocations).
+    checks.push(...checkGatewayFreeEnv(readEnvMap('')));
+    return checks;
   }
   const content = readFileSync(envPath, 'utf-8');
   const checks: CheckResult[] = [{
@@ -56,18 +210,7 @@ function checkEnvFile(): CheckResult[] {
     severity: 'ok',
     detail: envPath,
   }];
-
-  const critical = ['OMNIROUTE_URL', 'OMNIROUTE_API_KEY'];
-  for (const key of critical) {
-    const re = new RegExp(`^${key}=(.+)$`, 'm');
-    const m = content.match(re);
-    if (!m || !m[1]?.trim()) {
-      checks.push({ name: `env ${key}`, severity: 'warn', detail: 'unset or empty' });
-    } else {
-      checks.push({ name: `env ${key}`, severity: 'ok', detail: 'set' });
-    }
-  }
-
+  checks.push(...checkGatewayFreeEnv(readEnvMap(content)));
   return checks;
 }
 

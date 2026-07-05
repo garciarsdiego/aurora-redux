@@ -1,0 +1,23 @@
+# Simple Analysis DAG
+# Use case: Quick analysis of a topic without complex dependencies
+#
+# Model routing (gateway-free): the model id prefix decides the transport.
+#   claude-cli/            -> local `claude --print` CLI (brain / analysis)
+#   codex-cli/<model>      -> local `codex exec` CLI  (reviewer; strong but slow)
+#   kimi/kimi-for-coding   -> direct HTTP API         (fast task worker)
+#   minimax/MiniMax-M3     -> direct HTTP API         (task / consensus)
+#   glm/glm-5.2            -> direct HTTP API          (consolidator; 1M ctx)
+#   <no prefix>            -> legacy Omniroute gateway  (do NOT use here)
+# Legacy prefixes cc/ and cx/ route through Omniroute and will NOT run
+# gateway-free. See README.md ("How it routes") and docs/USAGE.md.
+tasks:
+  - id: t0
+    name: "Research and analyze"
+    kind: llm_call
+    depends_on: []
+    model: claude-cli/
+    acceptance_criteria: "Analysis is comprehensive and well-structured"
+    hitl: false
+    timeout_seconds: 300
+    execution_mode: ephemeral
+    stream_output: true

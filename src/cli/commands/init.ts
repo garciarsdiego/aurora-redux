@@ -13,12 +13,14 @@ const ENV_TEMPLATE = `# workspaces/{name}/.env
 # GOOGLE_ADS_DEVELOPER_TOKEN=
 # GOOGLE_ADS_CUSTOMER_ID=
 #
-# Omniroute (herda do .env raiz se nao definido aqui):
-# OMNIROUTE_URL=http://localhost:20228
-# DECOMPOSER_MODEL=claude/claude-opus-4-6
-# TASK_MODEL=claude/claude-sonnet-4-6
-# REVIEWER_MODEL=claude/claude-sonnet-4-6
-# CONSOLIDATOR_MODEL=claude/claude-sonnet-4-6
+# Roteamento de modelos (herda do .env raiz se nao definido aqui).
+# Prefixo do model-id decide a rota: kimi/ minimax/ glm/ -> HTTP direto;
+# claude-cli/ codex-cli/ -> CLI local via stdin; sem prefixo -> legado.
+# Detalhes: ver README.md ("How it routes") e docs/USAGE.md
+# DECOMPOSER_MODEL=claude-cli/
+# TASK_MODEL=kimi/kimi-for-coding
+# REVIEWER_MODEL=glm/glm-5.2
+# CONSOLIDATOR_MODEL=glm/glm-5.2
 `;
 
 const HITL_TEMPLATE = JSON.stringify(

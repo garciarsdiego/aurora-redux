@@ -1,0 +1,84 @@
+# =============================================================================
+# DAG #1 — Tradução técnica EN→PT-BR (BAIXA complexidade)
+# =============================================================================
+# Tipo:        comunicação / conteúdo
+# Tasks:       3
+# Kinds:       1 (só llm_call)
+# Providers:   1 (cc)
+# Modelos:     2 tiers diferentes (B+ Haiku para velocidade, S- Sonnet para qualidade)
+# HITL:        não
+# Tempo est.:  ~3 minutos
+#
+# LÓGICA DO PROJETO ----------------------------------------------------------
+# Caso clássico de "tarefa simples mas que merece review". A primeira passada
+# usa o modelo mais barato (Haiku B+), pois o objetivo é gerar uma tradução
+# competente. A revisão usa um modelo mais forte (Sonnet S-) que capta erros
+# de terminologia técnica e nuances de tom. A terceira task aplica o feedback
+# voltando pro Haiku — barato, e o trabalho já tá quase pronto.
+#
+# Por que NÃO usar 1 task só com Sonnet?
+#   Custaria mais e o output seria tecnicamente similar. O loop "draft barato
+#   + review premium + ajuste barato" custa ~40% menos pra ~95% da qualidade.
+# Por que NÃO usar pal:consensus?
+#   Tradução não é decisão controversa que se beneficia de debate multi-modelo.
+# Por que NÃO usar HITL?
+#   Volume baixo, baixo risco. O operador aceita o output direto se passar reviewer.
+#
+# ROTEAMENTO GATEWAY-FREE (prefixo do model-id decide o transporte) -----------
+#   claude-cli/            -> CLI local `claude --print`  (brain / qualidade)
+#   codex-cli/<model>      -> CLI local `codex exec`      (reviewer forte/lento)
+#   kimi/kimi-for-coding   -> API HTTP direta             (task barato/rápido)
+#   minimax/MiniMax-M3     -> API HTTP direta             (task / consensus)
+#   glm/glm-5.2            -> API HTTP direta              (consolidator, 1M ctx)
+#   <sem prefixo>          -> Omniroute legado             (NÃO usar aqui)
+# Prefixos cc/ e cx/ são legado Omniroute e NÃO rodam gateway-free.
+# Ref.: README.md ("How it routes") e docs/USAGE.md.
+# =============================================================================
+
+tasks:
+  - id: t0
+    name: "Tradução draft EN→PT-BR (passada rápida)"
+    kind: llm_call
+    depends_on: []
+    model: kimi/kimi-for-coding                    # barato e rápido para draft (task worker)
+    acceptance_criteria: |
+      Tradução completa de todo o texto fonte. Mantém estrutura (headings,
+      listas, code blocks intactos). Formato markdown preservado. Sem omissões.
+    timeout_seconds: 180
+
+  - id: t1
+    name: "Revisão técnica de terminologia e tom"
+    kind: llm_call
+    depends_on: [t0]
+    model: claude-cli/                            # qualidade na revisão (brain via CLI)
+    acceptance_criteria: |
+      Lista estruturada de correções propostas, cada uma com:
+        (1) trecho original em inglês
+        (2) tradução do draft
+        (3) tradução sugerida
+        (4) justificativa em 1 frase (terminologia, tom, naturalidade).
+      Se a tradução está boa em algum trecho, NÃO incluir nesse trecho —
+      reportar apenas mudanças reais.
+    timeout_seconds: 300
+    input_selectors:
+      t0: raw_full
+
+  - id: t2
+    name: "Aplicar feedback e gerar versão final"
+    kind: llm_call
+    depends_on: [t0, t1]
+    model: kimi/kimi-for-coding                    # volta pro barato — só aplica diff
+    acceptance_criteria: |
+      Tradução final em PT-BR markdown, com todas as correções de t1 aplicadas.
+      Sem incluir o feedback no output (só o texto traduzido limpo).
+      Estrutura idêntica ao original (mesmo número de seções/parágrafos).
+    timeout_seconds: 180
+    input_selectors:
+      t0: raw_full
+      t1: raw_full
+
+# IMPORTAR -------------------------------------------------------------------
+# node bin/omniforge import docs/examples/dags/01-baixa-traducao-tecnica.yaml \
+#   -w internal \
+#   -n traducao-tecnica-en-ptbr \
+#   -o "tradução técnica de documentação EN para PT-BR com revisão"

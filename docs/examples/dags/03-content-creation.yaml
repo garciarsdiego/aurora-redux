@@ -1,0 +1,70 @@
+# Content Creation DAG
+# Use case: Create structured content with research, drafting, and review
+#
+# Model routing (gateway-free): the model id prefix decides the transport.
+#   claude-cli/            -> local `claude --print` CLI (brain / analysis)
+#   codex-cli/<model>      -> local `codex exec` CLI  (reviewer; strong but slow)
+#   kimi/kimi-for-coding   -> direct HTTP API         (fast task worker)
+#   minimax/MiniMax-M3     -> direct HTTP API         (task / consensus)
+#   glm/glm-5.2            -> direct HTTP API          (consolidator; 1M ctx)
+#   <no prefix>            -> legacy Omniroute gateway  (do NOT use here)
+# Legacy prefixes cc/ and cx/ route through Omniroute and will NOT run
+# gateway-free. See README.md ("How it routes") and docs/USAGE.md.
+tasks:
+  - id: t0
+    name: "Research topic"
+    kind: llm_call
+    depends_on: []
+    model: claude-cli/
+    acceptance_criteria: "Comprehensive research with key points and sources"
+    hitl: false
+    timeout_seconds: 300
+    execution_mode: ephemeral
+
+  - id: t1
+    name: "Create outline"
+    kind: llm_call
+    depends_on: [t0]
+    model: claude-cli/
+    acceptance_criteria: "Structured outline with clear sections"
+    hitl: true
+    timeout_seconds: 300
+    execution_mode: ephemeral
+    input_selectors:
+      t0: summary_only
+
+  - id: t2
+    name: "Draft content"
+    kind: llm_call
+    depends_on: [t1]
+    model: kimi/kimi-for-coding
+    acceptance_criteria: "Well-written content following the outline"
+    hitl: false
+    timeout_seconds: 600
+    execution_mode: ephemeral
+    input_selectors:
+      t1: raw_full
+
+  - id: t3
+    name: "Review and refine"
+    kind: llm_call
+    depends_on: [t2]
+    model: claude-cli/
+    acceptance_criteria: "Polished content with improvements"
+    hitl: false
+    timeout_seconds: 300
+    execution_mode: ephemeral
+    input_selectors:
+      t2: raw_full
+
+  - id: t4
+    name: "Final approval"
+    kind: llm_call
+    depends_on: [t3]
+    model: claude-cli/
+    acceptance_criteria: "Content is ready for publication"
+    hitl: true
+    timeout_seconds: 300
+    execution_mode: ephemeral
+    input_selectors:
+      t3: raw_full

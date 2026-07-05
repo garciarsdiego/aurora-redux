@@ -1,0 +1,184 @@
+# =============================================================================
+# DAG #3 — Code review profundo de PR com multi-perspectiva (MÉDIA-ALTA)
+# =============================================================================
+# Tipo:        software / debug / auditoria
+# Tasks:       8
+# Kinds:       4 (tool_call + llm_call + cli_spawn + pal_call)
+# Providers:   3 (cc, cli:cursor, pal)
+# Modelos:     Opus 4.6 S, Sonnet 4.6 S-, pal:codereview, pal:consensus
+# HITL:        1 gate (antes de gerar review final)
+# Tempo est.:  ~15-20 minutos
+#
+# LÓGICA DO PROJETO ----------------------------------------------------------
+# Caso frequente: acabou de abrir um PR, quer review profundo ANTES
+# de pedir review humano de colega. Evita embaraço de review humano pegar
+# bugs óbvios que 4 modelos diferentes pegariam.
+#
+# Multi-perspectiva deliberada: cada modelo tem viés — Claude é conservador,
+# Cursor foca em IDE-ergonomia, pal:codereview é estruturado, pal:consensus
+# é o desempate. O operador é o decisor final (HITL antes de gerar o comment).
+#
+# Fluxo:
+#   [enumerate files]──▶[read content]──┬──▶[logic analysis: Opus]──┐
+#                                         ├──▶[security: pal:codereview]──┤
+#                                         └──▶[perf: cli:cursor]────┤
+#                                                                    ▼
+#                                                         [consensus: pal]
+#                                                                    ▼
+#                                                            [HITL operador]
+#                                                                    ▼
+#                                                     [gerar review comment]
+#
+# Decisões explicadas:
+#   • t0/t1 tool_call: file IO determinístico — zero LLM cost até aqui.
+#     Executor do t0 tem que ser bash (git diff), não file-read (precisa de
+#     comando). Input_json do workflow carrega PR number/branch.
+#   • t2 Opus: analisa LÓGICA (não estilo, não perf) — modelo S premium
+#     porque erro de lógica é o mais caro de deixar passar.
+#   • t3 pal:codereview: segurança estruturada, scan OWASP-style.
+#   • t4 cli:cursor: o Cursor tem noção de IDE ergonomics e refactor
+#     suggestions concretas (diff-ready).
+#   • t5 pal:consensus: 3 perspectivas divergentes → veredito com confidence.
+#   • t6 HITL: o operador lê o consensus, decide se gera review ou volta pro código.
+#   • t7 Sonnet: gera o comment formatado pra colar no GitHub.
+#     stream_output: o operador vê a review sendo escrita em tempo real.
+#
+# ROTEAMENTO GATEWAY-FREE (prefixo do model-id decide o transporte) -----------
+#   claude-cli/            -> CLI local `claude --print`  (brain / qualidade)
+#   codex-cli/<model>      -> CLI local `codex exec`      (reviewer / outro provider)
+#   kimi/kimi-for-coding   -> API HTTP direta             (task barato/rápido)
+#   minimax/MiniMax-M3     -> API HTTP direta             (task / consensus)
+#   glm/glm-5.2            -> API HTTP direta              (consolidator, 1M ctx)
+#   <sem prefixo>          -> Omniroute legado             (NÃO usar aqui)
+# Prefixos cc/ e cx/ são legado Omniroute e NÃO rodam gateway-free.
+# Ref.: README.md ("How it routes") e docs/USAGE.md.
+# =============================================================================
+
+tasks:
+  - id: t0
+    name: "Enumerar arquivos modificados no PR"
+    kind: tool_call
+    depends_on: []
+    tool_name: bash                                # `git diff --name-only main...HEAD`
+    acceptance_criteria: |
+      Output é lista JSON de paths de arquivo, todos relativos à raiz do repo.
+      Exclui arquivos deletados (apenas criados/modificados). Máximo 50 arquivos
+      — se passar, emitir flag `truncated: true`.
+    timeout_seconds: 120
+
+  - id: t1
+    name: "Ler conteúdo completo dos arquivos modificados"
+    kind: tool_call
+    depends_on: [t0]
+    tool_name: file-read
+    acceptance_criteria: |
+      Output é map {path: content} para cada arquivo de t0. Conteúdo integral,
+      sem truncamento. Se algum arquivo > 100KB, inclui apenas as primeiras
+      100KB + flag `truncated_at: <size>`.
+    timeout_seconds: 300
+    input_selectors:
+      t0: raw_full
+
+  - id: t2
+    name: "Análise de lógica e correção por modelo premium"
+    kind: llm_call
+    depends_on: [t1]
+    model: claude-cli/                            # brain forte — erro de lógica pesa (CLI)
+    acceptance_criteria: |
+      Relatório estruturado com:
+        (1) lista de bugs/erros de lógica encontrados (por arquivo, por linha)
+        (2) edge cases não tratados (null, empty, overflow)
+        (3) invariantes quebradas (assumptions que não valem sempre)
+        (4) riscos de race condition / concorrência se aplicável
+      Cada item com severity [blocker | high | medium | low] e sugestão de
+      correção em 1-3 linhas. Sem opinions estéticas.
+    timeout_seconds: 900
+    input_selectors:
+      t1: raw_full
+
+  - id: t3
+    name: "Análise de segurança estruturada via PAL"
+    kind: pal_call
+    depends_on: [t1]
+    executor_hint: pal:codereview                  # OWASP-style scan
+    acceptance_criteria: |
+      Relatório OWASP-aware com:
+        (1) input validation gaps
+        (2) authz/authn issues
+        (3) injection vectors (SQL, command, XSS, SSRF)
+        (4) secret handling
+        (5) crypto choices
+      Zero falsos positivos de nível blocker (só flaga quando tem prova).
+    timeout_seconds: 900
+
+  - id: t4
+    name: "Análise de performance e refactor via Cursor"
+    kind: cli_spawn
+    depends_on: [t1]
+    executor_hint: cli:cursor                      # IDE-style suggestions
+    acceptance_criteria: |
+      Output texto com 5-15 sugestões de refactor concretas. Cada uma com:
+        (a) arquivo + linha (ou range)
+        (b) código atual (snippet curto)
+        (c) código sugerido (diff-ready)
+        (d) benefício em 1 frase: performance | legibilidade | manutenção
+      Priorizar perf sobre estilo. Sem sugestões do tipo "rename X to Y".
+    timeout_seconds: 900
+
+  - id: t5
+    name: "Consensus multi-modelo sobre os riscos rankeados"
+    kind: pal_call
+    depends_on: [t2, t3, t4]                      # fan-in das 3 análises
+    executor_hint: pal:consensus                   # debate multi-modelo
+    acceptance_criteria: |
+      Relatório final com top 10 riscos rankeados, consenso de pelo menos
+      2 das 3 análises (lógica/segurança/performance). Cada risco com:
+        (a) descrição (1 frase)
+        (b) origem (qual análise primária detectou)
+        (c) severity consensuada [blocker | high | medium | low]
+        (d) confidence [high | medium | low] baseada em concordância
+      Riscos únicos (só 1 análise detectou) ficam em seção separada
+      "Precisa validar humana" com justificativa.
+    timeout_seconds: 900
+    input_selectors:
+      t2: raw_full
+      t3: raw_full
+      t4: raw_full
+
+  - id: t6
+    name: "HITL: operador revisa consensus antes de gerar comment"
+    kind: llm_call                                 # placeholder — só pra gate
+    depends_on: [t5]
+    model: kimi/kimi-for-coding                    # barato — tarefa trivial (task worker)
+    acceptance_criteria: |
+      Output é apenas uma linha: "operador aprovou revisão com notas: ..." OU
+      "operador rejeitou — iterar em: ...". Após aprovação, t7 gera o comment.
+    timeout_seconds: 60
+    hitl: true                                     # gate central
+    input_selectors:
+      t5: raw_full
+
+  - id: t7
+    name: "Gerar review comment formato GitHub"
+    kind: llm_call
+    depends_on: [t6]
+    model: claude-cli/                            # sólido pra formatação (brain via CLI)
+    acceptance_criteria: |
+      Markdown pronto pra colar em GitHub PR review, com:
+        (1) summary de 1 parágrafo (2-3 frases)
+        (2) seção "Blockers" (se houver) com code blocks `path:line`
+        (3) seção "High priority" (se houver)
+        (4) seção "Suggestions" (medium/low, agrupadas)
+        (5) tom colaborativo (não prescritivo)
+      Cada ponto terá ✅ ⚠️ 🔴 emoji conforme severidade.
+    timeout_seconds: 420
+    stream_output: true                            # o operador vê sendo escrito
+    input_selectors:
+      t5: raw_full
+      t6: raw_full
+
+# IMPORTAR -------------------------------------------------------------------
+# node bin/omniforge import docs/examples/dags/03-media-alta-code-review.yaml \
+#   -w internal \
+#   -n pr-review-profundo \
+#   -o "review profundo de PR antes de review humano com multi-perspectiva"

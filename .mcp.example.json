@@ -1,11 +1,6 @@
 {
+  "_note": "Gateway-free setup: the legacy HTTP gateway on port 20228 is disabled and its MCP server was removed from this template. Model routing is now by model-id prefix (kimi/ minimax/ glm/ = direct HTTP; claude-cli/ codex-cli/ = local CLI). See README.md and docs/USAGE.md. The omniforge (stdio) server below works with no extra configuration.",
   "mcpServers": {
-    "omniroute": {
-      "url": "http://localhost:20228/api/mcp/sse",
-      "headers": {
-        "Authorization": "Bearer CHANGE_ME"
-      }
-    },
     "omniforge": {
       "type": "stdio",
       "command": "node",

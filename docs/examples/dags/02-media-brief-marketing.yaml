@@ -1,0 +1,139 @@
+# =============================================================================
+# DAG #2 — Brief de marketing 1 pager com research + fact-check (MÉDIA complex.)
+# =============================================================================
+# Tipo:        conteúdo / comunicação
+# Tasks:       5
+# Kinds:       3 (cli_spawn + llm_call + tool_call)
+# Providers:   3 (cli:gemini local, cc direto, cx OpenAI)
+# Modelos:     Sonnet S-, GPT-5.1 A+, Haiku B+
+# HITL:        não
+# Tempo est.:  ~10 minutos
+#
+# LÓGICA DO PROJETO ----------------------------------------------------------
+# Tarefa real de agência: cliente pede brief de 1 página sobre tendência de
+# mercado. Precisa de (1) stats atualizadas, (2) redação polida, (3) URLs
+# que ainda funcionem, (4) revisão cruzada por modelo de outro provider.
+#
+# Arquitetura em 4 estágios:
+#
+#   ┌──────────┐   ┌──────────────────────────────────┐   ┌────────────┐
+#   │ t0       │   │ t1 redige       │  t2 fact-check │   │ t3 cross-  │
+#   │ research │──▶│ (depends on t0) │  (depends t1)  │──▶│ review     │
+#   │ gemini   │   │                  │  http-request  │   │ gpt-5.1    │
+#   └──────────┘   └──────────────────────────────────┘   └────────────┘
+#                                                                │
+#                                                          ┌─────▼─────┐
+#                                                          │ t4 final  │
+#                                                          │ haiku apli│
+#                                                          │ correções │
+#                                                          └───────────┘
+#
+# Decisões explicadas:
+#   • t0 cli:gemini: grounded search built-in — stats atualizadas com URLs.
+#     llm_call normal via gemini-cli/* rota Omniroute também funcionaria,
+#     mas o binário local preserva a chain-of-thought de research visível.
+#   • t1 Sonnet: default sólido para redação média.
+#   • t2 tool_call http-request: confirma que as URLs citadas em t0
+#     retornam 2xx ANTES de deixar o brief "fechado". Zero LLM cost.
+#   • t3 gpt-5.1 (OpenAI): revisão cruzada por modelo de OUTRO provider
+#     (princípio de diversidade — Claude pode viesar pra Claude voice).
+#     A+ tier = sweet spot custo/qualidade.
+#   • t4 Haiku: aplica o diff final. Volta pro barato — trabalho pronto.
+#
+# ROTEAMENTO GATEWAY-FREE (prefixo do model-id decide o transporte) -----------
+#   claude-cli/            -> CLI local `claude --print`  (brain / qualidade)
+#   codex-cli/<model>      -> CLI local `codex exec`      (reviewer / outro provider)
+#   kimi/kimi-for-coding   -> API HTTP direta             (task barato/rápido)
+#   minimax/MiniMax-M3     -> API HTTP direta             (task / consensus)
+#   glm/glm-5.2            -> API HTTP direta              (consolidator, 1M ctx)
+#   <sem prefixo>          -> Omniroute legado             (NÃO usar aqui)
+# Prefixos cc/ e cx/ são legado Omniroute e NÃO rodam gateway-free.
+# (executor_hint: cli:gemini é executor de CLI, não prefixo de model — ok manter.)
+# Ref.: README.md ("How it routes") e docs/USAGE.md.
+# =============================================================================
+
+tasks:
+  - id: t0
+    name: "Research grounded: stats recentes sobre o tópico"
+    kind: cli_spawn
+    depends_on: []
+    executor_hint: cli:gemini                      # grounded search nativo
+    acceptance_criteria: |
+      Nota de research estruturada com:
+        (1) 5+ stats quantitativas de 2025 ou 2026
+        (2) cada stat com URL da fonte e data de publicação
+        (3) 3 tendências de mercado em 2-3 frases cada
+        (4) lista de 3+ players relevantes com 1 frase de positioning cada
+      Apenas fontes de veículos reconhecidos. Sem stats de "research anônimo".
+    timeout_seconds: 600
+
+  - id: t1
+    name: "Redigir brief de 1 página incorporando o research"
+    kind: llm_call
+    depends_on: [t0]
+    model: claude-cli/                            # sólido para redação (brain via CLI)
+    acceptance_criteria: |
+      Markdown de 500-700 palavras com:
+        (1) título forte (não genérico)
+        (2) abertura em 1 parágrafo que posiciona o problema
+        (3) 3 seções correspondendo às 3 tendências de t0
+        (4) cada stat citada tem footnote [1], [2], ... numerado
+        (5) conclusão em 2-3 frases com call-to-action
+        (6) lista final "Fontes" com URLs numeradas batendo com footnotes
+      Tom: autoridade técnica, não hype vendedor.
+    timeout_seconds: 600
+    input_selectors:
+      t0: raw_full
+
+  - id: t2
+    name: "HEAD-check de todas as URLs citadas"
+    kind: tool_call
+    depends_on: [t1]
+    tool_name: http-request                        # zero LLM — determinístico
+    acceptance_criteria: |
+      Retorna JSON array: [{url, status_code, ok}] para cada URL citada no t1.
+      Flaga qualquer non-2xx como broken. Não interrompe o workflow se algumas
+      falharem — apenas reporta.
+    timeout_seconds: 180
+    input_selectors:
+      t1: raw_full
+
+  - id: t3
+    name: "Cross-review por modelo de outro provider (OpenAI)"
+    kind: llm_call
+    depends_on: [t1, t2]
+    model: codex-cli/gpt-5.5                       # outro provider, diversifica viés (CLI)
+    acceptance_criteria: |
+      Documento de review com:
+        (1) 3-5 problemas concretos identificados (tom, clareza, factual)
+        (2) para cada problema, sugestão de reescrita específica
+        (3) nota final 0-10 sobre publicabilidade
+        (4) para URLs broken em t2: decisão entre [substituir por X, remover
+            a stat, manter com disclaimer]
+      Se o brief está bom, apenas "APROVADO" + short nota. Não force problemas
+      inexistentes.
+    timeout_seconds: 420
+    input_selectors:
+      t1: raw_full
+      t2: raw_full
+
+  - id: t4
+    name: "Aplicar correções e entregar versão final"
+    kind: llm_call
+    depends_on: [t1, t3]
+    model: kimi/kimi-for-coding                    # volta pro barato — só aplica diff
+    acceptance_criteria: |
+      Brief markdown final (apenas o texto — sem meta-comentários). Todas as
+      sugestões de t3 aplicadas, incluindo substituições de URLs quebradas.
+      Mesma estrutura de 500-700 palavras e footnotes numeradas.
+    timeout_seconds: 240
+    stream_output: true                            # progresso live para o operador
+    input_selectors:
+      t1: raw_full
+      t3: raw_full
+
+# IMPORTAR -------------------------------------------------------------------
+# node bin/omniforge import docs/examples/dags/02-media-brief-marketing.yaml \
+#   -w internal \
+#   -n brief-marketing-1pager \
+#   -o "brief de marketing de 1 página com research recente e fact-check"

@@ -1,0 +1,270 @@
+# =============================================================================
+# DAG #4 — Análise competitiva de 5 empresas com relatório (ALTA complex.)
+# =============================================================================
+# Tipo:        research / análise / relatório
+# Tasks:       11
+# Kinds:       4 (llm_call + cli_spawn + pal_call + tool_call)
+# Providers:   4 (cc, cx, cli:gemini, pal)
+# Modelos:     Opus 4.6 S, Opus 4.7 S+, GPT-5.1 A+, Haiku B+, Gemini CLI
+# HITL:        1 gate (operador valida ranking antes do relatório)
+# Tempo est.:  ~30-45 minutos
+#
+# LÓGICA DO PROJETO ----------------------------------------------------------
+# Research de consultor: cliente pede análise competitiva de 5 players num
+# mercado. Precisa de (1) framework analítico, (2) research paralelo das 5
+# empresas, (3) normalização, (4) ranking por consensus, (5) validação humana,
+# (6) relatório executivo refinado.
+#
+# Arquitetura em 5 camadas:
+#
+#   ┌────────┐
+#   │ t0     │  Framework analítico (top-down — Opus)
+#   │ Opus   │
+#   └───┬────┘
+#       │
+#       ├──────┬──────┬──────┬──────┐ ← 5 paralelos
+#       ▼      ▼      ▼      ▼      ▼
+#    ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐
+#    │ t1 │ │ t2 │ │ t3 │ │ t4 │ │ t5 │   Research grounded
+#    │Gem │ │Gem │ │Gem │ │Gem │ │Gem │   (cli:gemini)
+#    └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘
+#      └──────┴──────┴──────┴──────┘
+#                   │
+#                   ▼
+#               ┌───────┐
+#               │ t6    │  Normalização (GPT-5.1 — viés alternativo)
+#               │ gpt-5 │
+#               └───┬───┘
+#                   │
+#                   ▼
+#               ┌───────┐
+#               │ t7    │  Consensus ranking (pal:consensus)
+#               │ pal   │
+#               └───┬───┘
+#                   │
+#                   ▼
+#               ┌───────┐
+#               │ t8    │  HITL operador valida
+#               │ HITL  │
+#               └───┬───┘
+#                   │
+#                   ▼
+#               ┌───────┐
+#               │ t9    │  Relatório executivo (Opus 4.7 S+ stream adaptive)
+#               │ Opus+ │
+#               └───┬───┘
+#                   │
+#                   ▼
+#               ┌───────┐
+#               │ t10   │  Escreve arquivo final
+#               │ file  │
+#               └───────┘
+#
+# Decisões explicadas:
+#   • t0 Opus 4.6: arquitetura do framework — S premium, decisão top-down.
+#   • t1-t5 fan-out cli:gemini: 5 empresas pesquisadas EM PARALELO (não
+#     serializadas). Usa grounded search pra stats atuais. Ganho de tempo:
+#     ~5x versus serial. Cada task tem mesma acceptance pra output comparável.
+#   • t6 GPT-5.1 (OpenAI A+): normaliza os 5 outputs em estrutura tabular.
+#     De PROPÓSITO não usa Anthropic aqui — evita viés "Claude consolida
+#     melhor o que Claude produziu".
+#   • t7 pal:consensus: 3+ modelos discutem ranking. Evita "consultor solo"
+#     impondo ordem arbitrária.
+#   • t8 HITL: o operador conhece o contexto do cliente, pode ajustar antes do
+#     relatório final ser escrito.
+#   • t9 Opus 4.7 (S+): relatório final = melhor modelo. stream_output=true
+#     (o operador acompanha). execution_mode=adaptive (FASE 1B — supervisor loop
+#     permite o operador injetar steering messages se quiser refinar durante).
+#   • t10 tool_call file-write: persiste o relatório em disco.
+#     OBSERVAÇÃO: alternativa é trocar t9 por cli:claude-code que escreve
+#     direto (elimina t10). Aqui mantemos t10 pra demonstrar a separação
+#     "gerar conteúdo (llm) vs persistir (tool)". Mais testável.
+#
+# ROTEAMENTO GATEWAY-FREE (prefixo do model-id decide o transporte) -----------
+#   claude-cli/            -> CLI local `claude --print`  (brain / qualidade)
+#   codex-cli/<model>      -> CLI local `codex exec`      (reviewer / outro provider)
+#   kimi/kimi-for-coding   -> API HTTP direta             (task barato/rápido)
+#   minimax/MiniMax-M3     -> API HTTP direta             (task / consensus)
+#   glm/glm-5.2            -> API HTTP direta              (consolidator, 1M ctx)
+#   <sem prefixo>          -> Omniroute legado             (NÃO usar aqui)
+# Prefixos cc/ e cx/ são legado Omniroute e NÃO rodam gateway-free.
+# Ref.: README.md ("How it routes") e docs/USAGE.md.
+# =============================================================================
+
+tasks:
+  - id: t0
+    name: "Definir framework analítico (dimensões, métricas, pesos)"
+    kind: llm_call
+    depends_on: []
+    model: claude-cli/                            # brain — decisão top-down (CLI)
+    acceptance_criteria: |
+      Documento com:
+        (1) lista de 5-8 dimensões comparativas (ex: produto, preço, GTM,
+            tech stack, funding, time, mercado endereçável)
+        (2) para cada dimensão, 2-3 métricas observáveis
+        (3) peso sugerido (0-100) de cada dimensão, com justificativa
+        (4) 3+ viéses conhecidos desse tipo de análise e como mitigar
+      Formato JSON estruturado, não markdown. Será consumido pelas 5 researches
+      em paralelo.
+    timeout_seconds: 600
+
+  - id: t1
+    name: "Research empresa A"
+    kind: cli_spawn
+    depends_on: [t0]
+    executor_hint: cli:gemini                      # grounded search atual
+    acceptance_criteria: |
+      Para cada dimensão do framework em t0, responder com:
+        (a) dado observado (número, fato, fonte)
+        (b) URL + data da fonte
+        (c) confidence [high | medium | low]
+      Mínimo 12 data points. Apenas fontes ≤ 12 meses. Proibido inventar
+      números — flagar "data não disponível publicamente" quando aplicável.
+    timeout_seconds: 900
+    input_selectors:
+      t0: raw_full
+
+  - id: t2
+    name: "Research empresa B"
+    kind: cli_spawn
+    depends_on: [t0]
+    executor_hint: cli:gemini
+    acceptance_criteria: |
+      Mesma estrutura de t1, adaptada para empresa B. Mínimo 12 data points.
+      Fontes ≤ 12 meses. Sem invenção.
+    timeout_seconds: 900
+    input_selectors:
+      t0: raw_full
+
+  - id: t3
+    name: "Research empresa C"
+    kind: cli_spawn
+    depends_on: [t0]
+    executor_hint: cli:gemini
+    acceptance_criteria: |
+      Mesma estrutura de t1, adaptada para empresa C. Mínimo 12 data points.
+      Fontes ≤ 12 meses. Sem invenção.
+    timeout_seconds: 900
+    input_selectors:
+      t0: raw_full
+
+  - id: t4
+    name: "Research empresa D"
+    kind: cli_spawn
+    depends_on: [t0]
+    executor_hint: cli:gemini
+    acceptance_criteria: |
+      Mesma estrutura de t1, adaptada para empresa D. Mínimo 12 data points.
+      Fontes ≤ 12 meses. Sem invenção.
+    timeout_seconds: 900
+    input_selectors:
+      t0: raw_full
+
+  - id: t5
+    name: "Research empresa E"
+    kind: cli_spawn
+    depends_on: [t0]
+    executor_hint: cli:gemini
+    acceptance_criteria: |
+      Mesma estrutura de t1, adaptada para empresa E. Mínimo 12 data points.
+      Fontes ≤ 12 meses. Sem invenção.
+    timeout_seconds: 900
+    input_selectors:
+      t0: raw_full
+
+  - id: t6
+    name: "Normalizar 5 researches em tabela comparativa"
+    kind: llm_call
+    depends_on: [t1, t2, t3, t4, t5]              # fan-in dos 5
+    model: codex-cli/gpt-5.5                       # outro provider, evita viés Claude (CLI)
+    acceptance_criteria: |
+      Output JSON com estrutura:
+        {
+          "dimensions": [...],
+          "companies": ["A", "B", "C", "D", "E"],
+          "matrix": {
+            "<dimensão>": {
+              "A": {value, confidence, source_url},
+              "B": {...}, ...
+            }
+          },
+          "gaps": [{company, dimension, reason}]   // dados faltantes
+        }
+      Valores normalizados para comparabilidade. Se uma empresa tinha "50M ARR"
+      e outra tinha "$50 milhões receita", padronizar unidades e moeda.
+    timeout_seconds: 600
+    input_selectors:
+      t1: raw_full
+      t2: raw_full
+      t3: raw_full
+      t4: raw_full
+      t5: raw_full
+
+  - id: t7
+    name: "Ranking competitivo via consensus multi-modelo"
+    kind: pal_call
+    depends_on: [t6]
+    executor_hint: pal:consensus                   # 3+ modelos debatem
+    acceptance_criteria: |
+      Ranking 1º-5º das empresas por cada dimensão + ranking overall ponderado
+      pelos pesos de t0. Para cada posição, incluir:
+        (a) rationale em 2-3 frases
+        (b) score numérico 0-100
+        (c) confidence consensuada [high | medium | low]
+      Flaggar empates ou decisões contestadas para revisão humana.
+    timeout_seconds: 1200
+
+  - id: t8
+    name: "HITL: operador valida ranking antes do relatório"
+    kind: llm_call
+    depends_on: [t7]
+    model: kimi/kimi-for-coding                    # barato — só registra decisão (task)
+    acceptance_criteria: |
+      Nota com decisão final do operador: ranking aprovado como está, ou ajuste
+      manual indicado (ex: "inverter posição 3 e 4, rationale: X").
+    timeout_seconds: 60
+    hitl: true                                     # gate central
+    input_selectors:
+      t7: raw_full
+
+  - id: t9
+    name: "Relatório executivo em markdown (adaptive, streaming)"
+    kind: llm_call
+    depends_on: [t8]
+    model: claude-cli/                            # brain — máxima qualidade (CLI)
+    acceptance_criteria: |
+      Relatório executivo 2500-3500 palavras, markdown, com:
+        (1) TL;DR de 3 bullets
+        (2) metodologia (referencia framework de t0)
+        (3) matriz comparativa visual (markdown table ou mermaid)
+        (4) deep-dive por empresa (~400 palavras cada)
+        (5) ranking overall com rationale
+        (6) recomendações estratégicas (3-5)
+        (7) apêndice com todas as fontes citadas (numeradas)
+      Tom: consultor sênior. Sem hype. Sem hedging excessivo ("it depends"
+      aceita, mas com propostas de como resolver a ambiguidade).
+    timeout_seconds: 1500
+    stream_output: true                            # o operador acompanha em tempo real
+    execution_mode: adaptive                       # supervisor loop — steering possível
+    input_selectors:
+      t6: raw_full
+      t7: raw_full
+      t8: raw_full
+
+  - id: t10
+    name: "Persistir relatório final em arquivo markdown"
+    kind: tool_call
+    depends_on: [t9]
+    tool_name: file-write                          # zero LLM — determinístico
+    acceptance_criteria: |
+      Grava OUTPUT_DIR/analise-competitiva.md com o conteúdo exato de t9.
+      Encoding UTF-8. Retorna path absoluto do arquivo.
+    timeout_seconds: 60
+    input_selectors:
+      t9: raw_full
+
+# IMPORTAR -------------------------------------------------------------------
+# node bin/omniforge import docs/examples/dags/04-alta-analise-competitiva.yaml \
+#   -w internal \
+#   -n analise-competitiva-5-players \
+#   -o "análise competitiva de N empresas com research paralelo, consensus e relatório"

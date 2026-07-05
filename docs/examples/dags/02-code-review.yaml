@@ -1,0 +1,56 @@
+# Code Review DAG
+# Use case: Automated code review with multiple perspectives
+#
+# Model routing (gateway-free): the model id prefix decides the transport.
+#   claude-cli/            -> local `claude --print` CLI (brain / analysis)
+#   codex-cli/<model>      -> local `codex exec` CLI  (reviewer; strong but slow)
+#   kimi/kimi-for-coding   -> direct HTTP API         (fast task worker)
+#   minimax/MiniMax-M3     -> direct HTTP API         (task / consensus)
+#   glm/glm-5.2            -> direct HTTP API          (consolidator; 1M ctx)
+#   <no prefix>            -> legacy Omniroute gateway  (do NOT use here)
+# Legacy prefixes cc/ and cx/ route through Omniroute and will NOT run
+# gateway-free. See README.md ("How it routes") and docs/USAGE.md.
+tasks:
+  - id: t0
+    name: "Security analysis"
+    kind: llm_call
+    depends_on: []
+    model: claude-cli/
+    acceptance_criteria: "Identifies all potential security vulnerabilities"
+    hitl: false
+    timeout_seconds: 300
+    execution_mode: ephemeral
+
+  - id: t1
+    name: "Performance analysis"
+    kind: llm_call
+    depends_on: []
+    model: claude-cli/
+    acceptance_criteria: "Identifies performance bottlenecks and optimizations"
+    hitl: false
+    timeout_seconds: 300
+    execution_mode: ephemeral
+
+  - id: t2
+    name: "Code quality analysis"
+    kind: llm_call
+    depends_on: []
+    model: claude-cli/
+    acceptance_criteria: "Evaluates code quality, maintainability, and best practices"
+    hitl: false
+    timeout_seconds: 300
+    execution_mode: ephemeral
+
+  - id: t3
+    name: "Consolidate review"
+    kind: llm_call
+    depends_on: [t0, t1, t2]
+    model: glm/glm-5.2
+    acceptance_criteria: "Comprehensive review combining all perspectives"
+    hitl: false
+    timeout_seconds: 300
+    execution_mode: ephemeral
+    input_selectors:
+      t0: raw_full
+      t1: raw_full
+      t2: raw_full

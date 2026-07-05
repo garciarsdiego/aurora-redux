@@ -1,4 +1,4 @@
-type ModelFamily = 'anthropic' | 'openai' | 'google' | 'deepseek' | 'kimi' | 'generic';
+type ModelFamily = 'anthropic' | 'openai' | 'google' | 'deepseek' | 'kimi' | 'glm' | 'minimax' | 'generic';
 
 const GUIDANCE: Record<ModelFamily, string> = {
   // Claude handles its own conventions natively — no extra guidance needed.
@@ -40,6 +40,22 @@ const GUIDANCE: Record<ModelFamily, string> = {
     '- Do not add meta-commentary about your own capabilities or limitations.',
   ].join('\n'),
 
+  glm: [
+    'MODEL EXECUTION GUIDANCE (GLM/Zhipu family):',
+    '- Respond in English unless the objective explicitly requests another language.',
+    '- For code tasks, output complete implementations — do not truncate with comments.',
+    '- When outputting JSON, ensure it is strict and well-formed.',
+    '- Do not add meta-commentary about your own capabilities or limitations.',
+  ].join('\n'),
+
+  minimax: [
+    'MODEL EXECUTION GUIDANCE (MiniMax family):',
+    '- Respond in English unless the objective explicitly requests another language.',
+    '- For code tasks, output complete implementations — do not truncate with comments.',
+    '- When outputting JSON, ensure it is strict and well-formed — never wrap it in a <think> reasoning block.',
+    '- Do not add meta-commentary about your own capabilities or limitations.',
+  ].join('\n'),
+
   generic: '',
 };
 
@@ -48,6 +64,8 @@ const FAMILY_PREFIXES: Array<[string, ModelFamily]> = [
   ['deepseek', 'deepseek'],
   ['kimi', 'kimi'],
   ['moonshot', 'kimi'],
+  ['minimax', 'minimax'],
+  ['glm', 'glm'],
   ['claude', 'anthropic'],
   ['anthropic', 'anthropic'],
   ['gpt-', 'openai'],

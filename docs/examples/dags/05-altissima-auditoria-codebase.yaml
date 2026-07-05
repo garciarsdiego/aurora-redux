@@ -1,0 +1,372 @@
+# =============================================================================
+# DAG #5 — Auditoria completa de codebase + relatório + roadmap (ALTÍSSIMA)
+# =============================================================================
+# Tipo:        auditoria / projetos / relatórios
+# Tasks:       16
+# Kinds:       4 (llm_call + cli_spawn + pal_call + tool_call) — mix total
+# Providers:   5+ (cc, cx, cli:claude-code, cli:cursor, pal múltiplos)
+# Modelos:     Opus 4.7 S+, Opus 4.6 S, Sonnet 4.6 S-, GPT-5.1 A+, Haiku B+,
+#              cli:claude-code (com Agent dispatch nativo), cli:cursor
+# HITL:        2 gates (validação de rankings, aprovação de roadmap)
+# Tempo est.:  ~1.5-2 horas (tasks pesadas com timeout 1800s)
+#
+# LÓGICA DO PROJETO ----------------------------------------------------------
+# Cenário real: o operador (ou cliente) precisa de auditoria técnica completa de
+# um repo — arquitetura, segurança, performance, testes, dependências — com
+# relatório executivo e roadmap priorizado de remediação. Este é o tipo de
+# workflow que um consultor sênior tomaria 3-5 dias pra fazer manualmente.
+#
+# Princípios arquiteturais deste DAG:
+#
+#   1. FAN-OUT de ANÁLISES (t3-t7): 5 perspectivas independentes paralelas
+#      — arquitetura, segurança estática, segurança crítica, performance,
+#      testes. Roda em ~30min em vez de 2h serial.
+#
+#   2. PREPARAÇÃO DETERMINÍSTICA (t0-t2): setup, enumeração e leitura de
+#      contexto via tool_call — zero LLM cost até ter o material pronto.
+#
+#   3. CONSENSUS GATE (t9): não confiar em 1 perspectiva; top 10 riscos
+#      consensuados por 2+ análises. Evita viés "modelo X adora flagar
+#      pattern Y".
+#
+#   4. DOIS HITLs (t10, t13): (a) o operador prioriza rankings antes de escrever
+#      relatório, (b) o operador aprova roadmap antes de arquivar. Os dois
+#      momentos são onde a decisão humana agrega mais valor — tudo entre é
+#      mecânico pro LLM.
+#
+#   5. ARTEFATOS PERSISTIDOS (t14, t15): tool_call grava relatório e roadmap
+#      como arquivos reais em OUTPUT_DIR, não apenas como strings no DB.
+#
+#   6. ADAPTIVE EXECUTION no t11: relatório final usa supervisor loop
+#      (FASE 1B) — o operador pode injetar steering ("foca mais em X") enquanto
+#      a redação rola.
+#
+# Fluxo visual:
+#
+#   [t0 setup bash]─▶[t1 enumerate]─▶[t2 read docs]
+#                                         │
+#                 ┌───────────────────────┼───────────────────────┐
+#                 │                       │                        │
+#                 ▼                       ▼                        ▼
+#           [t3 arch cli:cc]      [t4 sec-scan bash]       [t6 perf cursor]
+#                 │                       │                        │
+#                 │                       ▼                        │
+#                 │                [t5 sec pal:codereview]         │
+#                 │                       │                        │
+#                 └───────┬───────────────┴────────┬───────────────┘
+#                         │                         │
+#                         ▼                         ▼
+#                 [t7 tests cli:cc]         [t8 deps pal:apilookup]
+#                         │                         │
+#                         └───────────┬─────────────┘
+#                                     ▼
+#                             [t9 consensus pal]
+#                                     │
+#                                     ▼
+#                             [t10 HITL operador ranking]
+#                                     │
+#                                     ▼
+#                     [t11 relatório Opus 4.7 adaptive stream]
+#                                     │
+#                                     ▼
+#                             [t12 roadmap Sonnet]
+#                                     │
+#                                     ▼
+#                             [t13 HITL operador roadmap]
+#                                     │
+#                         ┌───────────┴───────────┐
+#                         ▼                         ▼
+#                 [t14 write relatório]   [t15 write roadmap]
+#
+# ROTEAMENTO GATEWAY-FREE (prefixo do model-id decide o transporte) -----------
+#   claude-cli/            -> CLI local `claude --print`  (brain / qualidade)
+#   codex-cli/<model>      -> CLI local `codex exec`      (reviewer / outro provider)
+#   kimi/kimi-for-coding   -> API HTTP direta             (task barato/rápido)
+#   minimax/MiniMax-M3     -> API HTTP direta             (task / consensus)
+#   glm/glm-5.2            -> API HTTP direta              (consolidator, 1M ctx)
+#   <sem prefixo>          -> Omniroute legado             (NÃO usar aqui)
+# Prefixos cc/ e cx/ são legado Omniroute e NÃO rodam gateway-free.
+# Ref.: README.md ("How it routes") e docs/USAGE.md.
+# =============================================================================
+
+tasks:
+  - id: t0
+    name: "Setup: confirmar repo existe, branch clean, tools instaladas"
+    kind: tool_call
+    depends_on: []
+    tool_name: bash
+    acceptance_criteria: |
+      Output JSON:
+        {
+          "repo_path": "...",
+          "branch": "...",
+          "dirty": false,
+          "loc_total": <number>,
+          "tools": {"semgrep": true|false, "npm": true|false, ...}
+        }
+      Falhar cedo se o diretório não é git repo ou tem uncommitted changes.
+    timeout_seconds: 120
+
+  - id: t1
+    name: "Enumerar estrutura do codebase"
+    kind: tool_call
+    depends_on: [t0]
+    tool_name: bash                                # find + wc + tree (bounded)
+    acceptance_criteria: |
+      Tree estruturado + contagens:
+        (a) top-level dirs com LOC cada
+        (b) top 20 arquivos maiores (path + LOC)
+        (c) linguagens detectadas com % de LOC
+        (d) presença de arquivos-chave (README, LICENSE, CHANGELOG, tests/,
+            docs/, .github/, docker*, package.json|Cargo.toml|go.mod)
+    timeout_seconds: 180
+    input_selectors:
+      t0: raw_full
+
+  - id: t2
+    name: "Ler arquivos-contexto (README, ARCHITECTURE, etc.)"
+    kind: tool_call
+    depends_on: [t1]
+    tool_name: file-read
+    acceptance_criteria: |
+      Map {path: content} de todos os arquivos-contexto relevantes
+      (README, docs/*.md, ARCHITECTURE.md, CONTRIBUTING.md se existe).
+      Truncar em 200KB por arquivo com flag se exceder.
+    timeout_seconds: 120
+    input_selectors:
+      t1: raw_full
+
+  - id: t3
+    name: "Análise arquitetural (Agent dispatch paralelo no Claude Code)"
+    kind: cli_spawn
+    depends_on: [t2]
+    executor_hint: cli:claude-code                 # Agent tool nativo
+    acceptance_criteria: |
+      Output estruturado por camadas:
+        (1) topologia (módulos + deps entre eles, diagrama mermaid se possível)
+        (2) patterns identificados (MVC, hexagonal, clean arch, etc.)
+        (3) smells arquiteturais (god classes, circular deps, layering violations)
+        (4) decisões implícitas que deveriam ser documentadas
+        (5) 3-5 pontos fortes e 3-5 pontos fracos explícitos
+      Verifica em [[CLI_TOOL_CALLS]] que dispatched 3+ Agent subagents
+      (1 por camada de análise).
+    timeout_seconds: 1800
+    input_selectors:
+      t1: raw_full
+      t2: raw_full
+
+  - id: t4
+    name: "Scan de segurança estático (semgrep ou equivalente)"
+    kind: tool_call
+    depends_on: [t1]
+    tool_name: bash                                # `semgrep --config=auto` ou similar
+    acceptance_criteria: |
+      Output JSON dos findings do scanner, normalizado em:
+        [{rule_id, severity, file, line, message, cwe?, owasp?}]
+      Mesmo com 0 findings, emitir array vazio + metadata do scanner
+      (version, rules executadas). Não crashar se um ruleset falhar.
+    timeout_seconds: 900
+    input_selectors:
+      t1: raw_full
+
+  - id: t5
+    name: "Revisão crítica de segurança humana-estruturada (PAL)"
+    kind: pal_call
+    depends_on: [t2, t4]
+    executor_hint: pal:codereview                  # OWASP + secure-by-design check
+    acceptance_criteria: |
+      Complementa o scan automatizado com:
+        (1) análise de authn/authz real (não apenas padrões)
+        (2) threat model em 5 linhas
+        (3) revisão de handling de secrets (env vars, git history)
+        (4) revisão de crypto choices
+        (5) riscos arquiteturais de segurança (além de findings de código)
+      Referenciar findings de t4 quando complementar; NÃO duplicar.
+    timeout_seconds: 1500
+    input_selectors:
+      t2: raw_full
+      t4: raw_full
+
+  - id: t6
+    name: "Análise de performance e refactor sugestões (Cursor)"
+    kind: cli_spawn
+    depends_on: [t1, t2]
+    executor_hint: cli:cursor                      # IDE-style refactor concrete
+    acceptance_criteria: |
+      10-20 sugestões de perf/refactor com:
+        (a) file + line/range
+        (b) problema identificado
+        (c) patch sugerido (diff-ready)
+        (d) impacto esperado: hot-path | moderado | cosmético
+      Priorizar hot-path. Identificar algoritmos O(n²) que deveriam ser O(n log n),
+      N+1 queries, allocações em loop, etc.
+    timeout_seconds: 1500
+
+  - id: t7
+    name: "Análise de cobertura de testes + gaps"
+    kind: cli_spawn
+    depends_on: [t1]
+    executor_hint: cli:claude-code                 # Agent dispatch pra ler + analisar
+    acceptance_criteria: |
+      Relatório com:
+        (1) framework(s) de teste detectado(s)
+        (2) comando de execução inferido + tempo aproximado
+        (3) % estimado de cobertura por módulo (se metadata disponível)
+        (4) top 10 gaps (funções sem teste, crítica do impacto)
+        (5) smells nos testes existentes (fixtures duplicadas, mocks frágeis)
+      Dispatch 2+ Agent subagents pra análise em paralelo.
+    timeout_seconds: 1800
+    input_selectors:
+      t1: raw_full
+
+  - id: t8
+    name: "Análise de dependências e drift via API lookup"
+    kind: pal_call
+    depends_on: [t1]
+    executor_hint: pal:apilookup                   # consulta docs/releases
+    acceptance_criteria: |
+      Para cada dependência direta do package.json/Cargo.toml/go.mod:
+        (a) versão usada vs latest estável
+        (b) se deprecated ou substituída por outra
+        (c) CVEs abertas conhecidas
+        (d) changelog breaking changes entre atual e latest
+      Top 10 mais críticas primeiro. Ignorar devDependencies patch-bumps.
+    timeout_seconds: 1200
+    input_selectors:
+      t1: raw_full
+
+  - id: t9
+    name: "Consensus: top 10 riscos rankeados (3+ modelos debatem)"
+    kind: pal_call
+    depends_on: [t3, t4, t5, t6, t7, t8]           # fan-in massivo das 6 análises
+    executor_hint: pal:consensus
+    acceptance_criteria: |
+      Top 10 riscos consolidados, cada um com:
+        (a) descrição
+        (b) análises que apontaram (quais de t3-t8)
+        (c) severity [blocker | high | medium | low] consensuada
+        (d) confidence [high | medium | low]
+        (e) esforço estimado de remediação [horas | dias | semanas]
+      + Seção "Apenas 1 análise flaggou" com riscos únicos para o operador avaliar.
+    timeout_seconds: 1500
+    input_selectors:
+      t3: raw_full
+      t4: raw_full
+      t5: raw_full
+      t6: raw_full
+      t7: raw_full
+      t8: raw_full
+
+  - id: t10
+    name: "HITL #1: operador valida rankings antes do relatório"
+    kind: llm_call
+    depends_on: [t9]
+    model: kimi/kimi-for-coding                    # barato — só registra decisão (task)
+    acceptance_criteria: |
+      Decisão estruturada do operador sobre os rankings:
+        (a) rankings aprovados como estão | ajustados (listar mudanças)
+        (b) riscos únicos promovidos ao top 10 se aplicável
+        (c) bloqueadores explícitos (quaisquer riscos que o operador considera
+            blocker mesmo se consensus disse diferente)
+    timeout_seconds: 60
+    hitl: true                                     # primeiro gate
+    input_selectors:
+      t9: raw_full
+
+  - id: t11
+    name: "Relatório executivo (Opus 4.7 S+, adaptive, streaming)"
+    kind: llm_call
+    depends_on: [t10]
+    model: claude-cli/                            # brain — premium absoluto (CLI)
+    acceptance_criteria: |
+      Relatório executivo 4000-6000 palavras, markdown, com:
+        (1) Sumário executivo de 1 página (2 bullets críticos + 3 de alto nível)
+        (2) Metodologia da auditoria (referencia tasks t3-t8)
+        (3) Estado da arquitetura (summary de t3)
+        (4) Superfície de segurança (summary t4+t5)
+        (5) Performance e escalabilidade (summary t6)
+        (6) Qualidade e testes (summary t7)
+        (7) Dependências e supply chain (summary t8)
+        (8) Top 10 riscos consolidados (tabela com severity, confidence, esforço)
+        (9) Recomendações estratégicas (3-5)
+        (10) Apêndice com todos os findings (tabelas longas)
+      Tom: consultor sênior. Claims SEMPRE citam task origem (t3, t4, etc.).
+      Zero placeholders.
+    timeout_seconds: 1800
+    stream_output: true                            # o operador acompanha
+    execution_mode: adaptive                       # supervisor loop — steering possível
+    input_selectors:
+      t3: summary_only                             # pega só sumário; matriz vem do t9
+      t4: summary_only
+      t5: summary_only
+      t6: summary_only
+      t7: summary_only
+      t8: summary_only
+      t9: raw_full                                 # consensus completo
+      t10: raw_full                                # decisão humana
+
+  - id: t12
+    name: "Roadmap de remediação priorizado (12 meses)"
+    kind: llm_call
+    depends_on: [t11]
+    model: claude-cli/                            # sólido pra planejamento (brain via CLI)
+    acceptance_criteria: |
+      Roadmap markdown estruturado por quarter:
+        Q1: ações "apagar incêndios" (blockers)
+        Q2-Q3: remediação estrutural (high priority)
+        Q4: melhorias (medium priority)
+      Para cada item:
+        (a) descrição em 1-2 frases
+        (b) esforço estimado em dev-days
+        (c) riscos mitigados (referenciar top 10 de t11)
+        (d) dependências internas (qual item precisa vir antes)
+        (e) KPI de sucesso mensurável
+      Sumário em 1 parágrafo: "Se executar até Q2, o repo sai de X para Y."
+    timeout_seconds: 1200
+    input_selectors:
+      t11: raw_full
+
+  - id: t13
+    name: "HITL #2: operador aprova roadmap antes de arquivar"
+    kind: llm_call
+    depends_on: [t12]
+    model: kimi/kimi-for-coding                    # barato — registra aprovação (task)
+    acceptance_criteria: |
+      Decisão: roadmap aprovado | ajustes listados. Se ajustado, listar
+      mudanças específicas (ex: "mover item X de Q3 para Q1, razão: Y").
+    timeout_seconds: 60
+    hitl: true                                     # segundo gate
+    input_selectors:
+      t12: raw_full
+
+  - id: t14
+    name: "Persistir relatório executivo em arquivo markdown"
+    kind: tool_call
+    depends_on: [t13]
+    tool_name: file-write
+    acceptance_criteria: |
+      Grava OUTPUT_DIR/auditoria-relatorio.md com o conteúdo de t11
+      (possivelmente ajustado por t13). UTF-8. Retorna path absoluto.
+    timeout_seconds: 60
+    input_selectors:
+      t11: raw_full
+      t13: raw_full
+
+  - id: t15
+    name: "Persistir roadmap em arquivo markdown"
+    kind: tool_call
+    depends_on: [t13]
+    tool_name: file-write
+    acceptance_criteria: |
+      Grava OUTPUT_DIR/auditoria-roadmap.md com o conteúdo de t12
+      (possivelmente ajustado por t13). UTF-8. Retorna path absoluto.
+    timeout_seconds: 60
+    input_selectors:
+      t12: raw_full
+      t13: raw_full
+
+# IMPORTAR -------------------------------------------------------------------
+# node bin/omniforge import docs/examples/dags/05-altissima-auditoria-codebase.yaml \
+#   -w internal \
+#   -n auditoria-completa-codebase \
+#   -o "auditoria técnica completa de repositório com relatório executivo e roadmap"
