@@ -12,6 +12,8 @@ import type {
 } from './types.js';
 import { reviewArchitectureIntegration } from './architecture-reviewer.js';
 import type { ArchitectureContract } from '../workflow-modes/existing-code-feature.js';
+import type { CanvasRegionCheck, InteractionCheck } from './playwright-product-harness.js';
+import { isCanvasRegionCheckArray, isInteractionCheckArray } from './visual-check-guards.js';
 
 interface TaskRow {
   id: string;
@@ -95,6 +97,45 @@ export function loadArchitectureContractForWorkflow(
     if (contract) return contract;
   }
   return null;
+}
+
+/**
+ * FASE C (Visual Reviewer) item 3 — aggregates canvasRegionChecks /
+ * interactionChecks declared on any task in the workflow's DAG (persisted
+ * into each task's input_json by orchestrate.ts — the Task interface/tasks
+ * table carry no dedicated columns for these, same pattern as the
+ * deterministic step-kind config) so they can be passed through to the
+ * Playwright harness's PlaywrightHarnessInput at the final quality gate.
+ *
+ * Purely additive/best-effort: tasks with malformed or absent checks are
+ * silently skipped rather than throwing, so a single bad task can never
+ * break the final quality gate. Queries `tasks` directly (mirrors
+ * loadArchitectureContractForWorkflow above) rather than piggybacking on
+ * the redacted FinalProductEvidenceBundle, so callers don't need to thread
+ * an extra field through the bundle just for this.
+ */
+export function collectVisualChecksForWorkflow(
+  db: Database.Database,
+  workflowId: string,
+): { canvasRegionChecks: CanvasRegionCheck[]; interactionChecks: InteractionCheck[] } {
+  const tasks = db
+    .prepare(`SELECT input_json FROM tasks WHERE workflow_id = ? ORDER BY created_at ASC`)
+    .all(workflowId) as Array<{ input_json: string | null }>;
+
+  const canvasRegionChecks: CanvasRegionCheck[] = [];
+  const interactionChecks: InteractionCheck[] = [];
+  for (const task of tasks) {
+    const input = safeParseJson(task.input_json);
+    const canvasCandidate = input['canvasRegionChecks'];
+    if (isCanvasRegionCheckArray(canvasCandidate)) {
+      canvasRegionChecks.push(...canvasCandidate);
+    }
+    const interactionCandidate = input['interactionChecks'];
+    if (isInteractionCheckArray(interactionCandidate)) {
+      interactionChecks.push(...interactionCandidate);
+    }
+  }
+  return { canvasRegionChecks, interactionChecks };
 }
 
 function executionRootsFromTask(task: TaskRow): string[] {
@@ -385,9 +426,20 @@ export function buildFinalProductEvidenceBundle(
  * a package.json that depends on react, vue, svelte, or next (any tier:
  * dependencies, devDependencies, peerDependencies). Used by the final
  * reviewer to decide whether the Playwright product harness is meaningful.
+ *
+ * Q4b: Also returns true when the projectRoot has an `index.html` at its
+ * root — a zero-build static app (e.g. a plain HTML/canvas/three.js game
+ * clone with no framework package.json) is just as "web app" as a React
+ * project for the purposes of the Playwright product harness. This widens
+ * the existing detection; it never narrows it — the framework-dependency
+ * checks below are unchanged.
  */
 export function isWebAppProject(projectRoot: string): boolean {
   if (!projectRoot) return false;
+
+  const indexHtmlPath = join(projectRoot, 'index.html');
+  if (existsSync(indexHtmlPath)) return true;
+
   const pkgPath = join(projectRoot, 'package.json');
   if (!existsSync(pkgPath)) return false;
   let pkg: unknown;

@@ -1,9 +1,11 @@
 import type Database from 'better-sqlite3';
 import type { Task } from '../../../types/index.js';
-import { insertEvent } from '../../../db/persist.js';
+import { insertEvent, loadWorkflowById, setTaskFailed } from '../../../db/persist.js';
 import { getTaskQualityReviewMode } from '../../../utils/config.js';
 import { enforceLightTaskQualityReview } from '../../../quality/task-reviewer.js';
 import { createQualityFixTasks } from '../../../quality/fix-tasks.js';
+import { attemptTaskVisualGate } from '../../../quality/task-visual-gate.js';
+import type { QualityReviewRow } from '../../../quality/types.js';
 
 /**
  * Runs the post-completion light quality review. When the gate flips a task
@@ -22,6 +24,37 @@ export async function runQualityGate(
 ): Promise<import('../../../quality/types.js').QualityReviewRow | null> {
   const taskQualityReviewMode = getTaskQualityReviewMode();
   if (taskQualityReviewMode === 'off') return null;
+
+  // FASE C (Visual Reviewer) item 4 — reviewer_profile === 'visual' plugs a
+  // deterministic Playwright-harness pre-check in BEFORE the LLM-backed
+  // enforceLightTaskQualityReview path below. attemptTaskVisualGate returns
+  // `null` (fall through unchanged) unless the task truly opted in AND a
+  // deterministic check actually failed, so this can never affect a
+  // workflow that doesn't declare reviewer_profile:'visual' with checks.
+  // Zero LLM cost is spent to reach a rejected outcome here.
+  const visualGateReview = await attemptTaskVisualGateSafely(db, task, wfId);
+  if (visualGateReview) {
+    if (taskQualityReviewMode === 'enforced') {
+      setTaskFailed(db, task.id);
+      insertEvent(db, {
+        workflow_id: wfId,
+        task_id: task.id,
+        type: 'task_quality_gate_blocked',
+        payload: {
+          review_id: visualGateReview.id,
+          outcome: visualGateReview.outcome,
+          score: visualGateReview.score,
+          source: 'visual_harness_precheck',
+        },
+      });
+      const { QualityGateFailedError } = await import('../../../quality/task-reviewer.js');
+      throw new QualityGateFailedError(
+        `Task quality gate blocked completion: ${visualGateReview.outcome}`,
+        visualGateReview,
+      );
+    }
+    return visualGateReview;
+  }
 
   // Tier 0 Wave 3 (ITEM 0.6) — when the light quality gate fires
   // needs_fixes / blocked under enforced mode, enforceLightTaskQualityReview
@@ -114,5 +147,35 @@ export async function runQualityGate(
       }
     }
     throw gateErr;
+  }
+}
+
+/**
+ * FASE C (Visual Reviewer) item 4 — resolves the workflow objective (for
+ * the harness's `objective` field) and delegates to attemptTaskVisualGate.
+ * NEVER throws: any unexpected error here is caught and treated as "gate
+ * does not apply" (returns null) so a bug in the new visual-gate wiring can
+ * never break the pre-existing quality gate behaviour for any task.
+ */
+async function attemptTaskVisualGateSafely(
+  db: Database.Database,
+  task: Task,
+  wfId: string,
+): Promise<QualityReviewRow | null> {
+  try {
+    const workflow = loadWorkflowById(db, wfId);
+    return await attemptTaskVisualGate(db, {
+      workflowId: wfId,
+      task,
+      objective: workflow?.objective ?? task.name,
+    });
+  } catch (err) {
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: task.id,
+      type: 'task_visual_gate_error',
+      payload: { error: err instanceof Error ? err.message : String(err) },
+    });
+    return null;
   }
 }

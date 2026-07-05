@@ -14,6 +14,7 @@ import { registerRepl } from './commands/repl.js';
 import { registerDoctor } from './commands/doctor.js';
 import { registerHelp } from './commands/help.js';
 import { registerResume } from './commands/resume.js';
+import { registerModels } from './commands/models.js';
 import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -58,5 +59,6 @@ registerRepl(program);
 registerDoctor(program);
 registerHelp(program);
 registerResume(program);
+registerModels(program);
 
 program.parse();

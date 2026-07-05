@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { loadCatalog as loadOmnirouteCatalog } from '../../repl/services/modelCatalog.js';
+import { listAllProviderModels } from '../../utils/provider-models.js';
 
 export const ListModelsSchema = z.object({
   tier: z.string().optional(),
@@ -57,9 +58,20 @@ export async function listModelsTool(raw: unknown): Promise<string> {
   }
 
   const results = entries.slice(0, limit);
+
+  // P3c (Aurora-Redux, trilha P3, 2026-07-05): acrescenta a seção
+  // `direct_providers` (modelos vivos dos provedores diretos configurados —
+  // kimi/minimax/glm + descoberta dinâmica, via provider-models.ts) ao lado
+  // do catálogo legado acima. NUNCA remove/renomeia total/shown/models — só
+  // acrescenta uma chave nova, preservando o contrato para clientes MCP
+  // existentes. listAllProviderModels() já nunca lança (cada provedor falho
+  // vira {provider, error}), então nenhum try/catch extra é necessário aqui.
+  const directProviders = await listAllProviderModels();
+
   return JSON.stringify({
     total: entries.length,
     shown: results.length,
     models: results,
+    direct_providers: directProviders,
   });
 }

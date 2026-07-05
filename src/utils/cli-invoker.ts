@@ -20,6 +20,7 @@ import { spawn, spawnSync, type SpawnOptionsWithoutStdio, type ChildProcess } fr
 import { claudeBin, codexBin } from '../executors/cli/bin-resolver.js';
 import { resolveSpawnTarget, buildCliSpawnOptions } from '../executors/cli/spawn-common.js';
 import { isCliSafeMode } from '../executors/cli/permission-context.js';
+import { listDirectProviderRoutes } from './provider-routes.js';
 import type { OmniroutePromptInput, OmnirouteCallResult } from './omniroute-call.js';
 
 const CLAUDE_CLI_RE = /^claude-cli\//i;
@@ -35,21 +36,29 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
-const PROVIDER_KEY_ENV_VARS = [
-  'KIMI_API_KEY', 'MINIMAX_API_KEY', 'GLM_API_KEY', 'OMNIROUTE_API_KEY',
-] as const;
+// Base fixa (não deriva de listDirectProviderRoutes): OMNIROUTE_API_KEY é o
+// legado, sempre removido independente de qualquer descoberta de provedor.
+const BASE_PROVIDER_KEY_ENV_VARS = ['OMNIROUTE_API_KEY'] as const;
 
 /**
  * Brain-role CLIs autenticam via OAuth/keyring próprios — nunca precisam das
  * keys dos provedores diretos nem da key do Omniroute. Removê-las do env do
  * filho reduz o blast radius de um CLI comprometido/prompt-injected.
  * Retorna um NOVO objeto (imutabilidade). (BAIXO-4, revisão 2026-07-04.)
+ *
+ * P1b (trilha P1, 2026-07-04): a lista de keys agora é derivada — além da
+ * OMNIROUTE_API_KEY fixa, inclui o `envVar` de TODA rota retornada por
+ * `listDirectProviderRoutes()` NO MOMENTO do spawn (presets + provedores
+ * registrados por convenção de env). Assim um provedor plugado via
+ * `<NOME>_BASE_URL`/`<NOME>_API_KEY` tem sua key stripada do child do mesmo
+ * jeito que kimi/minimax/glm, sem precisar hardcodar cada nome aqui.
  */
 export function stripProviderKeysFromEnv(
   env: Record<string, string | undefined>,
 ): Record<string, string | undefined> {
   const out = { ...env };
-  for (const k of PROVIDER_KEY_ENV_VARS) delete out[k];
+  for (const k of BASE_PROVIDER_KEY_ENV_VARS) delete out[k];
+  for (const route of listDirectProviderRoutes()) delete out[route.envVar];
   return out;
 }
 

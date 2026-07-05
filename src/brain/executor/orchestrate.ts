@@ -803,6 +803,15 @@ export async function executeWorkflow(
       // Aurora-parity Wave 0 (WS3): persist the per-task tool allowlist so the
       // tool_call executor can auto-deny out-of-scope tools.
       ...(dagTask.allowed_tools !== undefined ? { allowed_tools: dagTask.allowed_tools } : {}),
+      // FASE C (Visual Reviewer) item 3 — the Task interface + tasks table
+      // carry no dedicated columns for reviewer_profile/canvasRegionChecks/
+      // interactionChecks (same "no dedicated column" situation as the
+      // deterministic step-kind config above), so persist them into
+      // input_json. The quality gate (runQualityGate) reads them back via
+      // JSON.parse(task.input_json) when reviewer_profile === 'visual'.
+      ...(dagTask.reviewer_profile ? { reviewer_profile: dagTask.reviewer_profile } : {}),
+      ...(dagTask.canvasRegionChecks ? { canvasRegionChecks: dagTask.canvasRegionChecks } : {}),
+      ...(dagTask.interactionChecks ? { interactionChecks: dagTask.interactionChecks } : {}),
     }),
     output_json: null,
     status: 'pending' as TaskStatus,
@@ -825,6 +834,12 @@ export async function executeWorkflow(
     tool_name: dagTask.tool_name ?? null,
     tool_policy: dagTask.tool_policy,
     workspace,
+    // FASE C (Visual Reviewer) item 3/4 — materialise reviewer_profile onto
+    // the in-memory Task too (mirrors execution_mode below) so same-process
+    // consumers (the quality gate) can read task.reviewer_profile directly
+    // without needing to re-parse input_json. Not persisted as its own DB
+    // column — reload-from-DB paths still recover it from input_json.
+    reviewer_profile: dagTask.reviewer_profile,
     // FASE 1B Bloco A.2 — materialise execution_mode; default to 'ephemeral' for back-compat.
     execution_mode: dagTask.execution_mode ?? 'ephemeral',
     file_scope: dagTask.file_scope,

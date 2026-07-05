@@ -177,4 +177,31 @@ describe('stripProviderKeysFromEnv', () => {
     // Imutabilidade: o objeto original não é mutado.
     expect(env.KIMI_API_KEY).toBe('k');
   });
+
+  // P1b (Aurora-Redux, trilha P1): a lista de keys a remover agora deriva de
+  // listDirectProviderRoutes() no MOMENTO do spawn (dinâmico), então um
+  // provedor registrado só por convenção de env (<NOME>_BASE_URL/<NOME>_API_KEY)
+  // também tem sua key removida do env do CLI filho.
+  it('remove também a API key de um provedor dinâmico (via env fixture)', async () => {
+    process.env.FOO_BASE_URL = 'https://api.foo.example/v1';
+    process.env.FOO_API_KEY = 'foo-secret';
+    try {
+      const { stripProviderKeysFromEnv } = await import('../../src/utils/cli-invoker.js');
+      const env = {
+        FOO_API_KEY: 'foo-secret', KIMI_API_KEY: 'k', OMNIROUTE_API_KEY: 'o',
+        PATH: '/bin', NO_COLOR: '1',
+      };
+      const out = stripProviderKeysFromEnv(env);
+      expect(out.FOO_API_KEY).toBeUndefined();
+      expect(out.KIMI_API_KEY).toBeUndefined();
+      expect(out.OMNIROUTE_API_KEY).toBeUndefined();
+      expect(out.PATH).toBe('/bin');
+      expect(out.NO_COLOR).toBe('1');
+      // Imutabilidade preservada mesmo no caminho dinâmico.
+      expect(env.FOO_API_KEY).toBe('foo-secret');
+    } finally {
+      delete process.env.FOO_BASE_URL;
+      delete process.env.FOO_API_KEY;
+    }
+  });
 });

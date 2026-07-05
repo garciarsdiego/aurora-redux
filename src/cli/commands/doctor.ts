@@ -6,10 +6,15 @@
 //
 // Checks (each independent, never throws — accumulates report):
 //   1. Node version
-//   2. .env file presence + gateway-free role envs (T3, 2026-07-04):
+//   2. .env file presence + gateway-free role envs (T3, 2026-07-04;
+//      generalized P1c, 2026-07-04):
 //        - the 4 *_MODEL roles are warn-if-missing (never fail)
-//        - direct-provider prefixes (kimi/ minimax/ glm/) FAIL if their
-//          API key env (KIMI_API_KEY / MINIMAX_API_KEY / GLM_API_KEY) is unset
+//        - direct-provider prefixes FAIL if their API key env is unset —
+//          the prefix→key mapping is now derived from
+//          listDirectProviderRoutes() (provider-routes.ts): the 3 presets
+//          (kimi/minimax/glm) PLUS any provider registered by convention via
+//          <NOME>_BASE_URL/<NOME>_API_KEY get the same fail, naming the exact
+//          env the operator needs to set
 //        - warn if OMNIFORGE_SKIP_MODEL_VALIDATION != 'true' while a role
 //          uses a direct/CLI prefix (legacy catalog validation may abort boot)
 //        - OMNIROUTE_URL/KEY are informational (only relevant for no-prefix ids)
@@ -18,6 +23,8 @@
 //   5. Migrations applied count
 //   6. Daemon token file exists with restrictive mode
 //   7. CLI binaries on PATH (claude, codex, gemini, kimi)
+//   8. Playwright/Chromium availability (informational — prepares the visual
+//      harness; ok/warn only, never fail)
 //
 // Output: line per check + final summary "OK / N warnings / N errors".
 
@@ -26,6 +33,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { initDb, countMigrationFiles } from '../../db/client.js';
 import { getDbPath } from '../../utils/config.js';
+import { listDirectProviderRoutes } from '../../utils/provider-routes.js';
 
 type CheckSeverity = 'ok' | 'warn' | 'fail';
 interface CheckResult {
@@ -57,12 +65,15 @@ const ROLE_MODEL_ENVS = [
 ] as const;
 
 // Direct-HTTP provider prefixes → the API-key env each one requires.
-// Mirrors src/utils/provider-routes.ts (DIRECT_PROVIDER_ROUTES.envVar).
-const DIRECT_PREFIX_KEY_ENV: Record<string, string> = {
-  kimi: 'KIMI_API_KEY',
-  minimax: 'MINIMAX_API_KEY',
-  glm: 'GLM_API_KEY',
-};
+// P1c (2026-07-04): derived from listDirectProviderRoutes() (presets +
+// convention-registered providers) instead of a hardcoded kimi/minimax/glm
+// map, so any `<NOME>_BASE_URL`/`<NOME>_API_KEY` provider gets the same
+// fail-if-missing check naming its exact env var.
+function directPrefixKeyEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const route of listDirectProviderRoutes()) out[route.providerName] = route.envVar;
+  return out;
+}
 
 // CLI-transport prefixes (spawn a local binary; no API key env needed).
 const CLI_PREFIXES = new Set(['claude-cli', 'codex-cli']);
@@ -100,6 +111,32 @@ function readEnvMap(content: string): Record<string, string> {
 }
 
 /**
+ * Runs `fn` with `process.env` temporarily overlaid by `env` (own keys only,
+ * restored verbatim in `finally` — never left mutated). `listDirectProviderRoutes()`
+ * scans `process.env` directly (P1a, provider-routes.ts), but `env` here may
+ * come from a parsed `.env` FILE that was never exported into the real
+ * process env (readEnvMap parses without a dotenv side-effect). Without this
+ * overlay, a provider registered only in the .env file (not the shell) would
+ * be invisible to the dynamic-discovery scan and the doctor would silently
+ * skip its fail-if-missing-key check. (P1c, 2026-07-04.)
+ */
+function withEnvOverlay<T>(env: Record<string, string>, fn: () => T): T {
+  const prior = new Map<string, string | undefined>();
+  for (const key of Object.keys(env)) {
+    prior.set(key, process.env[key]);
+    process.env[key] = env[key];
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of prior) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+/**
  * Gateway-free env diagnostics. Given the resolved env map, report on the four
  * *_MODEL roles, the direct-provider API keys they imply, legacy validation,
  * and the now-informational Omniroute settings.
@@ -120,6 +157,11 @@ export function checkGatewayFreeEnv(env: Record<string, string>): CheckResult[] 
   }
 
   // (b) Each direct-provider role needs its API key present → fail naming it.
+  // Computed once per call: presets + any convention-registered provider seen
+  // in the CURRENT env (mirrors listDirectProviderRoutes()'s per-call scan).
+  // Overlaid so providers registered only in the checked `env` map (e.g. a
+  // parsed .env file, not the real process env) are still discovered.
+  const directPrefixKeyEnvMap = withEnvOverlay(env, () => directPrefixKeyEnv());
   const missingKeys = new Map<string, string[]>(); // keyEnv → roles needing it
   let usesDirectOrCli = false;
   let usesNoPrefix = false;
@@ -133,7 +175,7 @@ export function checkGatewayFreeEnv(env: Record<string, string>): CheckResult[] 
       usesDirectOrCli = true;
       continue;
     }
-    const keyEnv = DIRECT_PREFIX_KEY_ENV[prefix];
+    const keyEnv = directPrefixKeyEnvMap[prefix];
     if (keyEnv) {
       usesDirectOrCli = true;
       if (!env[keyEnv]?.trim()) {
@@ -156,7 +198,7 @@ export function checkGatewayFreeEnv(env: Record<string, string>): CheckResult[] 
   // Positive confirmation for direct-provider keys that ARE present.
   for (const keyEnv of new Set(
     activeModels
-      .map((m) => DIRECT_PREFIX_KEY_ENV[modelPrefix(m.model) ?? ''])
+      .map((m) => directPrefixKeyEnvMap[modelPrefix(m.model) ?? ''])
       .filter((k): k is string => Boolean(k)),
   )) {
     if (env[keyEnv]?.trim() && !missingKeys.has(keyEnv)) {
@@ -327,10 +369,46 @@ function checkCliBinaries(): CheckResult[] {
   return results;
 }
 
+/**
+ * P1c (2026-07-04): informational check preparing the visual test harness —
+ * is Playwright installed, and is the Chromium binary it drives actually
+ * downloaded? NEVER fails: a missing Playwright/Chromium doesn't affect the
+ * engine's core operation, it only blocks the (separate) visual harness.
+ * Tries both the bare `playwright` package and `@playwright/test` (this repo
+ * ships the latter as a devDependency; `@playwright/test` re-exports the same
+ * `chromium` launcher). `chromium.executablePath()` never throws even when
+ * the browser binary itself was never downloaded — it just returns the path
+ * it WOULD use, which we then check with `existsSync`.
+ */
+export async function checkPlaywrightAvailability(): Promise<CheckResult> {
+  const name = 'Playwright/Chromium';
+  let chromium: { executablePath(): string } | undefined;
+  for (const pkg of ['playwright', '@playwright/test']) {
+    try {
+      const mod = (await import(pkg)) as { chromium?: { executablePath(): string } };
+      if (mod.chromium) { chromium = mod.chromium; break; }
+    } catch {
+      // Not installed / not resolvable — try the next candidate package.
+    }
+  }
+  if (!chromium) {
+    return { name, severity: 'warn', detail: 'not installed — visual test harness unavailable (npm i -D @playwright/test)' };
+  }
+  try {
+    const execPath = chromium.executablePath();
+    if (existsSync(execPath)) {
+      return { name, severity: 'ok', detail: `chromium at ${execPath}` };
+    }
+    return { name, severity: 'warn', detail: `chromium binary not downloaded (expected ${execPath}) — run 'npx playwright install chromium'` };
+  } catch (err) {
+    return { name, severity: 'warn', detail: `could not resolve chromium executable path: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 export function registerDoctor(program: Command): void {
   program
     .command('doctor')
-    .description('Run local diagnostics (env, daemon, DB, CLI binaries) and report')
+    .description('Run local diagnostics (env, daemon, DB, CLI binaries, Playwright) and report')
     .action(async () => {
       console.log('');
       console.log('omniforge doctor — local diagnostics');
@@ -343,6 +421,7 @@ export function registerDoctor(program: Command): void {
       checks.push(...checkDbIntegrity());
       checks.push(checkDaemonToken());
       checks.push(...checkCliBinaries());
+      checks.push(await checkPlaywrightAvailability());
 
       for (const c of checks) {
         const sym = SYM[c.severity];

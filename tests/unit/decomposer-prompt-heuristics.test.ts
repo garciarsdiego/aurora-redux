@@ -31,4 +31,10 @@ describe('decomposer prompt heuristics (F-LIVE-19 / F-LIVE-20)', () => {
   it('updates H11 to point at the H20 trivial exception', () => {
     expect(prompt).toMatch(/H11 PLAN GATE \(MANDATORY[^\n]*see H20/);
   });
+
+  it('includes H21 debug hook convention for interactive/visual projects', () => {
+    expect(prompt).toContain('H21 DEBUG HOOK FOR INTERACTIVE/VISUAL PROJECTS');
+    expect(prompt).toContain('window.__debug');
+    expect(prompt).toContain('t0\'s acceptance_criteria');
+  });
 });

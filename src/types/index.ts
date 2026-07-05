@@ -181,8 +181,10 @@ export type ExecutionMode = 'ephemeral' | 'adaptive';
  * pick a scoring policy variant tuned to the task's domain (e.g. 'code' is
  * stricter on exit-code/regex shapes; 'creative' tolerates ambiguity).
  * Optional everywhere; default profile is 'strict'.
+ * FASE C (Visual Reviewer) — 'visual' routes the task through the
+ * deterministic Playwright harness checks before any LLM-backed review.
  */
-export type ReviewerProfile = 'strict' | 'lenient' | 'creative' | 'code' | 'data';
+export type ReviewerProfile = 'strict' | 'lenient' | 'creative' | 'code' | 'data' | 'visual';
 
 export interface Task {
   id: string;

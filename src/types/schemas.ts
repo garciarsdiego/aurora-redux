@@ -51,6 +51,45 @@ export const TaskKindSchema = z.enum([
 export const ExecutionModeSchema = z.enum(['ephemeral', 'adaptive']);
 export type ExecutionMode = z.infer<typeof ExecutionModeSchema>;
 
+// FASE C (Visual Reviewer) item 2 — minimal structured schemas mirroring
+// CanvasRegionCheck / InteractionCheck from
+// src/quality/playwright-product-harness.ts. Kept intentionally loose on the
+// "expect" / "region" unions (z.any() for the parts that are themselves
+// unions of primitives+objects) rather than fully mirroring the TS type,
+// but the REQUIRED fields (label/selector/waitMs) are validated so a
+// malformed DAG task fails fast instead of silently producing a no-op check.
+export const DagCanvasRegionCheckSchema = z.object({
+  selector: z.string().min(1),
+  region: z.union([
+    z.enum(['top', 'bottom', 'left', 'right']),
+    z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }),
+  ]),
+  expectedHueRange: z.tuple([z.number(), z.number()]).optional(),
+  expectedLuminanceAbove: z.number().optional(),
+  label: z.string().min(1),
+});
+
+export const DagInteractionCheckSchema = z.object({
+  label: z.string().min(1),
+  key: z.string().optional(),
+  clickSelector: z.string().optional(),
+  waitMs: z.number().int().min(0),
+  // `expect` is 'increase' | 'decrease' | { equals: unknown } — validated
+  // loosely via z.any() here since `unknown` payloads defeat a tight union
+  // anyway; the harness's own evaluateInteraction() fails closed at runtime
+  // on anything malformed.
+  domAssertion: z.object({
+    selector: z.string().min(1),
+    property: z.string().min(1),
+    expect: z.any(),
+  }).optional(),
+  debugHookAssertion: z.object({
+    path: z.string().min(1),
+    expect: z.any(),
+  }).optional(),
+  screenshotBeforeAfter: z.boolean().optional(),
+});
+
 /** Declares expected DAG-level shared state shape (contract metadata). */
 export const DagStateSchemaFieldSchema = z.object({
   type: z.enum(['string', 'number', 'boolean', 'object', 'array', 'null', 'unknown']),
@@ -185,7 +224,15 @@ export const DagTaskSchema = z.object({
   // OPP-R3 — per-domain reviewer profile selector. Pass-through here; the
   // reviewer dispatcher applies the actual scoring policy. Defaults to
   // 'strict' when omitted (existing behaviour).
-  reviewer_profile: z.enum(['strict', 'lenient', 'creative', 'code', 'data']).optional(),
+  // FASE C (Visual Reviewer) — added 'visual': routes the task through the
+  // deterministic Playwright harness checks (canvasRegionChecks /
+  // interactionChecks) before any LLM-backed review is attempted.
+  reviewer_profile: z.enum(['strict', 'lenient', 'creative', 'code', 'data', 'visual']).optional(),
+  // FASE C (Visual Reviewer) item 2 — deterministic per-task visual checks,
+  // consumed when reviewer_profile === 'visual'. Optional/aditive: DAGs
+  // without these fields keep validating exactly as before.
+  canvasRegionChecks: z.array(DagCanvasRegionCheckSchema).optional(),
+  interactionChecks: z.array(DagInteractionCheckSchema).optional(),
   // FASE 1B Bloco A.2 — opt into adaptive supervisor loop.
   // Defaults to ephemeral when omitted (back-compat). Skill matcher may set
   // this from SKILL.md frontmatter.

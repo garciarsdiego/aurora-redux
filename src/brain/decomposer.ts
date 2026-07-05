@@ -456,6 +456,15 @@ H20 TRIVIAL FAST PATH (NEW — overrides H11): when the objective is a
    value (F-LIVE-20). H11's mandatory gate remains correct for T2+
    workflows where the operator benefits from previewing the DAG.
 
+H21 DEBUG HOOK FOR INTERACTIVE/VISUAL PROJECTS (NEW): if the objective
+   builds an interactive or visual project (game, canvas/DOM app, UI with
+   runtime state), t0's acceptance_criteria MUST also require exposing a
+   documented global debug object (e.g. window.__debug, or a name stated
+   in the generated project's README) surfacing the state fields needed
+   for automated verification (player position, scene/level state, score,
+   game-over flag, etc.). This costs nothing at runtime and lets H7/H19
+   validation tasks assert on real state instead of guessing from pixels.
+
 ═══════════════════════════════════════════════════════════════════
 DETERMINISTIC STEPS (no LLM)
 ═══════════════════════════════════════════════════════════════════

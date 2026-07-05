@@ -15,8 +15,24 @@
 // reasoning isolated in a separate `reasoning_content` field; MiniMax inlines
 // its reasoning as a `<think>...</think>` block PREFIXED to `content`, which
 // `extractContentRobust` strips.
+//
+// P2a (Aurora-Redux, trilha P2, 2026-07-05): preset `deepseek/` adicionado
+// sobre https://api.deepseek.com/v1/chat/completions (deepseek-chat,
+// deepseek-reasoner). Segue o mesmo contrato de `reasoning_content` isolado
+// de Kimi/GLM (deepseek-reasoner usa esse campo) — compat, sem parsing novo.
+// NÃO verificado por smoke E2E real ainda (pendente de DEEPSEEK_API_KEY do
+// operador); apenas testes unitários de roteamento nesta trilha.
+//
+// P1a (Aurora-Redux, trilha P1, 2026-07-04): além dos 3 presets acima, QUALQUER
+// par de envs `<NOME>_BASE_URL` + `<NOME>_API_KEY` registra por convenção um
+// provedor direto sob o prefixo `nome.toLowerCase()/`. Isso deixa o operador
+// plugar um provedor OpenAI-compatible novo sem tocar em código — só setando
+// duas envs. Presets têm SEMPRE precedência (nome reservado, não pode ser
+// "roubado" pela descoberta) e o namespace legado OMNIROUTE_* é blindado
+// (nunca vira um provedor direto, mesmo que alguém sete OMNIROUTE_BASE_URL).
 
-export type DirectProviderName = 'kimi' | 'minimax' | 'glm';
+/** @deprecated Kept as an alias for callers that imported the old union type; the set of direct-provider names is now open-ended (dynamic discovery). */
+export type DirectProviderName = string;
 
 export interface DirectProviderRoute {
   providerName: DirectProviderName;
@@ -29,7 +45,7 @@ export interface DirectProviderRoute {
   baseUrlEnvVar: string;
 }
 
-const DIRECT_PROVIDER_ROUTES: Record<DirectProviderName, DirectProviderRoute> = {
+const PRESET_ROUTES: Record<string, DirectProviderRoute> = {
   kimi: {
     providerName: 'kimi',
     baseUrl: 'https://api.kimi.com/coding/v1',
@@ -51,11 +67,82 @@ const DIRECT_PROVIDER_ROUTES: Record<DirectProviderName, DirectProviderRoute> = 
     envVar: 'GLM_API_KEY',
     baseUrlEnvVar: 'GLM_BASE_URL',
   },
+  // P2a (Aurora-Redux, trilha P2, 2026-07-05): preset DeepSeek — habilita o
+  // prefixo `deepseek/` (ex.: deepseek/deepseek-chat, deepseek/deepseek-reasoner)
+  // sobre o endpoint OpenAI-compatible oficial. Puramente aditivo — mesmo
+  // formato exato dos presets acima. extractContentRobust já isola
+  // `reasoning_content` (contrato compartilhado com kimi/glm), então nenhum
+  // parsing novo é necessário para o modelo deepseek-reasoner.
+  deepseek: {
+    providerName: 'deepseek',
+    baseUrl: 'https://api.deepseek.com/v1',
+    path: '/chat/completions',
+    envVar: 'DEEPSEEK_API_KEY',
+    baseUrlEnvVar: 'DEEPSEEK_BASE_URL',
+  },
 };
+
+// NOME válido por convenção: começa com letra, resto letras/dígitos/underscore
+// (sem hífen — hífen não é um caractere válido de nome de env var POSIX/dotenv
+// de qualquer forma). Casa o prefixo de `<NOME>_BASE_URL`.
+const BASE_URL_ENV_RE = /^([A-Z][A-Z0-9_]*)_BASE_URL$/;
+
+// Namespace legado — nunca deve virar um provedor direto por convenção, mesmo
+// que OMNIROUTE_BASE_URL/OMNIROUTE_API_KEY existam (o legado usa OMNIROUTE_URL,
+// mas blindamos o nome inteiro por precaução).
+const RESERVED_NAMES = new Set(['OMNIROUTE']);
+
+/**
+ * Varre process.env por `<NOME>_BASE_URL` e monta as rotas dinâmicas
+ * correspondentes. Por-chamada (barato: só string ops sobre as chaves já em
+ * memória) para que testes que mutam process.env em beforeEach/afterEach vejam
+ * o efeito sem precisar de um reset explícito de cache.
+ *
+ * Registro é gated SÓ por `<NOME>_BASE_URL` presente — a API key pode estar
+ * ausente (é exatamente esse o cenário que o doctor precisa detectar e
+ * reportar como fail: "provedor configurado, key faltando"). Um provedor sem
+ * key ainda aparece em listDirectProviderRoutes() com `envVar` apontando para
+ * a env correta; getDirectProviderApiKey() simplesmente retorna '' nesse caso
+ * e o caller HTTP falha adiante com a mensagem de key ausente — o mesmo
+ * contrato que os presets kimi/minimax/glm já tinham.
+ */
+function discoverDynamicRoutes(): Record<string, DirectProviderRoute> {
+  const out: Record<string, DirectProviderRoute> = {};
+  for (const key of Object.keys(process.env)) {
+    const match = BASE_URL_ENV_RE.exec(key);
+    if (!match) continue;
+    const name = match[1];
+    if (RESERVED_NAMES.has(name)) continue;
+    const prefix = name.toLowerCase();
+    if (Object.hasOwn(PRESET_ROUTES, prefix)) continue; // presets têm precedência
+    const baseUrl = process.env[key]?.trim();
+    if (!baseUrl) continue; // <NOME>_BASE_URL vazio/whitespace — não registra
+    const pathOverride = process.env[`${name}_PATH`]?.trim();
+    out[prefix] = {
+      providerName: prefix,
+      baseUrl,
+      path: pathOverride || '/chat/completions',
+      envVar: `${name}_API_KEY`,
+      baseUrlEnvVar: key,
+    };
+  }
+  return out;
+}
+
+/**
+ * Todas as rotas registráveis no momento da chamada: presets primeiro, depois
+ * as descobertas dinamicamente (presets nunca são sobrescritos). Lista TODAS
+ * as rotas com par completo — quem consome (doctor/strip/models) filtra por
+ * key presente/ausente conforme sua necessidade.
+ */
+export function listDirectProviderRoutes(): DirectProviderRoute[] {
+  return [...Object.values(PRESET_ROUTES), ...Object.values(discoverDynamicRoutes())];
+}
 
 /**
  * Resolve a model id to a direct provider route by prefix, or null if the id
- * carries no known direct prefix (→ legacy Omniroute path).
+ * carries no known direct prefix (→ legacy Omniroute path). Presets first,
+ * then dynamic discovery — case-insensitive on the prefix either way.
  */
 export function resolveDirectProviderRoute(model: string): DirectProviderRoute | null {
   const slash = model.indexOf('/');
@@ -64,9 +151,9 @@ export function resolveDirectProviderRoute(model: string): DirectProviderRoute |
   // precisam rotear idêntico. (BAIXO-3, revisão 2026-07-04.)
   const prefix = model.slice(0, slash).toLowerCase();
   // Object.hasOwn guards against prototype keys ('constructor/x' etc.). (B1.)
-  return Object.hasOwn(DIRECT_PROVIDER_ROUTES, prefix)
-    ? DIRECT_PROVIDER_ROUTES[prefix as DirectProviderName]
-    : null;
+  if (Object.hasOwn(PRESET_ROUTES, prefix)) return PRESET_ROUTES[prefix];
+  const dynamic = discoverDynamicRoutes();
+  return Object.hasOwn(dynamic, prefix) ? dynamic[prefix] : null;
 }
 
 /** Strip the routing prefix so the provider receives its native model id. */

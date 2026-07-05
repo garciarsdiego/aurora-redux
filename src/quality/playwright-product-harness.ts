@@ -22,6 +22,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import treeKill from 'tree-kill';
+import { PNG } from 'pngjs';
 
 export interface PlaywrightHarnessInput {
   projectRoot: string;
@@ -31,6 +32,117 @@ export interface PlaywrightHarnessInput {
   startCommand?: string;
   startTimeoutMs?: number;
   startReadyPattern?: RegExp;
+  /**
+   * Q4a: Deterministic canvas region checks (no LLM cost). Runs against the
+   * screenshot the harness already captures — Playwright rasterizes <canvas>
+   * elements correctly, so no separate canvas.toDataURL() extraction is
+   * needed. Catches regressions like a scene rendered upside down (sky at
+   * the bottom, ground at the top) via average luminance/hue per region.
+   */
+  canvasRegionChecks?: CanvasRegionCheck[];
+  /**
+   * FASE C item 1: Deterministic before/after interaction checks (no LLM
+   * cost). Runs inside the harness's own Playwright page — for each check,
+   * reads a value BEFORE, dispatches a key press or click, waits `waitMs`,
+   * reads the value AFTER, and compares per `expect`. Catches regressions
+   * like "pressing space no longer makes the player jump" without ever
+   * spending an LLM call.
+   */
+  interactionChecks?: InteractionCheck[];
+}
+
+/**
+ * FASE C item 1: Comparison mode for an InteractionCheck's before/after
+ * values. 'increase'/'decrease' require both values to be finite numbers
+ * (fail-closed otherwise); `{ equals }` is a strict comparison via
+ * `Object.is` (NO loose/coerced matching) — so it is meaningful only for
+ * primitives (numbers, strings, booleans). Objects/arrays never match by
+ * value here, only by reference identity, which the harness's serialized
+ * before/after reads will never produce — use a primitive for `equals`.
+ */
+export type InteractionExpect = 'increase' | 'decrease' | { equals: unknown };
+
+/**
+ * FASE C item 1: A single deterministic "do something, check something
+ * changed" assertion. Exactly one of `key` / `clickSelector` should be
+ * supplied to decide how the interaction is dispatched — `key` goes through
+ * `page.keyboard.press`, `clickSelector` through `page.click`. At least one
+ * of `domAssertion` / `debugHookAssertion` should be supplied so there is
+ * something to compare before/after; a check with neither is a no-op that
+ * always reports pass (nothing to assert is not a failure by itself here,
+ * unlike CanvasRegionCheck, because dispatching the interaction alone can
+ * still be a meaningful smoke test when screenshotBeforeAfter is set).
+ */
+export interface InteractionCheck {
+  label: string;
+  /** Keyboard key to press via page.keyboard.press (e.g. 'Space', 'ArrowRight'). */
+  key?: string;
+  /** CSS selector to click via page.click. */
+  clickSelector?: string;
+  /** Milliseconds to wait between dispatching the interaction and reading "after". */
+  waitMs: number;
+  /** Compares a DOM property (e.g. element.style.left) before vs after. */
+  domAssertion?: {
+    selector: string;
+    property: string;
+    expect: InteractionExpect;
+  };
+  /** Compares a value reached via a dotted path off `window` (e.g. 'window.__debug.player.x'). */
+  debugHookAssertion?: {
+    path: string;
+    expect: InteractionExpect;
+  };
+  /** When true, captures a screenshot immediately before and after the interaction. */
+  screenshotBeforeAfter?: boolean;
+}
+
+/**
+ * FASE C item 1: Structured, per-check result of an InteractionCheck
+ * evaluation. Always produced — even on error — so the harness never
+ * throws for a missing selector/debug hook; it reports a failed check with
+ * `error` set instead.
+ */
+export interface InteractionCheckResult {
+  label: string;
+  pass: boolean;
+  before?: unknown;
+  after?: unknown;
+  reason?: string;
+  error?: string;
+  screenshotBeforePath?: string;
+  screenshotAfterPath?: string;
+}
+
+/**
+ * Q4a: A single deterministic assertion about a rectangular region of the
+ * captured screenshot. `region` is either a named half ('top' | 'bottom' |
+ * 'left' | 'right') or an explicit pixel rectangle. At least one of
+ * `expectedHueRange` / `expectedLuminanceAbove` should be supplied — a check
+ * with neither always reports fail with a descriptive reason (fail-closed,
+ * never silently no-ops).
+ */
+export interface CanvasRegionCheck {
+  selector: string;
+  region: 'top' | 'bottom' | 'left' | 'right' | { x: number; y: number; w: number; h: number };
+  /** Inclusive [minDegrees, maxDegrees) range on the 0-360 HSL hue wheel. */
+  expectedHueRange?: [number, number];
+  /** Average luminance (0-255) must be strictly above this threshold. */
+  expectedLuminanceAbove?: number;
+  label: string;
+}
+
+/**
+ * Q4a: Structured, per-check result of a CanvasRegionCheck evaluation.
+ * Always produced — even on error — so the harness never throws for a
+ * missing screenshot/canvas; it reports a failed check with `error` set.
+ */
+export interface CanvasRegionCheckResult {
+  label: string;
+  selector: string;
+  pass: boolean;
+  measuredLuminance?: number;
+  measuredHue?: number;
+  error?: string;
 }
 
 export interface PlaywrightHarnessResult {
@@ -44,6 +156,17 @@ export interface PlaywrightHarnessResult {
   }>;
   screenshotPaths: string[];
   appUrl?: string;
+  /**
+   * Q4a: Populated only when `canvasRegionChecks` was supplied on the input.
+   * Deterministic — no LLM call is ever made to produce these results.
+   */
+  canvasRegionCheckResults?: CanvasRegionCheckResult[];
+  /**
+   * FASE C item 1: Populated only when `interactionChecks` was supplied on
+   * the input. Deterministic — no LLM call is ever made to produce these
+   * results.
+   */
+  interactionCheckResults?: InteractionCheckResult[];
 }
 
 interface PlaywrightHarnessOptions {
@@ -267,10 +390,26 @@ interface LocatorLike {
   textContent: () => Promise<string | null>;
 }
 
-interface PageLike {
+/**
+ * FASE C item 1: The minimal slice of the Playwright page surface that the
+ * interaction-check flow (readInteractionValue -> dispatch -> read again)
+ * needs. Exported so unit tests can inject a fake page and exercise the
+ * full before/after flow — including the real-world "inverted controls"
+ * bug (pressing a key moved the player the WRONG way) — without launching
+ * Chromium. `PageLike` (the full harness surface) satisfies this.
+ */
+export interface InteractionPageLike {
+  screenshot: (opts: { path: string; fullPage?: boolean }) => Promise<unknown>;
+  $eval: (selector: string, pageFunction: (el: Element, property: string) => unknown, arg: string) => Promise<unknown>;
+  evaluate: <T>(pageFunction: (path: string) => T, arg: string) => Promise<T>;
+  keyboard: { press: (key: string) => Promise<void> };
+  click: (selector: string) => Promise<void>;
+  waitForTimeout: (ms: number) => Promise<void>;
+}
+
+interface PageLike extends InteractionPageLike {
   goto: (url: string, opts?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }) => Promise<unknown>;
   locator: (selector: string) => { first: () => LocatorLike };
-  screenshot: (opts: { path: string; fullPage?: boolean }) => Promise<unknown>;
   close: () => Promise<void>;
 }
 
@@ -347,6 +486,402 @@ async function captureScreenshots(
     // mismatches as the primary signal.
   }
   return paths.slice(0, cap);
+}
+
+/**
+ * Q4a: Resolves a CanvasRegionCheck's `region` (named half or explicit rect)
+ * into absolute pixel bounds against the given image dimensions. Named
+ * regions are clamped to the image size; explicit rects are clamped too so a
+ * bad {x,y,w,h} never reads out of bounds.
+ */
+function resolveRegionBounds(
+  region: CanvasRegionCheck['region'],
+  imageWidth: number,
+  imageHeight: number,
+): { x: number; y: number; w: number; h: number } {
+  if (typeof region === 'string') {
+    switch (region) {
+      case 'top':
+        return { x: 0, y: 0, w: imageWidth, h: Math.max(1, Math.floor(imageHeight / 2)) };
+      case 'bottom': {
+        const h = Math.max(1, Math.ceil(imageHeight / 2));
+        return { x: 0, y: imageHeight - h, w: imageWidth, h };
+      }
+      case 'left':
+        return { x: 0, y: 0, w: Math.max(1, Math.floor(imageWidth / 2)), h: imageHeight };
+      case 'right': {
+        const w = Math.max(1, Math.ceil(imageWidth / 2));
+        return { x: imageWidth - w, y: 0, w, h: imageHeight };
+      }
+    }
+  }
+  const x = Math.max(0, Math.min(region.x, imageWidth - 1));
+  const y = Math.max(0, Math.min(region.y, imageHeight - 1));
+  const w = Math.max(1, Math.min(region.w, imageWidth - x));
+  const h = Math.max(1, Math.min(region.h, imageHeight - y));
+  return { x, y, w, h };
+}
+
+/** Rec. 601 luma approximation — cheap and adequate for a bright/dark check. */
+function rgbToLuminance(r: number, g: number, b: number): number {
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+/** Standard RGB (0-255) -> hue-degrees (0-360) conversion, achromatic -> 0. */
+function rgbToHueDegrees(r: number, g: number, b: number): number {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const delta = max - min;
+  if (delta === 0) return 0;
+  let hue: number;
+  if (max === rn) {
+    hue = ((gn - bn) / delta) % 6;
+  } else if (max === gn) {
+    hue = (bn - rn) / delta + 2;
+  } else {
+    hue = (rn - gn) / delta + 4;
+  }
+  hue *= 60;
+  if (hue < 0) hue += 360;
+  return hue;
+}
+
+interface DecodedPng {
+  width: number;
+  height: number;
+  data: Buffer;
+}
+
+/**
+ * Q4a: Pure, synchronous decode of a PNG buffer via pngjs. Exported so unit
+ * tests can build fixture PNGs and feed them straight into
+ * `evaluateCanvasRegionCheck` without needing pngjs in the test file.
+ */
+export function decodePng(buffer: Buffer): DecodedPng {
+  const png = PNG.sync.read(buffer);
+  return { width: png.width, height: png.height, data: png.data };
+}
+
+/**
+ * Q4a: Pure function — computes average luminance (0-255) and average hue
+ * (0-360 degrees, undefined if fully achromatic) over a rectangular region
+ * of a decoded PNG. No I/O, no Playwright — directly unit-testable.
+ */
+export function computeRegionStats(
+  image: DecodedPng,
+  bounds: { x: number; y: number; w: number; h: number },
+): { avgLuminance: number; avgHue: number | undefined } {
+  let luminanceSum = 0;
+  let hueSumSin = 0;
+  let hueSumCos = 0;
+  let chromaticCount = 0;
+  let pixelCount = 0;
+
+  const x0 = Math.max(0, bounds.x);
+  const y0 = Math.max(0, bounds.y);
+  const x1 = Math.min(image.width, bounds.x + bounds.w);
+  const y1 = Math.min(image.height, bounds.y + bounds.h);
+
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const idx = (image.width * y + x) << 2;
+      const r = image.data[idx] ?? 0;
+      const g = image.data[idx + 1] ?? 0;
+      const b = image.data[idx + 2] ?? 0;
+      luminanceSum += rgbToLuminance(r, g, b);
+      pixelCount++;
+
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      if (max !== min) {
+        // Average hue via circular mean (sum of unit vectors) so hues that
+        // straddle the 0/360 boundary (e.g. reds) don't cancel out.
+        const hueDeg = rgbToHueDegrees(r, g, b);
+        const hueRad = (hueDeg * Math.PI) / 180;
+        hueSumSin += Math.sin(hueRad);
+        hueSumCos += Math.cos(hueRad);
+        chromaticCount++;
+      }
+    }
+  }
+
+  const avgLuminance = pixelCount > 0 ? luminanceSum / pixelCount : 0;
+  let avgHue: number | undefined;
+  if (chromaticCount > 0) {
+    const meanRad = Math.atan2(hueSumSin / chromaticCount, hueSumCos / chromaticCount);
+    let meanDeg = (meanRad * 180) / Math.PI;
+    if (meanDeg < 0) meanDeg += 360;
+    avgHue = meanDeg;
+  }
+  return { avgLuminance, avgHue };
+}
+
+/** Handles hue ranges that wrap past 360 (e.g. [350, 10) covering red). */
+function hueInRange(hue: number, range: [number, number]): boolean {
+  const [min, max] = range;
+  if (min <= max) return hue >= min && hue < max;
+  return hue >= min || hue < max;
+}
+
+/**
+ * Q4a: Pure evaluation of a single CanvasRegionCheck against an already
+ * decoded PNG. No filesystem, no Playwright, no LLM — fully unit-testable.
+ * A check with neither `expectedHueRange` nor `expectedLuminanceAbove` fails
+ * closed with a descriptive error rather than silently passing.
+ */
+export function evaluateCanvasRegionCheck(
+  image: DecodedPng,
+  check: CanvasRegionCheck,
+): CanvasRegionCheckResult {
+  if (!check.expectedHueRange && check.expectedLuminanceAbove === undefined) {
+    return {
+      label: check.label,
+      selector: check.selector,
+      pass: false,
+      error: 'CanvasRegionCheck has neither expectedHueRange nor expectedLuminanceAbove; nothing to assert.',
+    };
+  }
+
+  const bounds = resolveRegionBounds(check.region, image.width, image.height);
+  const stats = computeRegionStats(image, bounds);
+
+  let pass = true;
+  if (check.expectedLuminanceAbove !== undefined) {
+    pass = pass && stats.avgLuminance > check.expectedLuminanceAbove;
+  }
+  if (check.expectedHueRange) {
+    pass = pass && stats.avgHue !== undefined && hueInRange(stats.avgHue, check.expectedHueRange);
+  }
+
+  return {
+    label: check.label,
+    selector: check.selector,
+    pass,
+    measuredLuminance: stats.avgLuminance,
+    measuredHue: stats.avgHue,
+  };
+}
+
+/**
+ * Q4a: Reads a screenshot PNG from disk and evaluates every configured
+ * CanvasRegionCheck against it. Robust by construction — a missing/corrupt
+ * screenshot yields one failed CanvasRegionCheckResult per configured check
+ * (with `error` set), never a thrown exception.
+ */
+/**
+ * Q4a: Exported (not just used internally) so unit tests can exercise the
+ * "missing screenshot" / "corrupt PNG" robustness paths directly, without
+ * spinning up Playwright/Chromium.
+ */
+export function runCanvasRegionChecks(
+  screenshotPath: string | undefined,
+  checks: CanvasRegionCheck[],
+): CanvasRegionCheckResult[] {
+  if (!screenshotPath || !existsSync(screenshotPath)) {
+    return checks.map((check) => ({
+      label: check.label,
+      selector: check.selector,
+      pass: false,
+      error: `screenshot not found at ${screenshotPath ?? '(none captured)'}`,
+    }));
+  }
+
+  let image: DecodedPng;
+  try {
+    image = decodePng(readFileSync(screenshotPath));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return checks.map((check) => ({
+      label: check.label,
+      selector: check.selector,
+      pass: false,
+      error: `failed to decode screenshot PNG: ${message}`,
+    }));
+  }
+
+  return checks.map((check) => {
+    try {
+      return evaluateCanvasRegionCheck(image, check);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        label: check.label,
+        selector: check.selector,
+        pass: false,
+        error: `canvas region check threw: ${message}`,
+      };
+    }
+  });
+}
+
+/** True for finite numbers only — NaN, Infinity, and non-numbers all fail this. */
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * FASE C item 1: Pure comparison of a before/after pair against an
+ * InteractionExpect. No I/O, no Playwright — directly unit-testable.
+ *
+ * 'increase'/'decrease' fail closed (pass=false, descriptive reason) when
+ * either value is not a finite number — an interaction check must never
+ * silently pass just because the underlying value turned out to be a
+ * string, undefined, or NaN. `{ equals }` uses `Object.is` so it also
+ * distinguishes NaN/-0 correctly and works for non-numeric values (strings,
+ * booleans, etc.) without a fail-closed numeric requirement.
+ */
+export function evaluateInteraction(
+  before: unknown,
+  after: unknown,
+  expectation: InteractionExpect,
+): { pass: boolean; reason?: string } {
+  if (typeof expectation === 'object' && expectation !== null) {
+    return Object.is(after, expectation.equals)
+      ? { pass: true }
+      : { pass: false, reason: `value did not equal ${JSON.stringify(expectation.equals)} (got ${JSON.stringify(after)})` };
+  }
+
+  if (!isFiniteNumber(before) || !isFiniteNumber(after)) {
+    return {
+      pass: false,
+      reason: `expected numeric before/after values for '${expectation}' comparison, got before=${JSON.stringify(before)} after=${JSON.stringify(after)}`,
+    };
+  }
+
+  if (expectation === 'increase') {
+    return after > before
+      ? { pass: true }
+      : { pass: false, reason: `value did not increase (before=${before}, after=${after})` };
+  }
+
+  // expectation === 'decrease'
+  return after < before
+    ? { pass: true }
+    : { pass: false, reason: `value did not decrease (before=${before}, after=${after})` };
+}
+
+/**
+ * FASE C item 1: Reads the "current value" for a single InteractionCheck,
+ * preferring domAssertion when both are configured. Returns `undefined` (not
+ * a throw) when neither assertion is configured — evaluateInteraction then
+ * fails closed on the non-numeric undefined value for increase/decrease, or
+ * fails the equals comparison, so a misconfigured check never silently
+ * passes.
+ */
+async function readInteractionValue(
+  page: InteractionPageLike,
+  check: InteractionCheck,
+): Promise<unknown> {
+  if (check.domAssertion) {
+    const { selector, property } = check.domAssertion;
+    return page.$eval(selector, (el, prop) => (el as unknown as Record<string, unknown>)[prop], property);
+  }
+  if (check.debugHookAssertion) {
+    const { path } = check.debugHookAssertion;
+    // Walks a dotted property path (e.g. 'window.__debug.player.x') off
+    // `globalThis` inside the page context via plain property lookups —
+    // no eval, no Function constructor, so this is safe against injection.
+    return page.evaluate((p) => {
+      return p.split('.').reduce<unknown>((acc, key) => {
+        if (acc === undefined || acc === null) return undefined;
+        return (acc as Record<string, unknown>)[key];
+      }, globalThis as unknown);
+    }, path);
+  }
+  return undefined;
+}
+
+/**
+ * FASE C item 1: Dispatches the interaction (key press OR click) for a
+ * single check. Exactly one of key/clickSelector should be set; if both are
+ * set, key takes precedence; if neither is set, this is a no-op (the check
+ * still reads before/after, which will be identical, so it fails naturally
+ * unless the assertion is genuinely a no-op-tolerant `equals`).
+ */
+async function dispatchInteraction(page: InteractionPageLike, check: InteractionCheck): Promise<void> {
+  if (check.key) {
+    await page.keyboard.press(check.key);
+    return;
+  }
+  if (check.clickSelector) {
+    await page.click(check.clickSelector);
+  }
+}
+
+/**
+ * FASE C item 1: Runs every configured InteractionCheck against the live
+ * Playwright page: read BEFORE, dispatch, wait, read AFTER, compare. NEVER
+ * throws — any failure (missing selector, bad debug-hook path, dispatch
+ * error) is captured per-check as `{ pass: false, error }` so one bad check
+ * can never abort the whole harness run.
+ */
+export async function runInteractionChecks(
+  page: InteractionPageLike,
+  checks: InteractionCheck[],
+  artifactDir: string,
+): Promise<InteractionCheckResult[]> {
+  const results: InteractionCheckResult[] = [];
+  for (const check of checks) {
+    try {
+      const before = await readInteractionValue(page, check);
+
+      let screenshotBeforePath: string | undefined;
+      let screenshotAfterPath: string | undefined;
+      if (check.screenshotBeforeAfter) {
+        ensureDir(artifactDir);
+        const safeLabel = check.label.replace(/[^a-z0-9_-]+/gi, '_').slice(0, 60);
+        screenshotBeforePath = join(artifactDir, `interaction-${safeLabel}-before.png`);
+        try { await page.screenshot({ path: screenshotBeforePath }); } catch { /* best-effort */ }
+      }
+
+      await dispatchInteraction(page, check);
+      await page.waitForTimeout(check.waitMs);
+
+      const after = await readInteractionValue(page, check);
+
+      if (check.screenshotBeforeAfter) {
+        const safeLabel = check.label.replace(/[^a-z0-9_-]+/gi, '_').slice(0, 60);
+        screenshotAfterPath = join(artifactDir, `interaction-${safeLabel}-after.png`);
+        try { await page.screenshot({ path: screenshotAfterPath }); } catch { /* best-effort */ }
+      }
+
+      const expectation = check.domAssertion?.expect ?? check.debugHookAssertion?.expect;
+      if (!expectation) {
+        results.push({
+          label: check.label,
+          pass: false,
+          before,
+          after,
+          error: 'InteractionCheck has neither domAssertion nor debugHookAssertion; nothing to assert.',
+          ...(screenshotBeforePath ? { screenshotBeforePath } : {}),
+          ...(screenshotAfterPath ? { screenshotAfterPath } : {}),
+        });
+        continue;
+      }
+
+      const { pass, reason } = evaluateInteraction(before, after, expectation);
+      results.push({
+        label: check.label,
+        pass,
+        before,
+        after,
+        ...(reason ? { reason } : {}),
+        ...(screenshotBeforePath ? { screenshotBeforePath } : {}),
+        ...(screenshotAfterPath ? { screenshotAfterPath } : {}),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      results.push({
+        label: check.label,
+        pass: false,
+        error: `interaction check threw: ${message}`,
+      });
+    }
+  }
+  return results;
 }
 
 function buildSkipped(reason: string): PlaywrightHarnessResult {
@@ -464,15 +999,34 @@ export async function runPlaywrightProductHarness(
 
     const screenshotPaths = await captureScreenshots(page, artifactDir, MAX_SCREENSHOTS);
 
+    // FASE C item 1: Interaction checks need the live page (keyboard/click
+    // dispatch), so they must run BEFORE page/context teardown below. Never
+    // throws — runInteractionChecks captures per-check errors internally.
+    let interactionCheckResults: InteractionCheckResult[] | undefined;
+    if (input.interactionChecks && input.interactionChecks.length > 0) {
+      interactionCheckResults = await runInteractionChecks(page, input.interactionChecks, artifactDir);
+    }
+
     try { await page.close(); } catch { /* best-effort */ }
     try { await context.close(); } catch { /* best-effort */ }
 
+    // Q4a: Deterministic canvas region checks — evaluated against the
+    // screenshot we already captured above. No LLM call is ever made here.
+    let canvasRegionCheckResults: CanvasRegionCheckResult[] | undefined;
+    if (input.canvasRegionChecks && input.canvasRegionChecks.length > 0) {
+      canvasRegionCheckResults = runCanvasRegionChecks(screenshotPaths[0], input.canvasRegionChecks);
+    }
+
     const drained = mismatches.drain();
+    const canvasChecksFailed = (canvasRegionCheckResults ?? []).some((result) => !result.pass);
+    const interactionChecksFailed = (interactionCheckResults ?? []).some((result) => !result.pass);
     return {
-      status: drained.length === 0 ? 'passed' : 'failed',
+      status: drained.length === 0 && !canvasChecksFailed && !interactionChecksFailed ? 'passed' : 'failed',
       mismatches: drained,
       screenshotPaths,
       appUrl: server.url,
+      ...(canvasRegionCheckResults ? { canvasRegionCheckResults } : {}),
+      ...(interactionCheckResults ? { interactionCheckResults } : {}),
     };
   } finally {
     if (browser) {

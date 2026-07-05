@@ -17,6 +17,7 @@ import type {
 import {
   buildFinalProductEvidenceBundle,
   buildPlaywrightHarnessEvidence,
+  collectVisualChecksForWorkflow,
   isWebAppProject,
   loadArchitectureContractForWorkflow,
   playwrightHarnessIssues,
@@ -245,12 +246,24 @@ async function attemptPlaywrightHarness(
   }
 
   const run = runner ?? runPlaywrightProductHarness;
+  // FASE C (Visual Reviewer) item 3 — pass through any canvasRegionChecks /
+  // interactionChecks declared on the workflow's tasks so the deterministic
+  // checks run as part of the same harness invocation that already
+  // captures the screenshot(s) and drives the page. Best-effort: an empty
+  // result here just means no task declared visual checks (back-compat).
+  const visualChecks = collectVisualChecksForWorkflow(db, workflowId);
   let raw: PlaywrightHarnessResult;
   try {
     raw = await run({
       projectRoot: contract.projectRoot,
       objective: bundle.workflow.objective,
       expectedSelectors: contract.testSelectors,
+      ...(visualChecks.canvasRegionChecks.length > 0
+        ? { canvasRegionChecks: visualChecks.canvasRegionChecks }
+        : {}),
+      ...(visualChecks.interactionChecks.length > 0
+        ? { interactionChecks: visualChecks.interactionChecks }
+        : {}),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
