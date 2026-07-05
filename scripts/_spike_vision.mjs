@@ -228,8 +228,16 @@ async function runRealMultimodalSmoke() {
       });
       const dt = ((Date.now() - t0) / 1000).toFixed(1);
       const content = result.content.trim();
-      const detected = /\b(sim|yes)\b|de cabeça|de cabeca|upside|invertid/i.test(content)
-        && !/^\s*(nao|não|no)\b/i.test(content);
+      // Detector robusto: a resposta de uma palavra (SIM/NAO) manda; senao,
+      // exige mencao de inversao SEM negacao adjacente. Fecha o falso-positivo
+      // de respostas verbosas do tipo "a cena NAO esta invertida" (negacao no
+      // meio da frase, que a versao anterior deixava passar como deteccao).
+      const firstWord = content.toLowerCase().replace(/^[^a-zà-ú]+/i, '').split(/[\s,.;:!?]/)[0];
+      const saysYes = /^(sim|yes)$/.test(firstWord);
+      const saysNo = /^(nao|não|no|not)$/.test(firstWord);
+      const mentionsInversion = /de cabe[çc]a|upside\s*down|invertid|inverted/i.test(content);
+      const negatedInversion = /\b(n[ãa]o|not)\b[^.!?]*\b(invertid|inverted|de cabe[çc]a|upside)/i.test(content);
+      const detected = saysYes || (!saysNo && mentionsInversion && !negatedInversion);
       if (detected) {
         console.log(`[multimodal:${providerName}] OK ${dt}s | model=${result.model_used} | content=${JSON.stringify(content).slice(0, 160)}`);
       } else {
