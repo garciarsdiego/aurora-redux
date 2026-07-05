@@ -437,6 +437,10 @@ export function getFinalQualityReviewerModel(): string {
   return optional('OMNIFORGE_FINAL_QUALITY_REVIEWER_MODEL', 'claude/claude-opus-4-6');
 }
 
+export function getFinalVisualQualityReviewerModel(): string {
+  return optional('OMNIFORGE_FINAL_VISUAL_QUALITY_REVIEWER_MODEL', 'kimi/kimi-for-coding');
+}
+
 // Consolidator — D16. Sonnet default for flat-rate subs; override to Opus for richer synthesis.
 export function getConsolidatorModel(): string {
   return optional('CONSOLIDATOR_MODEL', 'claude/claude-sonnet-4-6');

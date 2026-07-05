@@ -179,10 +179,12 @@ describe('enforceFinalQualityReview — visual checks flow into PlaywrightHarnes
   let db: Database.Database;
   let tempRoot: string;
   const previousModeEnv = process.env.OMNIFORGE_FINAL_QUALITY_REVIEW;
+  const previousVisualModelEnv = process.env.OMNIFORGE_FINAL_VISUAL_QUALITY_REVIEWER_MODEL;
 
   beforeEach(() => {
     db = initDb(':memory:');
     tempRoot = mkdtempSync(join(tmpdir(), 'omniforge-visual-wire-'));
+    process.env.OMNIFORGE_FINAL_VISUAL_QUALITY_REVIEWER_MODEL = 'kimi/kimi-for-coding';
   });
 
   afterEach(() => {
@@ -190,6 +192,8 @@ describe('enforceFinalQualityReview — visual checks flow into PlaywrightHarnes
     rmSync(tempRoot, { recursive: true, force: true });
     if (previousModeEnv === undefined) delete process.env.OMNIFORGE_FINAL_QUALITY_REVIEW;
     else process.env.OMNIFORGE_FINAL_QUALITY_REVIEW = previousModeEnv;
+    if (previousVisualModelEnv === undefined) delete process.env.OMNIFORGE_FINAL_VISUAL_QUALITY_REVIEWER_MODEL;
+    else process.env.OMNIFORGE_FINAL_VISUAL_QUALITY_REVIEWER_MODEL = previousVisualModelEnv;
   });
 
   it('passes the task-declared canvasRegionChecks/interactionChecks to the harness runner', async () => {
@@ -312,5 +316,60 @@ describe('enforceFinalQualityReview — visual checks flow into PlaywrightHarnes
 
     expect(sawCanvasKey).toBe(false);
     expect(sawInteractionKey).toBe(false);
+  });
+
+  it('passes Playwright screenshots as image attachments and routes visual reviews to a vision model', async () => {
+    process.env.OMNIFORGE_FINAL_QUALITY_REVIEW = 'dry-run';
+    writeCleanReactApp(tempRoot);
+
+    const workflow = makeWorkflow('Render a canvas game with correct orientation');
+    insertWorkflow(db, workflow);
+    insertTask(db, makeVisualTask(workflow.id, tempRoot));
+
+    recordArchitectureContract(db, {
+      runId: workflow.id,
+      contract: {
+        runId: workflow.id,
+        projectRoot: tempRoot,
+        appType: 'react',
+        existingStateStores: [],
+        existingUiSurfaces: ['src/App.tsx'],
+        allowedFiles: ['src/**', 'package.json'],
+        forbiddenPatterns: [],
+        requiredIntegrationPoints: ['src/App.tsx'],
+        testSelectors: ['canvas'],
+      },
+    });
+
+    const screenshotPath = join(tempRoot, 'playwright-final.png');
+    const playwrightRunner: PlaywrightHarnessRunner = async () => ({
+      status: 'passed',
+      mismatches: [],
+      screenshotPaths: [screenshotPath],
+    });
+
+    let capturedImages: unknown;
+    let capturedModel: string | undefined;
+    let capturedUserPrompt = '';
+    const invoker: FinalQualityReviewInvoker = async (input) => {
+      capturedImages = input.images;
+      capturedModel = input.model;
+      capturedUserPrompt = input.userPrompt;
+      return JSON.stringify({ outcome: 'passed', score: 0.9, issues: [], fixTasks: [] });
+    };
+
+    await enforceFinalQualityReview(db, {
+      workflowId: workflow.id,
+      mode: 'dry-run',
+      model: 'glm/glm-5.2',
+      invoker,
+      playwrightRunner,
+    });
+
+    expect(capturedModel).toBe('kimi/kimi-for-coding');
+    expect(capturedImages).toEqual([
+      { path: screenshotPath, label: 'Playwright screenshot 1' },
+    ]);
+    expect(capturedUserPrompt).toContain('Attached Playwright screenshot images are available');
   });
 });

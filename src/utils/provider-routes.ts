@@ -43,6 +43,17 @@ export interface DirectProviderRoute {
   envVar: string;
   /** Env var allowing base-URL override (optional). */
   baseUrlEnvVar: string;
+  /**
+   * Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): whether this
+   * provider accepts OpenAI-style content-part images (`image_url`) at the
+   * endpoint/model this route targets. Verified live by the vision spike
+   * (docs/VISION-SPIKE-2026-07-05.md): kimi/minimax = yes, glm = no (rejected
+   * by the coding endpoint), deepseek-chat = not a vision model. Optional —
+   * dynamically-discovered routes (env-based) never set this field, so they
+   * are treated as NOT supporting vision by default (safe default; see
+   * `providerSupportsVision`). Purely additive to the interface.
+   */
+  vision?: boolean;
 }
 
 const PRESET_ROUTES: Record<string, DirectProviderRoute> = {
@@ -52,6 +63,8 @@ const PRESET_ROUTES: Record<string, DirectProviderRoute> = {
     path: '/chat/completions',
     envVar: 'KIMI_API_KEY',
     baseUrlEnvVar: 'KIMI_BASE_URL',
+    // Vision spike 2026-07-05: HTTP 200, content-part image_url accepted as-is.
+    vision: true,
   },
   minimax: {
     providerName: 'minimax',
@@ -59,6 +72,11 @@ const PRESET_ROUTES: Record<string, DirectProviderRoute> = {
     path: '/chat/completions',
     envVar: 'MINIMAX_API_KEY',
     baseUrlEnvVar: 'MINIMAX_BASE_URL',
+    // Vision spike 2026-07-05: HTTP 200, content-part image_url accepted as-is.
+    // Reminder from the spike: max_tokens must be generous enough for the
+    // model to finish its <think> reasoning before the visible answer, or
+    // content comes back empty and looks like a false "no vision support".
+    vision: true,
   },
   glm: {
     providerName: 'glm',
@@ -66,6 +84,13 @@ const PRESET_ROUTES: Record<string, DirectProviderRoute> = {
     path: '/chat/completions',
     envVar: 'GLM_API_KEY',
     baseUrlEnvVar: 'GLM_BASE_URL',
+    // Vision spike 2026-07-05: HTTP 400 — this coding endpoint only accepts
+    // content.type='text', rejects image_url content-parts outright. A
+    // separate GLM vision endpoint may exist but is out of scope until
+    // verified (see docs/VISION-SPIKE-2026-07-05.md). Explicit `false` (not
+    // omitted) to document that this was actively tested and rejected —
+    // distinct from a dynamic route where vision support is simply unknown.
+    vision: false,
   },
   // P2a (Aurora-Redux, trilha P2, 2026-07-05): preset DeepSeek — habilita o
   // prefixo `deepseek/` (ex.: deepseek/deepseek-chat, deepseek/deepseek-reasoner)
@@ -79,6 +104,11 @@ const PRESET_ROUTES: Record<string, DirectProviderRoute> = {
     path: '/chat/completions',
     envVar: 'DEEPSEEK_API_KEY',
     baseUrlEnvVar: 'DEEPSEEK_BASE_URL',
+    // Fase A / Wave 1 (2026-07-05): not smoke-tested for vision by the spike
+    // (out of scope — deepseek was untested there); deepseek-chat/-reasoner
+    // are text/reasoning models, not vision models, so treated as unsupported.
+    // Explicit `false` to document the deliberate decision, not an oversight.
+    vision: false,
   },
 };
 
@@ -174,6 +204,18 @@ export function buildDirectProviderUrl(route: DirectProviderRoute): string {
 /** Read the Bearer key for a direct provider from its env var. */
 export function getDirectProviderApiKey(route: DirectProviderRoute): string {
   return process.env[route.envVar]?.trim() ?? '';
+}
+
+/**
+ * Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): whether a
+ * resolved direct-provider route accepts image content-parts. Strict `===
+ * true` check (not truthy) so that `undefined` (dynamically-discovered
+ * routes never set this field) and explicit `false` both resolve to "no" —
+ * a safe default that fails closed rather than silently sending an image to
+ * a provider never verified to accept it.
+ */
+export function providerSupportsVision(route: DirectProviderRoute): boolean {
+  return route.vision === true;
 }
 
 const THINK_BLOCK_RE = /<think>[\s\S]*?<\/think>\s*/gi;

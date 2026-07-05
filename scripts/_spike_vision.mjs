@@ -17,7 +17,7 @@
 // Node. Custo: 1 chamada mínima por transporte HTTP + 1 invocação por CLI —
 // autorizado pelo escopo da trilha S6.
 //
-// Uso: node scripts/_spike_vision.mjs
+// Uso: node --import tsx scripts/_spike_vision.mjs [--multimodal-smoke]
 import 'dotenv/config';
 import { spawnSync } from 'node:child_process';
 import { deflateSync } from 'node:zlib';
@@ -27,8 +27,9 @@ import os from 'node:os';
 
 // Import directly from src/ via tsx (already a project devDependency) so the
 // spike always exercises the CURRENT source, regardless of whether another
-// concurrent track has rebuilt dist/. Run this file with `npx tsx` (see
-// verification command in docs/VISION-SPIKE-2026-07-05.md), not plain `node`.
+// concurrent track has rebuilt dist/. Run this file with `node --import tsx`
+// (see verification command in docs/VISION-SPIKE-2026-07-05.md), not plain
+// `node`.
 import {
   resolveDirectProviderRoute,
   buildDirectProviderUrl,
@@ -41,6 +42,10 @@ import {
 // child_process without shell:true won't resolve PATHEXT (.cmd/.exe) itself.
 import { claudeBin, codexBin } from '../src/executors/cli/bin-resolver.ts';
 import { resolveSpawnTarget, buildCliSpawnOptions } from '../src/executors/cli/spawn-common.ts';
+import { callOmnirouteWithUsage } from '../src/utils/omniroute-call.ts';
+
+const args = new Set(process.argv.slice(2));
+const runMultimodalSmoke = args.has('--multimodal-smoke');
 
 // ---------------------------------------------------------------------------
 // 1. PNG determinístico: 64x64, metade superior vermelha pura, metade
@@ -87,14 +92,12 @@ function chunk(type, data) {
  *   those already produce structured yes/no evidence (HTTP status + content
  *   shape) without needing this control, so the spike stays at 1 call each.
  */
-function buildRedBluePng(invert = false) {
-  const WIDTH = 64;
-  const HEIGHT = 64;
+function buildRgbPng(width, height, pixelAt) {
   const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
   const ihdrData = Buffer.alloc(13);
-  ihdrData.writeUInt32BE(WIDTH, 0);
-  ihdrData.writeUInt32BE(HEIGHT, 4);
+  ihdrData.writeUInt32BE(width, 0);
+  ihdrData.writeUInt32BE(height, 4);
   ihdrData[8] = 8; // bit depth
   ihdrData[9] = 2; // color type: 2 = truecolor (RGB)
   ihdrData[10] = 0; // compression method
@@ -103,19 +106,15 @@ function buildRedBluePng(invert = false) {
   const ihdr = chunk('IHDR', ihdrData);
 
   // Raw scanlines: each row prefixed with filter-type byte 0 (none).
-  const rowBytes = 1 + WIDTH * 3;
-  const raw = Buffer.alloc(rowBytes * HEIGHT);
-  for (let y = 0; y < HEIGHT; y++) {
+  const rowBytes = 1 + width * 3;
+  const raw = Buffer.alloc(rowBytes * height);
+  for (let y = 0; y < height; y++) {
     const rowStart = y * rowBytes;
     raw[rowStart] = 0; // filter: none
-    const topIsRed = y < HEIGHT / 2 ? !invert : invert;
-    for (let x = 0; x < WIDTH; x++) {
+    for (let x = 0; x < width; x++) {
       const px = rowStart + 1 + x * 3;
-      if (topIsRed) {
-        raw[px] = 255; raw[px + 1] = 0; raw[px + 2] = 0; // pure red
-      } else {
-        raw[px] = 0; raw[px + 1] = 0; raw[px + 2] = 255; // pure blue
-      }
+      const [r, g, b] = pixelAt(x, y, width, height);
+      raw[px] = r; raw[px + 1] = g; raw[px + 2] = b;
     }
   }
 
@@ -123,6 +122,65 @@ function buildRedBluePng(invert = false) {
   const iend = chunk('IEND', Buffer.alloc(0));
 
   return Buffer.concat([PNG_SIGNATURE, ihdr, idat, iend]);
+}
+
+function buildRedBluePng(invert = false) {
+  return buildRgbPng(64, 64, (_x, y, _width, height) => {
+    const topIsRed = y < height / 2 ? !invert : invert;
+    return topIsRed ? [255, 0, 0] : [0, 0, 255];
+  });
+}
+
+function buildCameraOrientationPng(invert = false) {
+  const width = 192;
+  const height = 192;
+  const scenePixel = (x, y) => {
+    if (y >= 124) {
+      if (Math.abs(y - 124) < 3) return [72, 84, 45]; // horizon
+      return [58, 151, 78]; // ground
+    }
+
+    const sunDx = x - 158;
+    const sunDy = y - 32;
+    if ((sunDx * sunDx) + (sunDy * sunDy) <= 14 * 14) return [255, 219, 77];
+
+    // House body.
+    if (x >= 54 && x <= 112 && y >= 88 && y <= 130) {
+      if (x >= 78 && x <= 91 && y >= 107 && y <= 130) return [80, 44, 31]; // door
+      if (x >= 61 && x <= 72 && y >= 96 && y <= 107) return [235, 244, 255]; // window
+      if (x >= 95 && x <= 106 && y >= 96 && y <= 107) return [235, 244, 255]; // window
+      return [182, 112, 61];
+    }
+
+    // Roof triangle.
+    if (y >= 58 && y <= 90) {
+      const leftEdge = 83 - (90 - y);
+      const rightEdge = 83 + (90 - y);
+      if (x >= leftEdge && x <= rightEdge) return [173, 55, 43];
+    }
+
+    // Tree trunk + canopy.
+    if (x >= 136 && x <= 146 && y >= 88 && y <= 130) return [104, 70, 42];
+    const canopyCenters = [
+      [141, 75],
+      [128, 87],
+      [154, 87],
+    ];
+    for (const [cx, cy] of canopyCenters) {
+      const dx = x - cx;
+      const dy = y - cy;
+      if ((dx * dx) + (dy * dy) <= 18 * 18) return [32, 119, 73];
+    }
+
+    return [120, 196, 232]; // sky
+  };
+
+  return buildRgbPng(width, height, (x, y) => {
+    if (invert) {
+      return scenePixel(width - 1 - x, height - 1 - y);
+    }
+    return scenePixel(x, y);
+  });
 }
 
 const pngBuffer = buildRedBluePng(false); // top=red, bottom=blue
@@ -141,6 +199,62 @@ console.log(`[setup] PNG written to ${pngPath} (${pngBuffer.length} bytes, base6
 console.log(`[setup] Control (inverted) PNG written to ${pngPathInverted}`);
 
 const QUESTION = 'Qual a cor da metade superior da imagem? Responda uma palavra.';
+
+async function runRealMultimodalSmoke() {
+  const invertedScenePath = join(os.tmpdir(), 'aurora-vision-smoke-camera-invertida.png');
+  writeFileSync(invertedScenePath, buildCameraOrientationPng(true));
+  console.log(`[setup] Inverted-camera PNG written to ${invertedScenePath}`);
+
+  const providerModels = {
+    kimi: 'kimi/kimi-for-coding',
+    minimax: 'minimax/MiniMax-M3',
+  };
+  const prompt = [
+    'Olhe apenas para a imagem anexada. Ela é uma cena sintética com céu, chão, sol, casa e árvore.',
+    'A câmera/cena está de cabeça para baixo? Procure chão no topo, céu embaixo e objetos invertidos.',
+    'Responda com uma palavra: SIM ou NAO. Se detectar que está invertida, responda SIM.',
+  ].join('\n');
+  let failures = 0;
+
+  for (const [providerName, model] of Object.entries(providerModels)) {
+    const t0 = Date.now();
+    try {
+      const result = await callOmnirouteWithUsage({
+        systemPrompt: 'You are a visual QA smoke tester. Answer only SIM or NAO.',
+        userPrompt: prompt,
+        model,
+        images: [{ path: invertedScenePath, label: 'camera-invertida smoke image' }],
+        temperature: 0,
+      });
+      const dt = ((Date.now() - t0) / 1000).toFixed(1);
+      const content = result.content.trim();
+      const detected = /\b(sim|yes)\b|de cabeça|de cabeca|upside|invertid/i.test(content)
+        && !/^\s*(nao|não|no)\b/i.test(content);
+      if (detected) {
+        console.log(`[multimodal:${providerName}] OK ${dt}s | model=${result.model_used} | content=${JSON.stringify(content).slice(0, 160)}`);
+      } else {
+        failures += 1;
+        console.log(`[multimodal:${providerName}] FAIL ${dt}s | model=${result.model_used} | content=${JSON.stringify(content).slice(0, 220)}`);
+      }
+    } catch (e) {
+      failures += 1;
+      const dt = ((Date.now() - t0) / 1000).toFixed(1);
+      console.log(`[multimodal:${providerName}] ERR ${dt}s | ${String(e.message).slice(0, 220)}`);
+    }
+  }
+
+  if (failures > 0) {
+    console.error(`[multimodal] FAIL: ${failures} provider(s) did not detect the inverted camera image.`);
+    process.exitCode = 1;
+  } else {
+    console.log('[multimodal] PASS: kimi and minimax detected the inverted camera image.');
+  }
+}
+
+if (runMultimodalSmoke) {
+  await runRealMultimodalSmoke();
+  process.exit(process.exitCode ?? 0);
+}
 
 // ---------------------------------------------------------------------------
 // 2. HTTP direto: kimi / minimax / glm

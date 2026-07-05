@@ -3,8 +3,10 @@ import { insertEvent, setWorkflowDone } from '../db/persist.js';
 import { callOmnirouteWithUsage } from '../utils/omniroute-call.js';
 import {
   getFinalQualityReviewerModel,
+  getFinalVisualQualityReviewerModel,
   type QualityGateMode,
 } from '../utils/config.js';
+import type { ReviewImageAttachment } from '../utils/image-attachment.js';
 import type {
   FinalProductEvidenceBundle,
   PlaywrightHarnessEvidence,
@@ -29,11 +31,13 @@ import {
   type PlaywrightHarnessInput,
   type PlaywrightHarnessResult,
 } from './playwright-product-harness.js';
+import { providerSupportsVision, resolveDirectProviderRoute } from '../utils/provider-routes.js';
 
 export interface FinalQualityReviewInvokerInput {
   systemPrompt: string;
   userPrompt: string;
   model: string;
+  images?: ReviewImageAttachment[];
 }
 
 export type FinalQualityReviewInvoker = (
@@ -72,6 +76,8 @@ export class FinalQualityGateFailedError extends Error {
 const SYSTEM_PROMPT = [
   'You are the final product quality reviewer for an Omniforge workflow.',
   'Judge the delivered product from real evidence: tasks, quality reviews, product harness, structured errors, and terminal/debug tails.',
+  'When screenshot images are attached, inspect the actual image content: orientation, layout, canvas regions, visual hierarchy, clipping, overlap, and whether the rendered scene matches the acceptance criteria.',
+  'Do not treat screenshot file paths alone as visual proof; the attached images are the evidence.',
   'Do not accept a workflow merely because files exist. The result must satisfy the objective as a usable product.',
   'Return strict JSON only with this shape:',
   '{"outcome":"passed|needs_fixes|blocked","score":0-1,"issues":[{"severity":"info|warning|error|blocking","code":"snake_case","origin":"product_harness|workflow|task|runtime|reviewer","message":"concrete issue","suggestedAction":"operator action","safeContext":{}}],"fixTasks":[{"title":"short title","kind":"cli_spawn|llm_call","objective":"what to fix","dependsOn":["optional task ids"],"acceptanceCriteria":"testable criteria","metadata":{}}]}',
@@ -84,6 +90,7 @@ function defaultInvoker(input: FinalQualityReviewInvokerInput): Promise<string> 
     userPrompt: input.userPrompt,
     model: input.model,
     temperature: 0,
+    images: input.images,
   }).then((result) => result.content);
 }
 
@@ -198,6 +205,46 @@ function issuesFromPlaywright(
   }));
 }
 
+function safeParseTaskInputJson(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function workflowHasVisualReviewerProfile(db: Database.Database, workflowId: string): boolean {
+  const rows = db
+    .prepare(`SELECT input_json FROM tasks WHERE workflow_id = ?`)
+    .all(workflowId) as Array<{ input_json: string | null }>;
+  return rows.some((row) => safeParseTaskInputJson(row.input_json)['reviewer_profile'] === 'visual');
+}
+
+function modelSupportsImageInput(model: string): boolean {
+  if (/^codex-cli\//i.test(model)) return true;
+  const route = resolveDirectProviderRoute(model);
+  return route ? providerSupportsVision(route) : false;
+}
+
+function selectFinalReviewerModel(baseModel: string, needsVision: boolean): string {
+  if (!needsVision || modelSupportsImageInput(baseModel)) return baseModel;
+  return getFinalVisualQualityReviewerModel();
+}
+
+function imagesFromPlaywrightEvidence(
+  evidence: PlaywrightHarnessEvidence | undefined,
+): ReviewImageAttachment[] {
+  if (!evidence || evidence.screenshotPaths.length === 0) return [];
+  return evidence.screenshotPaths.slice(0, 6).map((path, index) => ({
+    path,
+    label: `Playwright screenshot ${index + 1}`,
+  }));
+}
+
 interface PlaywrightHarnessAttempt {
   evidence: PlaywrightHarnessEvidence;
   issues: QualityIssue[];
@@ -301,9 +348,11 @@ function fixTasksFromIssues(issues: QualityIssue[]): QualityFixTaskDraft[] {
   }));
 }
 
-function buildUserPrompt(bundle: FinalProductEvidenceBundle): string {
+function buildUserPrompt(bundle: FinalProductEvidenceBundle, hasAttachedImages: boolean): string {
   return JSON.stringify({
-    instruction: 'Review this final workflow/product evidence. Return strict JSON only.',
+    instruction: hasAttachedImages
+      ? 'Review this final workflow/product evidence. Attached Playwright screenshot images are available as real image inputs; inspect them directly for visual correctness, orientation, layout, canvas scene state, overlap/clipping, and acceptance-criteria fit. Return strict JSON only.'
+      : 'Review this final workflow/product evidence. Return strict JSON only.',
     bundle,
   });
 }
@@ -313,8 +362,9 @@ export async function runFinalQualityReview(
   input: EnforceFinalQualityReviewInput,
 ): Promise<QualityReviewRow> {
   if (input.mode === 'off') throw new Error('Final quality review is disabled.');
-  const model = input.model ?? getFinalQualityReviewerModel();
+  const baseModel = input.model ?? getFinalQualityReviewerModel();
   const bundle = buildFinalProductEvidenceBundle(db, input.workflowId);
+  const visualProfileRequested = workflowHasVisualReviewerProfile(db, input.workflowId);
   const staticHarnessIssues = issuesFromHarness(bundle);
 
   // F6-2: Run Playwright harness in parallel with the static harness logic.
@@ -342,6 +392,11 @@ export async function runFinalQualityReview(
   }
   const playwrightIssues = playwrightAttempt?.issues ?? [];
   const harnessIssues = [...staticHarnessIssues, ...playwrightIssues];
+  const reviewerImages = imagesFromPlaywrightEvidence(bundle.playwrightHarness);
+  const model = selectFinalReviewerModel(
+    baseModel,
+    visualProfileRequested || reviewerImages.length > 0,
+  );
 
   if (harnessIssues.length > 0) {
     const evidence = [
@@ -393,8 +448,9 @@ export async function runFinalQualityReview(
   try {
     const raw = await (input.invoker ?? defaultInvoker)({
       systemPrompt: SYSTEM_PROMPT,
-      userPrompt: buildUserPrompt(bundle),
+      userPrompt: buildUserPrompt(bundle, reviewerImages.length > 0),
       model,
+      ...(reviewerImages.length > 0 ? { images: reviewerImages } : {}),
     });
     parsed = extractJsonObject(raw);
   } catch (err) {

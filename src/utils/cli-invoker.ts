@@ -280,6 +280,28 @@ function estimateUsage(inputChars: number, outputChars: number) {
   };
 }
 
+function buildCliPrompt(input: OmniroutePromptInput, provider: CliSpec['provider']): string {
+  const combined = `${input.systemPrompt}\n\n${input.userPrompt}`;
+  if (!input.images || input.images.length === 0) return combined;
+  if (provider === 'claude') {
+    throw new Error(
+      `Image attachments are not supported over claude-cli/ yet (model ${input.model}) — ` +
+        'the vision spike could not confirm a reliable image attachment mechanism for Claude CLI; ' +
+        'use codex-cli/ or a direct vision provider (kimi/, minimax/) for visual review.',
+    );
+  }
+  const attachmentLines = input.images.map((img, index) => {
+    const label = img.label?.trim() || `image ${index + 1}`;
+    return `- ${label}: ${img.path}`;
+  });
+  return [
+    combined,
+    '=== IMAGE ATTACHMENTS ===',
+    'Open/read these local image files from disk before answering. If a path is inaccessible, say so explicitly.',
+    ...attachmentLines,
+  ].join('\n\n');
+}
+
 /**
  * Satisfy a brain-role LLM call by spawning a local CLI. Returns the same
  * shape as the HTTP path so the chokepoint's downstream finalize (cost
@@ -287,8 +309,8 @@ function estimateUsage(inputChars: number, outputChars: number) {
  */
 export async function callViaCli(input: OmniroutePromptInput): Promise<OmnirouteCallResult> {
   const spec = resolveCliSpec(input.model);
-  const combined = `${input.systemPrompt}\n\n${input.userPrompt}`;
-  const raw = await spawnCliCollect(spec, combined, input.signal);
+  const prompt = buildCliPrompt(input, spec.provider);
+  const raw = await spawnCliCollect(spec, prompt, input.signal);
   const content = extractCliContent(raw, spec.provider);
   if (content.trim() === '') {
     throw new Error(`${spec.provider} CLI returned empty content for model ${input.model}`);
@@ -296,6 +318,6 @@ export async function callViaCli(input: OmniroutePromptInput): Promise<Omniroute
   return {
     content,
     model_used: input.model,
-    usage: estimateUsage(combined.length, content.length),
+    usage: estimateUsage(prompt.length, content.length),
   };
 }

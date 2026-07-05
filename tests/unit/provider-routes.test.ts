@@ -7,6 +7,7 @@ import {
   listDirectProviderRoutes,
   buildDirectProviderUrl,
   getDirectProviderApiKey,
+  providerSupportsVision,
 } from '../../src/utils/provider-routes.js';
 
 describe('resolveDirectProviderRoute', () => {
@@ -267,5 +268,47 @@ describe('preset deepseek — URL e API key', () => {
   it('getDirectProviderApiKey retorna string vazia quando a key não está setada', () => {
     const route = resolveDirectProviderRoute('deepseek/deepseek-chat')!;
     expect(getDirectProviderApiKey(route)).toBe('');
+  });
+});
+
+// Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): capacidade de
+// visão por preset, conforme evidência do spike (docs/VISION-SPIKE-2026-07-05.md)
+// — kimi/minimax aceitam content-parts image_url; glm rejeita no endpoint
+// coding; deepseek-chat não é modelo de visão, tratado como sem suporte.
+describe('providerSupportsVision', () => {
+  it('kimi suporta visão', () => {
+    const route = resolveDirectProviderRoute('kimi/kimi-for-coding')!;
+    expect(providerSupportsVision(route)).toBe(true);
+  });
+
+  it('minimax suporta visão', () => {
+    const route = resolveDirectProviderRoute('minimax/MiniMax-M3')!;
+    expect(providerSupportsVision(route)).toBe(true);
+  });
+
+  it('glm NÃO suporta visão (rejeitado pelo endpoint coding no spike)', () => {
+    const route = resolveDirectProviderRoute('glm/glm-5.2')!;
+    expect(providerSupportsVision(route)).toBe(false);
+  });
+
+  it('deepseek NÃO suporta visão (deepseek-chat não é modelo de visão)', () => {
+    const route = resolveDirectProviderRoute('deepseek/deepseek-chat')!;
+    expect(providerSupportsVision(route)).toBe(false);
+  });
+
+  it('rota dinâmica sem o campo vision é tratada como SEM visão (padrão seguro)', () => {
+    const saved = { FOO_BASE_URL: process.env.FOO_BASE_URL, FOO_API_KEY: process.env.FOO_API_KEY };
+    process.env.FOO_BASE_URL = 'https://api.foo.example/v1';
+    process.env.FOO_API_KEY = 'foo-key';
+    try {
+      const route = resolveDirectProviderRoute('foo/some-model')!;
+      expect(route.vision).toBeUndefined();
+      expect(providerSupportsVision(route)).toBe(false);
+    } finally {
+      if (saved.FOO_BASE_URL === undefined) delete process.env.FOO_BASE_URL;
+      else process.env.FOO_BASE_URL = saved.FOO_BASE_URL;
+      if (saved.FOO_API_KEY === undefined) delete process.env.FOO_API_KEY;
+      else process.env.FOO_API_KEY = saved.FOO_API_KEY;
+    }
   });
 });

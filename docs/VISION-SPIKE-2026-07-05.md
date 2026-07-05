@@ -6,6 +6,8 @@
 `src/executors/cli/{bin-resolver,spawn-common}.ts` diretamente da fonte via o loader `tsx`, já
 devDependency do projeto — assim o spike sempre exercita o código atual, independente do estado de
 `dist/`).
+**Smoke Wave 2:** `node --import tsx scripts/_spike_vision.mjs --multimodal-smoke` roda uma regressão
+real em `kimi/kimi-for-coding` e `minimax/MiniMax-M3` com uma cena PNG invertida.
 
 ## Método
 
@@ -69,3 +71,14 @@ de leitura real; se a resposta não muda, é alucinação.
 2x codex-cli para o par normal/controle). Nenhuma chave de API foi impressa; a existência das env vars
 foi checada via `getDirectProviderApiKey`/`resolveDirectProviderRoute` (mesmo helper de produção), nunca
 via `console.log` do valor.
+
+## Smoke multimodal Wave 2
+
+O modo `--multimodal-smoke` não reexecuta a matriz inteira do spike original. Ele gera um PNG
+sintético maior com céu, chão, sol, casa e árvore, rotaciona a cena 180 graus e chama apenas os dois
+transportes HTTP com visão confirmada (`kimi` e `minimax`) pelo mesmo `callOmnirouteWithUsage` usado
+em produção. O gate passa quando ambos respondem que a cena/câmera está de cabeça para baixo.
+
+Execução validada em 2026-07-05: `kimi/kimi-for-coding` e `minimax/MiniMax-M3` responderam `SIM` para
+a imagem de câmera invertida. O smoke usa `DOTENV_CONFIG_PATH` quando rodado de uma worktree isolada
+sem `.env` local.

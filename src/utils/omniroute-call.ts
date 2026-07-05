@@ -18,8 +18,13 @@ import {
   buildDirectProviderUrl,
   getDirectProviderApiKey,
   extractContentRobust,
+  providerSupportsVision,
 } from './provider-routes.js';
 import { isCliModel, callViaCli } from './cli-invoker.js';
+// Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): pure image ->
+// data-URL conversion, see docs/VISION-SPIKE-2026-07-05.md for the transport
+// evidence this wiring is based on.
+import { imageToDataUrl, type ReviewImageAttachment } from './image-attachment.js';
 import { resolveAutoTag } from '../v2/models/auto-tags.js';
 import {
   isLlmCacheEnabled,
@@ -223,6 +228,19 @@ export interface OmniroutePromptInput {
    * Task ID for cost tracking purposes.
    */
   taskId?: string;
+  /**
+   * Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05) — optional local
+   * image attachments (e.g. reviewer screenshots) to send alongside the
+   * prompt as OpenAI-style content-parts. Purely additive: when absent/empty
+   * the call behaves byte-identically to before this field existed (plain
+   * string `content`, no content-parts array — see docs/VISION-SPIKE-2026-07-05.md
+   * for the transport evidence). When present, requires a direct-provider
+   * route with confirmed vision support (`providerSupportsVision`) — CLI
+   * transports and the legacy Omniroute path both fail fast with an explicit
+   * error rather than silently dropping the image (see the transport branch
+   * below in `callOmnirouteWithUsage`).
+   */
+  images?: ReviewImageAttachment[];
 }
 
 export interface OmnirouteUsage {
@@ -285,6 +303,7 @@ export async function callOmnirouteWithUsage(
     enforceBudget,
     workflowId,
     taskId,
+    images,
   } = input;
 
   // Cost-aware routing (Aurora-parity Wave 2): when the caller threads budget
@@ -362,6 +381,36 @@ export async function callOmnirouteWithUsage(
     throw new Error(
       `${directRoute.envVar} not set — required for direct provider '${directRoute.providerName}' (model ${resolvedModel})`,
     );
+  }
+
+  // Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): fail fast on
+  // any unsupported image transport, BEFORE any HTTP request or CLI spawn is
+  // made — same fail-fast posture as the missing-key check above. Silently
+  // dropping the image and sending a text-only prompt would be worse than an
+  // explicit error: the caller would get a plausible-looking response that
+  // never actually looked at the screenshot. See docs/VISION-SPIKE-2026-07-05.md
+  // for the evidence backing each branch below.
+  if (images && images.length > 0) {
+    if (directRoute) {
+      if (!providerSupportsVision(directRoute)) {
+        throw new Error(
+          `Direct provider '${directRoute.providerName}' does not support image/vision input ` +
+            `(model ${resolvedModel}) — use kimi/ or minimax/ instead (verified by the vision ` +
+            'spike, docs/VISION-SPIKE-2026-07-05.md).',
+        );
+      }
+      // vision-capable direct provider — content-parts assembled below.
+    } else if (isCliModel(resolvedModel)) {
+      // Wave 2: CLI-specific support is delegated to callViaCli(). codex-cli
+      // attaches images by mentioning local paths in stdin; claude-cli still
+      // fail-fasts there with a transport-specific explanation because the
+      // spike did not confirm a reliable image mechanism for Claude CLI.
+    } else {
+      throw new Error(
+        `Image attachments are not supported on the legacy Omniroute path (model ${resolvedModel}) — ` +
+          'use a direct HTTP provider with vision support (kimi/, minimax/) instead.',
+      );
+    }
   }
 
   // Initialize real-time cost tracking
@@ -442,8 +491,47 @@ export async function callOmnirouteWithUsage(
   // (Aurora-parity Wave 0 / GHOST-03: the prior USE_OMNIROUTE_SYSTEM_PROMPT branch
   // built a `system`-field body, discarded it, and swallowed errors in this hot
   // path — removed as inert dead code.)
-  const userContent: string | { type: string; text: string; cache_control?: { type: string } }[] =
-    useCacheControl
+  //
+  // Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): when `images`
+  // are present on a vision-capable direct HTTP provider, content becomes an
+  // OpenAI-style content-parts array: one text part carrying the EXACT SAME
+  // `${systemPrompt}\n\n${userPrompt}` string the no-image path already sends
+  // (so prompt content is byte-identical either way), followed by one optional
+  // short label part + one image_url part per attachment. By this point the
+  // fail-fast block above has already guaranteed direct providers support
+  // vision. Wave 2 lets CLI image calls pass through too, but those must NOT
+  // build data URLs here: callViaCli() attaches local paths in stdin instead.
+  //
+  // Interaction with `useCacheControl` (cache_control branch, decided here):
+  // `images` takes priority over prompt-prefix caching. Anthropic-family
+  // models are the only ones useCacheControl targets (isAnthropicFamily),
+  // and no Anthropic-family model is currently vision-confirmed on the direct
+  // path (kimi/minimax only) — so in practice the two conditions don't
+  // overlap yet. Should that change, correctness (the model actually seeing
+  // the image) outranks the cache_control perf-win: we build the image
+  // content-parts WITHOUT a cache_control marker on the text part rather than
+  // risk a provider adapter choking on cache_control mixed with image_url
+  // parts (untested combination, out of scope for this wave's spike).
+  const hasDirectProviderImages = directRoute !== null && images !== undefined && images.length > 0;
+  const userContent:
+    | string
+    | Array<{
+        type: string;
+        text?: string;
+        cache_control?: { type: string };
+        image_url?: { url: string };
+      }> = hasDirectProviderImages
+    ? [
+        { type: 'text', text: `${systemPrompt}\n\n${userPrompt}` },
+        ...images!.flatMap((img) => {
+          const { dataUrl } = imageToDataUrl(img.path);
+          const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+          if (img.label) parts.push({ type: 'text', text: img.label });
+          parts.push({ type: 'image_url', image_url: { url: dataUrl } });
+          return parts;
+        }),
+      ]
+    : useCacheControl
       ? [
           { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
           { type: 'text', text: `\n\n${userPrompt}` },
