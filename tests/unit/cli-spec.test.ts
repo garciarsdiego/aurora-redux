@@ -99,21 +99,21 @@ describe('resolveCliSpec — existing CLIs (stdin delivery)', () => {
     expect(spec.args).not.toContain('--dangerously-skip-permissions');
   });
 
-  it('gemini: --yolo + -p by default, arg delivery (post-2026-05-05 fix — --skip-trust does not exist)', () => {
+  it('gemini (agy): --dangerously-skip-permissions + --model default + -p, arg delivery (Aurora-Redux 2026-07-04 — migrado do gemini-cli morto para Antigravity)', () => {
     const spec = resolveCliSpec('cli:gemini');
-    // Windows resolves to absolute path under npm-global; bin name still ends with gemini
-    expect(spec.bin.toLowerCase()).toMatch(/gemini(\.exe|\.cmd)?$/);
+    // Antigravity CLI: bin é agy (gemini-cli foi desligado em 2026-06-18).
+    expect(spec.bin.toLowerCase()).toMatch(/agy(\.exe|\.cmd)?$/);
     // -p is the LAST arg before runCliTask appends the prompt as the next argv element.
-    expect(spec.args).toEqual(['--yolo', '-p']);
+    expect(spec.args).toEqual(['--dangerously-skip-permissions', '--model', 'gemini-3.1-pro', '-p']);
     expect(spec.promptDelivery).toBe('arg');
     expect(spec.streamJson).toBe(false);
   });
 
-  it('gemini: safe mode drops --yolo but keeps -p (interactive approval default + arg delivery)', () => {
+  it('gemini (agy): safe mode drops --dangerously-skip-permissions but keeps --model + -p', () => {
     process.env.CLI_SAFE_MODE = 'true';
     const spec = resolveCliSpec('cli:gemini');
-    expect(spec.args).toEqual(['-p']);
-    expect(spec.args).not.toContain('--yolo');
+    expect(spec.args).toEqual(['--model', 'gemini-3.1-pro', '-p']);
+    expect(spec.args).not.toContain('--dangerously-skip-permissions');
     expect(spec.promptDelivery).toBe('arg');
   });
 
@@ -175,9 +175,10 @@ describe('resolveCliSpec — existing CLIs (stdin delivery)', () => {
 
   it('null hint infers gemini CLI from a gemini-cli model id', () => {
     const spec = resolveCliSpec(null, taskWithModel('gemini-cli/gemini-2.5-pro'));
-    expect(spec.bin.toLowerCase()).toMatch(/gemini(\.exe|\.cmd)?$/);
-    // Args order: --yolo (write permission), --model X, then -p (prompt-arg flag, prompt appended after).
-    expect(spec.args).toEqual(['--yolo', '--model', 'gemini-2.5-pro', '-p']);
+    expect(spec.bin.toLowerCase()).toMatch(/agy(\.exe|\.cmd)?$/);
+    // Args order: skip-permissions (write permission), --model X, then -p (prompt-arg flag, prompt appended after).
+    // 'gemini-2.5-pro' não casa /preview/i, então o id do task é mantido.
+    expect(spec.args).toEqual(['--dangerously-skip-permissions', '--model', 'gemini-2.5-pro', '-p']);
   });
 });
 
@@ -362,15 +363,18 @@ describe('resolveCliSpec — model↔CLI compatibility (AETHER α-init regressio
     expect(spec.args).toEqual(['exec', '--model', 'gpt-5.4', '--dangerously-bypass-approvals-and-sandbox', '--ignore-user-config']);
   });
 
-  it('cli:gemini + cc/* model → drops --model (Gemini would not recognise Claude id) but --yolo + -p stay', () => {
+  it('cli:gemini + cc/* model → incompatível vira o --model default do agy (agy não reconhece id Claude)', () => {
     const spec = resolveCliSpec('cli:gemini', taskWithModel('cc/claude-sonnet-4-6'));
-    // --model dropped, --yolo kept, -p is the prompt-arg flag (post-2026-05-05 fix).
-    expect(spec.args).toEqual(['--yolo', '-p']);
+    // cliModel incompatível é dropado; o adapter agy sempre passa --model
+    // (default gemini-3.1-pro). -p segue por último (prompt como arg).
+    expect(spec.args).toEqual(['--dangerously-skip-permissions', '--model', 'gemini-3.1-pro', '-p']);
   });
 
-  it('cli:gemini + gemini-cli/* model → keeps --yolo, --model, and -p', () => {
+  it('cli:gemini + gemini-cli/* model → ids *-preview do gemini-cli morto normalizam para o default do agy', () => {
     const spec = resolveCliSpec('cli:gemini', taskWithModel('gemini-cli/gemini-3.1-pro-preview'));
-    expect(spec.args).toEqual(['--yolo', '--model', 'gemini-3.1-pro-preview', '-p']);
+    // 'gemini-3.1-pro-preview' não é um id do agy — o adapter normaliza
+    // qualquer /preview/i para o default verificado.
+    expect(spec.args).toEqual(['--dangerously-skip-permissions', '--model', 'gemini-3.1-pro', '-p']);
   });
 
   // Note: `cli:claude-code` (and `cli:auto` / `cli:default`) is intentionally
