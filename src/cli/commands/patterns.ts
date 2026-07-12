@@ -67,7 +67,10 @@ export function registerPatterns(program: Command): void {
         console.log('');
       } catch (err) {
         console.error('Erro:', err instanceof Error ? err.message : String(err));
-        process.exit(1);
+        // exitCode (não process.exit) para deixar o finally fechar o db —
+        // process.exit() aqui pularia o close e arrisca a assertion do libuv
+        // no Windows (ver run.ts / run-summary.ts).
+        process.exitCode = 1;
       } finally {
         db.close();
       }
@@ -84,7 +87,7 @@ export function registerPatterns(program: Command): void {
           console.log(`✓ Pattern ${patternId} removido.`);
         } else {
           console.log(`Pattern não encontrado: ${patternId}`);
-          process.exit(1);
+          process.exitCode = 1;
         }
       } finally {
         db.close();

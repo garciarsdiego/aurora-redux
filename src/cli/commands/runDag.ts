@@ -28,6 +28,7 @@ import { DagSchema } from '../../types/schemas.js';
 import { getDbPath } from '../../utils/config.js';
 import { loadWorkspaceEnv } from '../../utils/workspace.js';
 import { makeProgressPrinter } from '../progress-printer.js';
+import { printWorkflowSummary, reportRunError } from '../run-summary.js';
 import type { Dag } from '../../types/index.js';
 
 interface RunDagOptions {
@@ -66,6 +67,18 @@ export function readAndValidateDag(file: string): Dag {
   return result.data;
 }
 
+type DagTask = Dag['tasks'][number];
+
+/** Distinct non-empty values of `pick` across tasks, sorted. */
+function collectDistinct(tasks: readonly DagTask[], pick: (t: DagTask) => string | null | undefined): string[] {
+  const set = new Set<string>();
+  for (const t of tasks) {
+    const value = pick(t);
+    if (value) set.add(value);
+  }
+  return [...set].sort();
+}
+
 /** Build the human-readable plan summary + per-task table. */
 export function formatPlan(dag: Dag, file: string, opts: { workspace: string; autoApprove?: boolean }): string {
   const lines: string[] = [];
@@ -80,26 +93,20 @@ export function formatPlan(dag: Dag, file: string, opts: { workspace: string; au
   lines.push(`  Kinds:      ${[...kindCounts].map(([k, n]) => `${k} (${n})`).join(', ')}`);
 
   // Distinct models
-  const models = new Set<string>();
-  for (const t of dag.tasks) if (t.model) models.add(t.model);
-  if (models.size > 0) {
-    lines.push(`  Models:     ${[...models].sort().join(', ')}`);
-  }
+  const models = collectDistinct(dag.tasks, (t) => t.model);
+  if (models.length > 0) lines.push(`  Models:     ${models.join(', ')}`);
 
   // CLI hints
-  const cliHints = new Set<string>();
-  for (const t of dag.tasks) if (t.kind === 'cli_spawn' && t.executor_hint) cliHints.add(t.executor_hint);
-  if (cliHints.size > 0) lines.push(`  CLI:        ${[...cliHints].sort().join(', ')}`);
+  const cliHints = collectDistinct(dag.tasks, (t) => (t.kind === 'cli_spawn' ? t.executor_hint : undefined));
+  if (cliHints.length > 0) lines.push(`  CLI:        ${cliHints.join(', ')}`);
 
   // PAL tools
-  const palHints = new Set<string>();
-  for (const t of dag.tasks) if (t.kind === 'pal_call' && t.executor_hint) palHints.add(t.executor_hint);
-  if (palHints.size > 0) lines.push(`  PAL:        ${[...palHints].sort().join(', ')}`);
+  const palHints = collectDistinct(dag.tasks, (t) => (t.kind === 'pal_call' ? t.executor_hint : undefined));
+  if (palHints.length > 0) lines.push(`  PAL:        ${palHints.join(', ')}`);
 
   // tool_call tools
-  const toolNames = new Set<string>();
-  for (const t of dag.tasks) if (t.kind === 'tool_call' && t.tool_name) toolNames.add(t.tool_name);
-  if (toolNames.size > 0) lines.push(`  Tools:      ${[...toolNames].sort().join(', ')}`);
+  const toolNames = collectDistinct(dag.tasks, (t) => (t.kind === 'tool_call' ? t.tool_name : undefined));
+  if (toolNames.length > 0) lines.push(`  Tools:      ${toolNames.join(', ')}`);
 
   // HITL gates
   const hitlTasks = dag.tasks.filter((t) => t.hitl).map((t) => t.id);
@@ -261,19 +268,19 @@ export function registerRunDag(program: Command): void {
         });
         const duration = Date.now() - started;
 
-        console.log('');
-        console.log('✓ Workflow completado');
-        console.log(`  ID:        ${wf.id}`);
-        console.log(`  Workspace: ${wf.workspace}`);
-        console.log(`  Status:    ${wf.status}`);
-        console.log(`  Tasks:     ${dag.tasks.length}`);
-        console.log(`  Duração:   ${duration}ms`);
-        console.log(`  Artefatos: workspaces/${wf.workspace}/runs/${wf.id}/`);
+        printWorkflowSummary({
+          title: '✓ Workflow completado',
+          id: wf.id,
+          workspace: wf.workspace,
+          status: wf.status,
+          tasks: dag.tasks.length,
+          durationMs: duration,
+          artifacts: `workspaces/${wf.workspace}/runs/${wf.id}/`,
+        });
       } catch (err) {
-        console.error('Erro:', err instanceof Error ? err.message : String(err));
-        // Same rationale as `run.ts`: set exitCode rather than process.exit() so
-        // event loop drains naturally. See run.ts comment.
-        process.exitCode = 1;
+        // reportRunError sets exitCode (never process.exit) so the event loop
+        // drains naturally — see src/cli/run-summary.ts.
+        reportRunError(err);
       } finally {
         db.close();
       }

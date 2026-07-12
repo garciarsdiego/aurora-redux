@@ -1,8 +1,9 @@
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import type { Task, TaskKind } from '../types/index.js';
-import { insertEvent, loadWorkflowById, loadWorkflowTasks } from '../db/persist.js';
+import { insertEvent, loadWorkflowById } from '../db/persist.js';
 import { withSqliteRetrySync } from '../db/sqlite-retry.js';
+import { reloadTask } from './dashboard-task-ops-meta.js';
 import {
   loadCatalog as loadOmnirouteCatalog,
   extractProvider,
@@ -72,12 +73,6 @@ export function isTaskModelCompatible(task: CompatibleTask, model: CompatibleMod
   return modelKind === 'llm' || modelKind === 'unknown';
 }
 
-function taskById(db: Database.Database, workflowId: string, taskId: string): Task {
-  const task = loadWorkflowTasks(db, workflowId).find((item) => item.id === taskId);
-  if (!task) throw new Error(`Task not found in workflow: ${taskId}`);
-  return task;
-}
-
 export async function patchDashboardTaskModel(
   db: Database.Database,
   workflowId: string,
@@ -88,7 +83,7 @@ export async function patchDashboardTaskModel(
   const workflow = loadWorkflowById(db, workflowId);
   if (!workflow) throw new Error(`Workflow not found: ${workflowId}`);
 
-  const task = taskById(db, workflowId, taskId);
+  const task = reloadTask(db, workflowId, taskId);
   if (task.status !== 'pending') {
     throw new Error(`Cannot change model for ${task.status} task: ${taskId}`);
   }
@@ -118,7 +113,7 @@ export async function patchDashboardTaskModel(
     },
   });
 
-  return taskById(db, workflowId, taskId);
+  return reloadTask(db, workflowId, taskId);
 }
 
 export function lookupWorkflowIdForTask(db: Database.Database, taskId: string): string | null {

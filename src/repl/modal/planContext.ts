@@ -4,7 +4,8 @@
 // dump. Keeping this in its own file lets tests exercise the formatting logic
 // without spinning up Ink.
 
-import type { PlanContext } from '../../hitl/cli.js';
+import type { PlanContext, PlanTaskSummary } from '../../hitl/cli.js';
+import { truncate } from '../utils/text.js';
 
 const NAME_MAX = 50;
 const OBJECTIVE_MAX = 100;
@@ -25,11 +26,12 @@ export function formatDuration(seconds: number | undefined): string {
  * memoisation. Returns 0 for empty input.
  */
 export function criticalPathSeconds(
-  tasks: readonly PlanContext['tasks'][number][],
+  tasks: readonly PlanTaskSummary[],
 ): number {
   if (tasks.length === 0) return 0;
   const byId = new Map(tasks.map((t) => [t.id, t]));
   const memo = new Map<string, number>();
+  const onStack = new Set<string>(); // nodes on the current recursion path
 
   function pathTo(id: string): number {
     const cached = memo.get(id);
@@ -45,11 +47,6 @@ export function criticalPathSeconds(
   }
 
   return Math.max(...tasks.map((t) => pathTo(t.id)));
-}
-
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return text.slice(0, max - 1) + '\u2026';
 }
 
 /**

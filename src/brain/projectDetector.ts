@@ -70,11 +70,9 @@ export function detectProjectType(rootDir: string): ProjectType | null {
 
   // package.json without tsconfig — treat as JavaScript
   if (existsSync(pkgJsonPath)) {
-    // But confirm there actually ARE JS/TS files to validate
+    // Parse only to detect a malformed package.json (degrade to 'other').
     try {
-      const pkgRaw = readFileSync(pkgJsonPath, 'utf8');
-      const pkg = JSON.parse(pkgRaw) as { type?: string };
-      if (pkg.type === 'module' || pkg.type === undefined) return 'javascript';
+      JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
     } catch {
       // malformed package.json — still a JS-adjacent project, but degrade to 'other'
       return 'other';

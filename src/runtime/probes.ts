@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
-import { redactRuntimeValue } from './events.js';
+import { redactRuntimeValue, type RuntimeStructuredError } from './events.js';
 
 export interface RuntimeProbeRunInput {
   dryRun?: boolean;
@@ -26,13 +26,16 @@ export interface RuntimeProbeRunResult {
   summary: RuntimeProbeSummary | null;
   stdout: string;
   stderr: string;
-  structured_error?: {
-    code: string;
-    origin: string;
-    message: string;
-    suggestedAction: string;
-    safeContext?: Record<string, unknown>;
-  };
+  structured_error?: RuntimeStructuredError;
+}
+
+/** Typed wrappers around redactRuntimeValue so the casts live in one place. */
+function redactText(value: string): string {
+  return redactRuntimeValue(value) as string;
+}
+
+function redactRecord(value: Record<string, unknown>): Record<string, unknown> {
+  return redactRuntimeValue(value) as Record<string, unknown>;
 }
 
 function structuredError(
@@ -46,7 +49,7 @@ function structuredError(
     origin: 'runtime.probes',
     message,
     suggestedAction,
-    safeContext: safeContext ? redactRuntimeValue(safeContext) as Record<string, unknown> : undefined,
+    safeContext: safeContext ? redactRecord(safeContext) : undefined,
   };
 }
 
@@ -86,7 +89,7 @@ export function latestRuntimeProbeSummary(repoRoot = process.cwd()): RuntimeProb
     const summaryPath = path.join(root, dir, 'summary.json');
     if (!existsSync(summaryPath)) continue;
     const parsed = parseJsonObject(readFileSync(summaryPath, 'utf8'));
-    if (parsed) return toSummary(redactRuntimeValue(parsed) as Record<string, unknown>);
+    if (parsed) return toSummary(redactRecord(parsed));
   }
   return null;
 }
@@ -131,8 +134,8 @@ export async function runRuntimeAdapterProbe(input: RuntimeProbeRunInput = {}): 
       resolve({
         ok: false,
         summary: null,
-        stdout: redactRuntimeValue(stdout) as string,
-        stderr: redactRuntimeValue(stderr) as string,
+        stdout: redactText(stdout),
+        stderr: redactText(stderr),
         structured_error: structuredError(
           'runtime_probe_spawn_failed',
           err.message,
@@ -143,12 +146,12 @@ export async function runRuntimeAdapterProbe(input: RuntimeProbeRunInput = {}): 
     });
     child.once('close', (code) => {
       const parsed = parseJsonObject(stdout.trim());
-      const summary = parsed ? toSummary(redactRuntimeValue(parsed) as Record<string, unknown>) : latestRuntimeProbeSummary(repoRoot);
+      const summary = parsed ? toSummary(redactRecord(parsed)) : latestRuntimeProbeSummary(repoRoot);
       resolve({
         ok: code === 0,
         summary,
-        stdout: redactRuntimeValue(stdout) as string,
-        stderr: redactRuntimeValue(stderr) as string,
+        stdout: redactText(stdout),
+        stderr: redactText(stderr),
         ...(code === 0
           ? {}
           : {

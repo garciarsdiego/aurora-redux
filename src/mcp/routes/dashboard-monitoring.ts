@@ -23,7 +23,28 @@ import {
   getCapacityPlanning,
   generateInsights,
 } from '../../v2/observability/analytics.js';
-import { getCachedAnalytics } from '../../v2/observability/analytics-cache.js';
+
+// ── Local response helpers ────────────────────────────────────────────────
+//
+// NOTE: this file responds with 'Content-Type' + 'X-Omniforge-Api-Version'
+// only (no SECURITY_HEADERS), matching its historical behavior. Unifying
+// with jsonOk/badRequest from _shared.ts would change response headers —
+// do that as a separate, conscious step.
+
+function respondJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'X-Omniforge-Api-Version': String(API_VERSION),
+  });
+  res.end(JSON.stringify(body));
+}
+
+function respondError(res: ServerResponse, error: string, err: unknown): void {
+  respondJson(res, 500, {
+    error,
+    message: err instanceof Error ? err.message : String(err),
+  });
+}
 
 /**
  * GET /api/monitoring/dashboard
@@ -40,20 +61,9 @@ function handleMonitoringDashboard(res: ServerResponse, url: URL, ctx: RouteCont
       includeAnalytics,
     });
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify(data));
+    respondJson(res, 200, data);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to fetch monitoring data',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to fetch monitoring data', err);
   }
 }
 
@@ -89,26 +99,15 @@ function handleHealthCheck(res: ServerResponse, ctx: RouteContext): void {
 
     const overallHealth = issues.length === 0 ? 'healthy' : (health.status === 'unhealthy' ? 'unhealthy' : 'degraded');
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
+    respondJson(res, 200, {
       status: overallHealth,
       system_health: health,
       issues,
       thresholds: HEALTH_THRESHOLDS,
       timestamp: data.timestamp,
-    }));
-  } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
     });
-    res.end(JSON.stringify({
-      error: 'Failed to fetch health status',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+  } catch (err) {
+    respondError(res, 'Failed to fetch health status', err);
   }
 }
 
@@ -186,7 +185,7 @@ function handleMetricsExport(res: ServerResponse, ctx: RouteContext): void {
  * 
  * Export traces in Jaeger-compatible format for distributed tracing systems.
  */
-function handleJaegerTraceExport(res: ServerResponse, url: URL, ctx: RouteContext): void {
+function handleJaegerTraceExport(res: ServerResponse, url: URL): void {
   try {
     const workflowId = url.pathname.split('/').slice(-2)[0]; // Extract workflow ID from path
     if (!workflowId) {
@@ -198,23 +197,12 @@ function handleJaegerTraceExport(res: ServerResponse, url: URL, ctx: RouteContex
     const db = initDb(getDbPath());
     try {
       const traces = exportTracesJaeger(db, workflowId);
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'X-Omniforge-Api-Version': String(API_VERSION),
-      });
-      res.end(JSON.stringify({ data: traces }));
+      respondJson(res, 200, { data: traces });
     } finally {
       db.close();
     }
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to export Jaeger traces',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to export Jaeger traces', err);
   }
 }
 
@@ -223,7 +211,7 @@ function handleJaegerTraceExport(res: ServerResponse, url: URL, ctx: RouteContex
  * 
  * Export traces in Zipkin v2 format for distributed tracing systems.
  */
-function handleZipkinTraceExport(res: ServerResponse, url: URL, ctx: RouteContext): void {
+function handleZipkinTraceExport(res: ServerResponse, url: URL): void {
   try {
     const workflowId = url.pathname.split('/').slice(-2)[0]; // Extract workflow ID from path
     if (!workflowId) {
@@ -235,23 +223,12 @@ function handleZipkinTraceExport(res: ServerResponse, url: URL, ctx: RouteContex
     const db = initDb(getDbPath());
     try {
       const traces = exportTracesZipkin(db, workflowId);
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'X-Omniforge-Api-Version': String(API_VERSION),
-      });
-      res.end(JSON.stringify(traces));
+      respondJson(res, 200, traces);
     } finally {
       db.close();
     }
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to export Zipkin traces',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to export Zipkin traces', err);
   }
 }
 
@@ -260,7 +237,7 @@ function handleZipkinTraceExport(res: ServerResponse, url: URL, ctx: RouteContex
  * 
  * Get trace statistics for a workflow.
  */
-function handleTraceStatistics(res: ServerResponse, url: URL, ctx: RouteContext): void {
+function handleTraceStatistics(res: ServerResponse, url: URL): void {
   try {
     const workflowId = url.pathname.split('/').slice(-2)[0]; // Extract workflow ID from path
     if (!workflowId) {
@@ -272,66 +249,48 @@ function handleTraceStatistics(res: ServerResponse, url: URL, ctx: RouteContext)
     const db = initDb(getDbPath());
     try {
       const stats = getTraceStatistics(db, workflowId);
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'X-Omniforge-Api-Version': String(API_VERSION),
-      });
-      res.end(JSON.stringify(stats));
+      respondJson(res, 200, stats);
     } finally {
       db.close();
     }
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to get trace statistics',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to get trace statistics', err);
   }
+}
+
+/** Builds a LogQuery from query params — shared by /logs and /logs/export
+ *  so the two parsers can never drift apart. */
+function parseLogQuery(params: URLSearchParams): LogQuery {
+  return {
+    level: params.get('level') as LogQuery['level'] || undefined,
+    context: params.get('context') || undefined,
+    workflowId: params.get('workflowId') || undefined,
+    taskId: params.get('taskId') || undefined,
+    since: params.get('since') ? parseInt(params.get('since')!, 10) : undefined,
+    until: params.get('until') ? parseInt(params.get('until')!, 10) : undefined,
+    limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : undefined,
+    search: params.get('search') || undefined,
+  };
 }
 
 /**
  * GET /api/monitoring/logs
- * 
+ *
  * Query logs with optional filters.
  */
 function handleLogsQuery(res: ServerResponse, url: URL): void {
   try {
-    const params = url.searchParams;
-    
-    const query: LogQuery = {
-      level: params.get('level') as LogQuery['level'] || undefined,
-      context: params.get('context') || undefined,
-      workflowId: params.get('workflowId') || undefined,
-      taskId: params.get('taskId') || undefined,
-      since: params.get('since') ? parseInt(params.get('since')!, 10) : undefined,
-      until: params.get('until') ? parseInt(params.get('until')!, 10) : undefined,
-      limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : undefined,
-      search: params.get('search') || undefined,
-    };
+    const query = parseLogQuery(url.searchParams);
 
     const logs = logAggregator.queryLogs(query);
-    
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
+
+    respondJson(res, 200, {
       logs,
       total: logs.length,
       query,
-    }));
-  } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
     });
-    res.end(JSON.stringify({
-      error: 'Failed to query logs',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+  } catch (err) {
+    respondError(res, 'Failed to query logs', err);
   }
 }
 
@@ -343,21 +302,10 @@ function handleLogsQuery(res: ServerResponse, url: URL): void {
 function handleLogsStatistics(res: ServerResponse): void {
   try {
     const stats = logAggregator.getStatistics();
-    
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify(stats));
+
+    respondJson(res, 200, stats);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to get log statistics',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to get log statistics', err);
   }
 }
 
@@ -370,24 +318,15 @@ function handleLogsExport(res: ServerResponse, url: URL): void {
   try {
     const params = url.searchParams;
     const format = (params.get('format') as 'json' | 'csv' | 'syslog') || 'json';
-    
-    const query: LogQuery = {
-      level: params.get('level') as LogQuery['level'] || undefined,
-      context: params.get('context') || undefined,
-      workflowId: params.get('workflowId') || undefined,
-      taskId: params.get('taskId') || undefined,
-      since: params.get('since') ? parseInt(params.get('since')!, 10) : undefined,
-      until: params.get('until') ? parseInt(params.get('until')!, 10) : undefined,
-      limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : undefined,
-      search: params.get('search') || undefined,
-    };
+
+    const query = parseLogQuery(params);
 
     const exported = logAggregator.exportLogs(query, format);
-    
-    const contentType = format === 'json' 
-      ? 'application/json' 
+
+    const contentType = format === 'json'
+      ? 'application/json'
       : (format === 'csv' ? 'text/csv' : 'text/plain');
-    
+
     res.writeHead(200, {
       'Content-Type': contentType,
       'X-Omniforge-Api-Version': String(API_VERSION),
@@ -395,14 +334,7 @@ function handleLogsExport(res: ServerResponse, url: URL): void {
     });
     res.end(exported);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to export logs',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to export logs', err);
   }
 }
 
@@ -415,20 +347,9 @@ function handleAnalyticsReport(res: ServerResponse): void {
   try {
     const report = getAnalyticsReport();
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify(report));
+    respondJson(res, 200, report);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to fetch analytics report',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to fetch analytics report', err);
   }
 }
 
@@ -444,20 +365,9 @@ function handlePerformanceTrend(res: ServerResponse, url: URL): void {
 
     const trend = getPerformanceTrend(metric, period);
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify(trend));
+    respondJson(res, 200, trend);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to fetch performance trend',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to fetch performance trend', err);
   }
 }
 
@@ -470,20 +380,9 @@ function handleCostAnalytics(res: ServerResponse): void {
   try {
     const analytics = getCostAnalytics();
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify(analytics));
+    respondJson(res, 200, analytics);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to fetch cost analytics',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to fetch cost analytics', err);
   }
 }
 
@@ -496,20 +395,9 @@ function handleRoutingAnalytics(res: ServerResponse): void {
   try {
     const analytics = getRoutingAnalytics();
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify(analytics));
+    respondJson(res, 200, analytics);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to fetch routing analytics',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to fetch routing analytics', err);
   }
 }
 
@@ -522,20 +410,9 @@ function handleAnomalies(res: ServerResponse): void {
   try {
     const anomalies = detectAnomalies();
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({ anomalies }));
+    respondJson(res, 200, { anomalies });
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to detect anomalies',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to detect anomalies', err);
   }
 }
 
@@ -548,20 +425,9 @@ function handleCapacityPlanning(res: ServerResponse): void {
   try {
     const capacity = getCapacityPlanning();
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify(capacity));
+    respondJson(res, 200, capacity);
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to fetch capacity planning',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to fetch capacity planning', err);
   }
 }
 
@@ -574,20 +440,9 @@ function handleInsights(res: ServerResponse): void {
   try {
     const insights = generateInsights();
 
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({ insights }));
+    respondJson(res, 200, { insights });
   } catch (err) {
-    res.writeHead(500, {
-      'Content-Type': 'application/json',
-      'X-Omniforge-Api-Version': String(API_VERSION),
-    });
-    res.end(JSON.stringify({
-      error: 'Failed to generate insights',
-      message: err instanceof Error ? err.message : String(err),
-    }));
+    respondError(res, 'Failed to generate insights', err);
   }
 }
 
@@ -606,15 +461,15 @@ export const monitoringRouter: Router = async (req, url, res, ctx) => {
   }
   // Sprint 0: Distributed tracing endpoints
   if (req.method === 'GET' && url.pathname.match(/^\/api\/monitoring\/traces\/[^/]+\/jaeger$/)) {
-    handleJaegerTraceExport(res, url, ctx);
+    handleJaegerTraceExport(res, url);
     return true;
   }
   if (req.method === 'GET' && url.pathname.match(/^\/api\/monitoring\/traces\/[^/]+\/zipkin$/)) {
-    handleZipkinTraceExport(res, url, ctx);
+    handleZipkinTraceExport(res, url);
     return true;
   }
   if (req.method === 'GET' && url.pathname.match(/^\/api\/monitoring\/traces\/[^/]+\/statistics$/)) {
-    handleTraceStatistics(res, url, ctx);
+    handleTraceStatistics(res, url);
     return true;
   }
   // Sprint 0: Log aggregation endpoints

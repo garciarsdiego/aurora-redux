@@ -9,6 +9,7 @@ import { getDbPath } from '../../utils/config.js';
 import { loadWorkspaceEnv } from '../../utils/workspace.js';
 import type { Dag } from '../../types/index.js';
 import { makeProgressPrinter } from '../progress-printer.js';
+import { printWorkflowSummary, reportRunError } from '../run-summary.js';
 
 export function registerRun(program: Command): void {
   program
@@ -17,7 +18,8 @@ export function registerRun(program: Command): void {
     .requiredOption('-w, --workspace <name>', 'workspace to run in')
     .option('--auto-approve', 'bypass all HITL gates automatically')
     .option('--no-pattern', 'skip pattern matching and always generate a fresh DAG')
-    .action(async (objective: string, options: { workspace: string; autoApprove?: boolean; noPattern?: boolean }) => {
+    // Commander maps `--no-pattern` to `options.pattern = false` (default true).
+    .action(async (objective: string, options: { workspace: string; autoApprove?: boolean; pattern?: boolean }) => {
       loadWorkspaceEnv(options.workspace);
       const db = initDb(getDbPath());
       try {
@@ -34,17 +36,18 @@ export function registerRun(program: Command): void {
           });
           const duration = Date.now() - started;
 
-          console.log('');
-          console.log('✓ Workflow retomado e completado');
-          console.log(`  ID:        ${wf.id}`);
-          console.log(`  Workspace: ${wf.workspace}`);
-          console.log(`  Status:    ${wf.status}`);
-          console.log(`  Duração:   ${duration}ms`);
+          printWorkflowSummary({
+            title: '✓ Workflow retomado e completado',
+            id: wf.id,
+            workspace: wf.workspace,
+            status: wf.status,
+            durationMs: duration,
+          });
         } else {
           let dag: Dag;
           let patternId: string | undefined;
 
-          if (options.noPattern) {
+          if (options.pattern === false) {
             console.log('Gerando DAG novo (--no-pattern)...');
             dag = await decompose(objective);
             console.log(`DAG: ${dag.tasks.length} tasks`);
@@ -75,25 +78,20 @@ export function registerRun(program: Command): void {
             bumpPatternUsage(db, patternId);
           }
 
-          console.log('');
-          console.log('✓ Workflow completado');
-          console.log(`  ID:        ${wf.id}`);
-          console.log(`  Workspace: ${wf.workspace}`);
-          console.log(`  Status:    ${wf.status}`);
-          console.log(`  Tasks:     ${dag.tasks.length}`);
-          console.log(`  Duração:   ${duration}ms`);
-          if (patternId) {
-            console.log(`  Pattern:   ${patternId}`);
-          }
+          printWorkflowSummary({
+            title: '✓ Workflow completado',
+            id: wf.id,
+            workspace: wf.workspace,
+            status: wf.status,
+            tasks: dag.tasks.length,
+            durationMs: duration,
+            pattern: patternId,
+          });
         }
       } catch (err) {
-        console.error('Erro:', err instanceof Error ? err.message : String(err));
-        // Set exitCode rather than calling process.exit() — this lets the event
-        // loop drain naturally so any in-flight Omniroute fetch / better-sqlite3
-        // worker handle finishes closing before Node shuts down. Calling
-        // process.exit(1) here triggers libuv "Assertion failed: !(handle->flags
-        // & UV_HANDLE_CLOSING)" on Windows when an async handle is mid-close.
-        process.exitCode = 1;
+        // reportRunError sets exitCode (never process.exit) — see the libuv
+        // rationale in src/cli/run-summary.ts.
+        reportRunError(err);
       } finally {
         db.close();
       }

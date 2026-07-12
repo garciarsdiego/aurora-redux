@@ -10,6 +10,7 @@
 import type Database from 'better-sqlite3';
 import type { DashboardTaskCard, DashboardMailboxEntry } from './dashboard-data-tasks.js';
 import type { DashboardWorkflowCard } from './dashboard-data-workflows.js';
+import { previewValue, safeJsonObject, taskMapKey } from './_json-utils.js';
 
 export interface DashboardTimelineEvent {
   id: number;
@@ -57,31 +58,8 @@ interface SubagentMessageDeliveryRow {
   delivered_at: number;
 }
 
-function payloadObject(raw: string | null): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function previewValue(raw: string | null, max = 1_000): string | null {
-  if (!raw) return null;
-  let text = raw;
-  try {
-    text = JSON.stringify(JSON.parse(raw) as unknown, null, 2);
-  } catch {
-    text = raw;
-  }
-  return text.length > max ? `${text.slice(0, max)}...` : text;
-}
-
 function inferTaskIdFromPayload(raw: string | null): string | null {
-  const payload = payloadObject(raw);
+  const payload = safeJsonObject(raw);
   const candidates = [
     payload['task_id'],
     payload['source_task_id'],
@@ -99,12 +77,8 @@ function inferTaskIdFromPayload(raw: string | null): string | null {
   return null;
 }
 
-function taskMapKey(workflowId: string, taskId: string | null): string | null {
-  return taskId ? `${workflowId}::${taskId}` : null;
-}
-
 function workflowErrorFromEvent(row: EventDetailRow): DashboardWorkflowCard['latest_error'] | null {
-  const payload = payloadObject(row.payload_json);
+  const payload = safeJsonObject(row.payload_json);
   if (row.type === 'workflow_quota_blocked') {
     const remaining = typeof payload['remaining_pct'] === 'number' ? payload['remaining_pct'] : 0;
     return {
@@ -227,7 +201,7 @@ export function queryEventsAndBuildTimeline(
     };
     const wfTimeline = timelines.get(row.workflow_id) ?? [];
     wfTimeline.push(event);
-    timelines.set(row.workflow_id, wfTimeline.slice(-80));
+    timelines.set(row.workflow_id, wfTimeline);
     const workflowError = workflowErrorFromEvent(row);
     const dismissedUntil = dismissedWorkflowErrors.get(row.workflow_id) ?? 0;
     if (workflowError && row.id > dismissedUntil) latestErrors.set(row.workflow_id, workflowError);
@@ -245,6 +219,11 @@ export function queryEventsAndBuildTimeline(
         task.events = task.events.slice(-8);
       }
     }
+  }
+
+  // Trim once per workflow instead of reallocating on every event row.
+  for (const [workflowId, wfTimeline] of timelines) {
+    if (wfTimeline.length > 80) timelines.set(workflowId, wfTimeline.slice(-80));
   }
 
   return { timelines, latestErrors };

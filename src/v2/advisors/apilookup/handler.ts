@@ -18,7 +18,7 @@
 
 import type { Advisor, AdvisorContext, AdvisorResult } from '../types.js';
 import { getAdvisorMode } from '../shared/mode.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
+import { callAdvisorLlm } from '../shared/llm.js';
 import { webSearch } from '../../tools/core/web-search.js';
 import { webFetch } from '../../tools/core/web-fetch.js';
 import { ApilookupInputSchema } from './schema.js';
@@ -35,41 +35,44 @@ const PER_FETCH_TIMEOUT = 15_000;
 const MAX_BODY_PER_RESULT = 12_000;
 
 async function gatherSources(query: string): Promise<string> {
-  const lines: string[] = [];
-  let searchProvider = 'unknown';
+  // Only the search itself is guarded: when it fails there is no grounding at
+  // all, so return '' and let the caller fall back to the ungrounded prompt —
+  // an error string here would be mislabelled as "GROUNDING SOURCES" evidence.
+  let search;
   try {
-    const search = await webSearch({ query, limit: TOP_N });
-    searchProvider = search.provider;
-    lines.push(`Search provider: ${search.provider}${search.cached ? ' (cached)' : ''}`);
-    lines.push(`Top ${search.results.length} results:`);
-    for (const [i, r] of search.results.entries()) {
-      lines.push(`  ${i + 1}. ${r.title} — ${r.url}`);
-      if (r.snippet) lines.push(`     ${r.snippet.slice(0, 200)}`);
+    search = await webSearch({ query, limit: TOP_N });
+  } catch {
+    return '';
+  }
+
+  const lines: string[] = [];
+  lines.push(`Search provider: ${search.provider}${search.cached ? ' (cached)' : ''}`);
+  lines.push(`Top ${search.results.length} results:`);
+  for (const [i, r] of search.results.entries()) {
+    lines.push(`  ${i + 1}. ${r.title} — ${r.url}`);
+    if (r.snippet) lines.push(`     ${r.snippet.slice(0, 200)}`);
+  }
+  lines.push('');
+
+  const fetched = await Promise.allSettled(
+    search.results.slice(0, TOP_N).map((r) =>
+      webFetch({ url: r.url, method: 'GET', timeout: PER_FETCH_TIMEOUT }),
+    ),
+  );
+  fetched.forEach((settled, i) => {
+    const url = search.results[i]?.url ?? '<unknown>';
+    lines.push(`=== Source ${i + 1}: ${url} ===`);
+    if (settled.status === 'fulfilled') {
+      const body = settled.value.body.length > MAX_BODY_PER_RESULT
+        ? `${settled.value.body.slice(0, MAX_BODY_PER_RESULT)}\n[truncated: ${settled.value.body.length - MAX_BODY_PER_RESULT} chars omitted]`
+        : settled.value.body;
+      lines.push(`status=${settled.value.status}`);
+      lines.push(body);
+    } else {
+      lines.push(`fetch failed: ${String(settled.reason).slice(0, 300)}`);
     }
     lines.push('');
-
-    const fetched = await Promise.allSettled(
-      search.results.slice(0, TOP_N).map((r) =>
-        webFetch({ url: r.url, method: 'GET', timeout: PER_FETCH_TIMEOUT }),
-      ),
-    );
-    fetched.forEach((settled, i) => {
-      const url = search.results[i]?.url ?? '<unknown>';
-      lines.push(`=== Source ${i + 1}: ${url} ===`);
-      if (settled.status === 'fulfilled') {
-        const body = settled.value.body.length > MAX_BODY_PER_RESULT
-          ? `${settled.value.body.slice(0, MAX_BODY_PER_RESULT)}\n[truncated: ${settled.value.body.length - MAX_BODY_PER_RESULT} chars omitted]`
-          : settled.value.body;
-        lines.push(`status=${settled.value.status}`);
-        lines.push(body);
-      } else {
-        lines.push(`fetch failed: ${String(settled.reason).slice(0, 300)}`);
-      }
-      lines.push('');
-    });
-  } catch (err) {
-    lines.push(`web-search via ${searchProvider} failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  });
   return lines.join('\n');
 }
 
@@ -86,11 +89,9 @@ export const apilookupAdvisor: Advisor = {
       ? `${parsed.prompt}\n\n=== GROUNDING SOURCES (use these as primary evidence) ===\n${sources}`
       : parsed.prompt;
 
-    const text = await callOmniroute({
+    const text = await callAdvisorLlm(ctx, {
       systemPrompt: LOOKUP_PROMPT,
       userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
 
     return { output: text };

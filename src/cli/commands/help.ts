@@ -60,7 +60,7 @@ export function registerHelp(program: Command): void {
   program
     .command('help [command]')
     .description('Show enhanced help with examples and workflows')
-    .action((commandName) => {
+    .action((commandName: string | undefined) => {
       if (commandName) {
         // Show help for specific command
         const cmd = program.commands.find((c) => c.name() === commandName);
@@ -112,7 +112,6 @@ export function registerHelp(program: Command): void {
         console.log('🔍 Diagnostic Tools');
         console.log('─────────────────────────────────────────────────────────────────');
         console.log('  ./bin/omniforge doctor          Run local diagnostics');
-        console.log('  ./bin/omniforge doctor --verbose Detailed diagnostics');
         console.log('');
         
         console.log('🚀 Quick Commands');

@@ -7,6 +7,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { redact } from '../utils/redaction.js';
+import { errorMessage } from '../utils/errors.js';
 import { HISTORY_RING_CAP, HISTORY_MAX_BYTES } from '../config.js';
 
 export interface HistoryEntry {
@@ -38,23 +39,18 @@ function rotatedFilePath(workspace: string, suffix: '.1' | '.2'): string {
   return historyFilePath(workspace) + suffix;
 }
 
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await fs.stat(p);
-    return true;
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw err;
-  }
+/** Narrow an unknown catch value to a Node ENOENT filesystem error. */
+function isEnoent(err: unknown): boolean {
+  return err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
 async function safeUnlink(p: string): Promise<void> {
   try {
     await fs.unlink(p);
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if (isEnoent(err)) return;
     process.stderr.write(
-      `[history] warn: failed to unlink ${p}: ${(err as Error).message}\n`,
+      `[history] warn: failed to unlink ${p}: ${errorMessage(err)}\n`,
     );
   }
 }
@@ -85,7 +81,7 @@ export async function appendHistoryEntry(
     // non-fatal warning so test harnesses can verify it ran (D-H2.028 G5).
     if (process.platform !== 'win32') {
       process.stderr.write(
-        `[history] warn: chmod 0600 failed: ${(err as Error).message}\n`,
+        `[history] warn: chmod 0600 failed: ${errorMessage(err)}\n`,
       );
     }
   }
@@ -104,8 +100,7 @@ export async function loadHistoryEntries(
   try {
     content = await fs.readFile(filePath, { encoding: 'utf8' });
   } catch (err: unknown) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return [];
+    if (isEnoent(err)) return [];
     throw err;
   }
 
@@ -155,24 +150,23 @@ export async function rotateHistoryIfNeeded(
   try {
     stat = await fs.stat(filePath);
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if (isEnoent(err)) return false;
     throw err;
   }
 
   if (stat.size <= HISTORY_MAX_BYTES) return false;
 
-  // Cleanup any stale .2 from older code paths first.
-  if (await pathExists(r2)) await safeUnlink(r2);
-
-  // Then drop the previous backup so the rename below is atomic on Windows
-  // (rename across an existing target throws EEXIST on win32).
-  if (await pathExists(r1)) await safeUnlink(r1);
+  // Cleanup any stale .2 from older code paths first, then drop the previous
+  // backup so the rename below is atomic on Windows (rename across an existing
+  // target throws EEXIST on win32). safeUnlink tolerates missing files.
+  await safeUnlink(r2);
+  await safeUnlink(r1);
 
   try {
     await fs.rename(filePath, r1);
   } catch (err: unknown) {
     process.stderr.write(
-      `[history] warn: rotation rename failed: ${(err as Error).message}\n`,
+      `[history] warn: rotation rename failed: ${errorMessage(err)}\n`,
     );
     return false;
   }
@@ -189,10 +183,7 @@ export async function clearHistory(workspace: string): Promise<void> {
   try {
     await fs.unlink(filePath);
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if (isEnoent(err)) return;
     throw err;
   }
 }
-
-// Re-export for backwards compat with M0 placeholder callers.
-export { appendHistoryEntry as appendHistory, loadHistoryEntries as loadHistory };

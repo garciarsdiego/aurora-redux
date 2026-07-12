@@ -5,6 +5,12 @@
 export interface AdvisorResult {
   output: string;
   structured?: unknown;
+  /**
+   * Reserved for token/cost attribution. No handler populates this today —
+   * they call callOmniroute (which discards usage); cost tracking happens
+   * inside callOmnirouteWithUsage/the ledger instead. Kept on the contract
+   * for callers that fill it in from outer layers.
+   */
   usage?: {
     tokens_in: number;
     tokens_out: number;
@@ -31,6 +37,10 @@ export interface AdvisorContext {
   workspace: string;
   workflow_id: string;
   signal?: AbortSignal;
+  /**
+   * Reserved streaming hook — no handler emits advisor_step_* events yet.
+   * Kept on the contract for future streaming-aware executors.
+   */
   onEvent?: (event: AdvisorEvent) => void;
   /** Per-call execution mode override (Onda 1 cluster F). Defaults to 'auto'. */
   mode?: AdvisorMode;

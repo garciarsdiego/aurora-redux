@@ -11,21 +11,27 @@ export async function getArchitectureContractTool(raw: unknown): Promise<string>
   const input = GetArchitectureContractSchema.parse(raw);
   const db = initDb(getDbPath());
   try {
-    const row = db.prepare(
-      `SELECT * FROM context_decisions
+    // The LIKE clause is a cheap SQL-side cut; the decision_type check below
+    // remains authoritative. Only the columns actually used are selected.
+    const rows = db.prepare(
+      `SELECT id, created_at, metadata_json FROM context_decisions
         WHERE run_id = ?
+          AND metadata_json LIKE '%architecture_contract%'
         ORDER BY created_at DESC, id DESC`,
-    ).all(input.workflow_id)
-      .find((decision) => {
-        try {
-          const parsed = JSON.parse(String((decision as Record<string, unknown>)['metadata_json'] ?? '{}')) as Record<string, unknown>;
-          return parsed['decision_type'] === 'architecture_contract';
-        } catch {
-          return false;
-        }
-      }) as Record<string, unknown> | undefined;
+    ).all(input.workflow_id) as Array<{ id: unknown; created_at: unknown; metadata_json: string | null }>;
 
-    if (!row) {
+    let match: { id: unknown; created_at: unknown; metadata: Record<string, unknown> } | null = null;
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(String(row.metadata_json ?? '{}')) as Record<string, unknown>;
+        if (parsed['decision_type'] === 'architecture_contract') {
+          match = { id: row.id, created_at: row.created_at, metadata: parsed };
+          break;
+        }
+      } catch { /* malformed metadata_json — skip row */ }
+    }
+
+    if (!match) {
       return JSON.stringify({
         workflow_id: input.workflow_id,
         architecture_contract: null,
@@ -33,12 +39,11 @@ export async function getArchitectureContractTool(raw: unknown): Promise<string>
       });
     }
 
-    const metadata = JSON.parse(String(row['metadata_json'] ?? '{}')) as Record<string, unknown>;
     return JSON.stringify(redactContextJson({
       workflow_id: input.workflow_id,
-      decision_id: row['id'],
-      created_at: row['created_at'],
-      architecture_contract: metadata['architecture_contract'] ?? null,
+      decision_id: match.id,
+      created_at: match.created_at,
+      architecture_contract: match.metadata['architecture_contract'] ?? null,
     }), null, 2);
   } finally {
     db.close();

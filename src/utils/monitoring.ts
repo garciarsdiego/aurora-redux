@@ -4,11 +4,10 @@
  * Fornece funções para coletar métricas, verificar thresholds e gerar alerts.
  */
 
-import type Database from 'better-sqlite3';
 import { initDb } from '../db/client.js';
-import { getDbPath } from './config.js';
+import { getDbPath, getDecomposerMetrics } from './config.js';
 import { readDaemonHeartbeat } from '../db/daemon-heartbeat.js';
-import { getDecomposerMetrics } from './config.js';
+import { postTelegramMessage } from './telegram-notify.js';
 
 export interface MonitoringSummary {
   timestamp: number;
@@ -93,11 +92,14 @@ export function getMonitoringSummary(): MonitoringSummary {
     const now = Date.now();
     const oneHourAgo = now - 3600000;
 
-    // Workflows ativos por status
+    // Workflows ativos por status — todos os statuses NÃO-terminais de
+    // WorkflowStatus (types/index.ts). Os valores antigos ('running',
+    // 'retrying') eram statuses de TASK e nunca casavam com linhas de
+    // workflow, então workflows em execução real ficavam fora da contagem.
     const activeWorkflows = db.prepare(`
       SELECT status, COUNT(*) as count
       FROM workflows
-      WHERE status IN ('running', 'pending', 'retrying')
+      WHERE status IN ('pending', 'approved', 'executing', 'paused', 'awaiting_remediation')
       GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
 
@@ -252,13 +254,19 @@ export function getMonitoringMetrics(): MonitoringMetrics {
     const totalReviews = approved + rejected;
     const approvalRate = totalReviews > 0 ? (approved / totalReviews) * 100 : 100;
 
+    // Check explícito por null: um avg legítimo de 0ms não deve virar null.
+    const avgTaskDurationMs =
+      avgTaskDuration.avg_duration != null ? Math.round(avgTaskDuration.avg_duration) : null;
+    const avgWorkflowDurationMs =
+      avgWorkflowDuration.avg_duration != null ? Math.round(avgWorkflowDuration.avg_duration) : null;
+
     return {
       timestamp: Date.now(),
       decomposer: decomposerMetrics,
       executor: {
         tasks_completed: tasksCompleted.count,
         tasks_failed: tasksFailed.count,
-        avg_duration_ms: avgTaskDuration.avg_duration ? Math.round(avgTaskDuration.avg_duration) : null,
+        avg_duration_ms: avgTaskDurationMs,
       },
       reviewer: {
         approved,
@@ -266,8 +274,8 @@ export function getMonitoringMetrics(): MonitoringMetrics {
         approval_rate: Math.round(approvalRate * 100) / 100,
       },
       performance: {
-        avg_task_duration_ms: avgTaskDuration.avg_duration ? Math.round(avgTaskDuration.avg_duration) : null,
-        avg_workflow_duration_ms: avgWorkflowDuration.avg_duration ? Math.round(avgWorkflowDuration.avg_duration) : null,
+        avg_task_duration_ms: avgTaskDurationMs,
+        avg_workflow_duration_ms: avgWorkflowDurationMs,
       },
     };
   } finally {
@@ -371,19 +379,7 @@ async function sendTelegramAlert(
 
   message += `\nTimestamp: ${new Date().toISOString()}`;
 
-  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: message,
-      parse_mode: 'Markdown',
-    }),
-  });
-
+  const response = await postTelegramMessage(botToken, chatId, message, 'Markdown');
   if (!response.ok) {
     throw new Error(`Telegram API error: ${response.statusText}`);
   }

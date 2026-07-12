@@ -15,6 +15,12 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import type Database from 'better-sqlite3';
 import { listPatternsByWorkspace } from '../../db/persist.js';
+import {
+  PROVIDER_MATRIX_CSV_REL,
+  parseProviderMatrixCsv,
+  type ProviderMatrixRow,
+} from '../services/providerMatrixCsv.js';
+import { truncate } from '../utils/text.js';
 import type { ArgType } from '../commands/types.js';
 
 // ---------------------------------------------------------------------------
@@ -67,11 +73,6 @@ async function withTimeout<T extends readonly Completion[]>(
 function startsWithCI(haystack: string, needle: string): boolean {
   if (needle.length === 0) return true;
   return haystack.toLowerCase().startsWith(needle.toLowerCase());
-}
-
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return text.slice(0, Math.max(0, max - 1)) + '…';
 }
 
 function workspaceRoot(workspace: string): string {
@@ -227,17 +228,12 @@ async function patternNameCompleterImpl(
 // 5. modelIdCompleter
 // ---------------------------------------------------------------------------
 
-const PROVIDER_MATRIX_PATH = path.join('docs', '08-AI-PROVIDER-MATRIX.csv');
+// CSV path + parsing live in services/providerMatrixCsv.ts (shared with
+// services/modelCatalog.ts). This completer only adds an mtime-based cache.
+let _csvCache: { mtimeMs: number; rows: readonly ProviderMatrixRow[] } | null = null;
 
-interface CsvRow {
-  readonly id: string;
-  readonly tier: string;
-}
-
-let _csvCache: { mtimeMs: number; rows: readonly CsvRow[] } | null = null;
-
-async function loadProviderMatrix(): Promise<readonly CsvRow[]> {
-  const abs = path.resolve(PROVIDER_MATRIX_PATH);
+async function loadProviderMatrix(): Promise<readonly ProviderMatrixRow[]> {
+  const abs = path.resolve(...PROVIDER_MATRIX_CSV_REL);
   let stat: Awaited<ReturnType<typeof fs.stat>>;
   try {
     stat = await fs.stat(abs);
@@ -253,33 +249,9 @@ async function loadProviderMatrix(): Promise<readonly CsvRow[]> {
   } catch {
     return [];
   }
-  const rows = parseProviderCsv(raw);
+  const rows = parseProviderMatrixCsv(raw);
   _csvCache = { mtimeMs: stat.mtimeMs, rows };
   return rows;
-}
-
-/**
- * Minimal CSV parser tailored to docs/08-AI-PROVIDER-MATRIX.csv.
- * Skips the header row, ignores empty lines, and extracts:
- *   col 0 → model id (e.g. "cc/claude-opus-4-7")
- *   col 5 → tier ("S+", "S", "A", "B+", "C", ...)
- * Quoted fields are NOT supported (the source file uses unquoted commas only).
- */
-export function parseProviderCsv(raw: string): readonly CsvRow[] {
-  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length === 0) return [];
-  // Drop the header row.
-  const dataLines = lines.slice(1);
-  const out: CsvRow[] = [];
-  for (const line of dataLines) {
-    const cols = line.split(',');
-    if (cols.length < 6) continue;
-    const id = cols[0]?.trim() ?? '';
-    const tier = cols[5]?.trim() ?? '';
-    if (id.length === 0) continue;
-    out.push({ id, tier });
-  }
-  return out;
 }
 
 export const modelIdCompleter: Completer = (partial, _ctx) =>
@@ -288,10 +260,10 @@ export const modelIdCompleter: Completer = (partial, _ctx) =>
 async function modelIdCompleterImpl(partial: string): Promise<readonly Completion[]> {
   const rows = await loadProviderMatrix();
   return rows
-    .filter((r) => startsWithCI(r.id, partial))
+    .filter((r) => startsWithCI(r.model_id, partial))
     .slice(0, MAX_RESULTS)
     .map<Completion>((r) => ({
-      value: r.id,
+      value: r.model_id,
       hint: r.tier ? `tier ${r.tier}` : undefined,
     }));
 }
@@ -311,15 +283,3 @@ const COMPLETER_BY_ARG_TYPE: Readonly<Partial<Record<ArgType, Completer>>> = {
 export function getCompleterForArgType(type: ArgType): Completer | undefined {
   return COMPLETER_BY_ARG_TYPE[type];
 }
-
-/**
- * Public registry — kept for backward compat with the M0 placeholder shape.
- * New code should import the functions directly or use getCompleterForArgType.
- */
-export const completers = {
-  workspace: workspaceCompleter,
-  workflowId: workflowIdCompleter,
-  filePath: filePathCompleter,
-  patternName: patternNameCompleter,
-  modelId: modelIdCompleter,
-} as const;

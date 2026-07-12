@@ -6,9 +6,8 @@
  */
 
 import type { NormalizedModel, IntentInference } from './catalog.js';
-import { getWorkflowCostSummary, getTotalTrackedCost } from './cost-sync.js';
 import { getHealthStatus } from './health-cache.js';
-import { logInfo, logWarn, logError, logDebug } from '../observability/log-aggregation.js';
+import { logInfo, logWarn, logError } from '../observability/log-aggregation.js';
 
 export type RoutingStrategy = 'quality' | 'cost' | 'balanced' | 'health' | 'adaptive';
 
@@ -136,7 +135,7 @@ class RoutingEngine {
       const ranked = await this.scoreCandidates(candidates, intent, context, strategy);
 
       // Select best model
-      const selected = this.selectBestModel(ranked, context);
+      const selected = this.selectBestModel(ranked);
 
       if (!selected || !selected.model) {
         return this.createEmptyDecision(intent, strategy);
@@ -233,11 +232,7 @@ class RoutingEngine {
         if (estimatedCost > context.maxCostUsd) return false;
       }
 
-      // Check health constraint
-      if (this.options.considerHealth) {
-        // This is a simplified check - in production, you'd query actual health
-        // For now, we assume all models are healthy unless explicitly marked
-      }
+      // Health is factored in later via getHealthScore (no per-candidate check here)
 
       return true;
     });
@@ -463,7 +458,6 @@ class RoutingEngine {
    */
   private selectBestModel(
     ranked: Array<{ model: NormalizedModel; score: number; reasons: string[] }>,
-    context: RoutingContext,
   ): { model: NormalizedModel | null; score: number; reasons: string[] } {
     if (ranked.length === 0) {
       return { model: null, score: 0, reasons: [] };

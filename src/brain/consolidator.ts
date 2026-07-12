@@ -1,8 +1,8 @@
 import type { Task, Workflow } from '../types/index.js';
-import { callOmniroute, callOmnirouteWithUsage } from '../utils/omniroute-call.js';
+import { callOmniroute } from '../utils/omniroute-call.js';
 import { getConsolidatorModel, getUsePersonas } from '../utils/config.js';
-import { runAgent, type AgentInvoker } from '../v2/agents/runner.js';
-import type { AgentContext } from '../v2/agents/types.js';
+import { runAgent } from '../v2/agents/runner.js';
+import { omnirouteInvoker, buildConsoleAgentContext } from './agent-omniroute.js';
 import {
   CONSOLIDATOR_PERSONA,
   type ConsolidatorInput,
@@ -37,38 +37,6 @@ export interface ConsolidateOptions {
   readonly workspaceDir?: string;
   /** Alias matching the persona input field name; workspaceDir wins when both are set. */
   readonly workspace_dir?: string;
-}
-
-const omnirouteInvoker: AgentInvoker = async (args) => {
-  const result = await callOmnirouteWithUsage({
-    systemPrompt: args.systemPrompt,
-    userPrompt: args.userPrompt ?? 'Respond per the system contract above.',
-    model: args.model,
-  });
-  return result.content;
-};
-
-function buildConsolidatorAgentContext(
-  workflow: Workflow,
-  options: ConsolidateOptions,
-): AgentContext {
-  const workspaceDir = options.workspaceDir ?? options.workspace_dir;
-  return {
-    workflowId: workflow.id,
-    workspaceDir,
-    retryCount: 0,
-    emit(event, payload) {
-      console.debug(`[consolidator:event] ${event}`, payload);
-    },
-    warn(message, payload) {
-      console.warn(`[consolidator:warn] ${message}`, payload ?? '');
-    },
-    log(level, message, payload) {
-      if (level === 'error' || level === 'warn') {
-        console.warn(`[consolidator:${level}] ${message}`, payload ?? '');
-      }
-    },
-  };
 }
 
 function parseTaskOutput(raw: string | null): unknown {
@@ -122,7 +90,11 @@ async function consolidateViaPersona(
   options: ConsolidateOptions,
 ): Promise<string> {
   const input = buildConsolidatorInput(workflow, tasks, options);
-  const ctx = buildConsolidatorAgentContext(workflow, options);
+  const ctx = buildConsoleAgentContext(
+    'consolidator',
+    options.workspaceDir ?? options.workspace_dir,
+    { workflowId: workflow.id },
+  );
 
   // Only override the persona's defaultModel when CONSOLIDATOR_MODEL is explicitly
   // set; getConsolidatorModel() returns a placeholder default when unset, which is
@@ -147,7 +119,6 @@ export async function consolidateWorkflow(
 ): Promise<string> {
   const completed = tasks.filter((t) => t.status === 'completed' && t.output_json);
   if (completed.length === 0) return '';
-  if (completed.length === 1 && !getUsePersonas()) return completed[0].output_json ?? '';
 
   if (getUsePersonas()) {
     try {

@@ -131,9 +131,7 @@ export async function syncWorkflowCostsOnCompletion(
     }, 'omniroute-cost-integration');
   } finally {
     // Mark sync as complete
-    if (markSyncComplete !== undefined) {
-      markSyncComplete(workflowId);
-    }
+    markSyncComplete(workflowId);
   }
 }
 

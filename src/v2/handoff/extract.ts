@@ -2,6 +2,7 @@ import type { HandoffSection, ParsedHandoff } from './types.js';
 import { HANDOFF_SECTIONS } from './types.js';
 
 /**
+ * Per-line section-heading matcher, anchored at line start.
  * Matches H1–H3 headings (optional #s) for any of the 5 section names,
  * with an optional trailing colon.
  * Examples matched:
@@ -10,17 +11,10 @@ import { HANDOFF_SECTIONS } from './types.js';
  *   Summary:
  *   # Risks :
  */
-const HEADING_RE = /^[ \t]*(#{1,3}\s*)?(Summary|Actions|Artifacts|Risks|Next)\s*:?\s*$/im;
-
-/**
- * Build a per-line parser regex anchored at line start.
- */
-function buildSectionRE(): RegExp {
-  return new RegExp(
-    `^[ \\t]*(#{1,3}\\s*)?(${HANDOFF_SECTIONS.join('|')})\\s*:?\\s*$`,
-    'im',
-  );
-}
+const SECTION_RE = new RegExp(
+  `^[ \\t]*(#{1,3}\\s*)?(${HANDOFF_SECTIONS.join('|')})\\s*:?\\s*$`,
+  'i',
+);
 
 export function extractHandoffSections(text: string): ParsedHandoff {
   const empty: ParsedHandoff = {
@@ -36,16 +30,12 @@ export function extractHandoffSections(text: string): ParsedHandoff {
 
   // Split into lines and scan for section headings
   const lines = text.split('\n');
-  const sectionRE = new RegExp(
-    `^[ \\t]*(#{1,3}\\s*)?(${HANDOFF_SECTIONS.join('|')})\\s*:?\\s*$`,
-    'i',
-  );
 
   type Segment = { section: HandoffSection; startLine: number };
   const segments: Segment[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    const m = sectionRE.exec(lines[i]);
+    const m = SECTION_RE.exec(lines[i]);
     if (m) {
       segments.push({ section: m[2] as HandoffSection, startLine: i });
     }

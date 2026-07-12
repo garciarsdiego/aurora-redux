@@ -5,10 +5,10 @@
  * Runs periodic health checks and integrates with failover logic.
  */
 
-import { refreshHealthStatus, getHealthStatus } from './health-cache.js';
-import { type DetailedHealthResult } from './client.js';
+import { refreshHealthStatus } from './health-cache.js';
+import { detailedHealthFallback, tallyProviderHealth, type DetailedHealthResult } from './client.js';
 import { evaluateAndCheckFailover, getFailoverState, type FailoverState } from './failover.js';
-import { logInfo, logWarn, logError, logDebug } from '../observability/log-aggregation.js';
+import { logInfo, logWarn, logError } from '../observability/log-aggregation.js';
 
 export interface HealthMonitorConfig {
   /** Interval between health checks in milliseconds (default: 30 seconds) */
@@ -141,7 +141,7 @@ class HealthMonitor {
         // Auto-evaluate failover if enabled
         if (this.config.autoEvaluateFailover) {
           const failoverResult = await evaluateAndCheckFailover();
-          const newFailoverState = getFailoverState();
+          const newFailoverState = failoverResult.state;
 
           // Detect failover state change
           if (this.lastFailoverState && JSON.stringify(newFailoverState) !== JSON.stringify(this.lastFailoverState)) {
@@ -165,12 +165,7 @@ class HealthMonitor {
         const newStatus = 'unhealthy';
         if (newStatus !== this.lastHealthStatus) {
           this.lastHealthStatus = newStatus;
-          this.config.onHealthChange?.(this.lastHealthStatus, newStatus, {
-            status: 'error',
-            timestamp: new Date().toISOString(),
-            providers: {},
-            rate_limits: {},
-          });
+          this.config.onHealthChange?.(this.lastHealthStatus, newStatus, detailedHealthFallback());
         }
       }
     } catch (error) {
@@ -186,12 +181,7 @@ class HealthMonitor {
       const newStatus = 'unhealthy';
       if (newStatus !== this.lastHealthStatus) {
         this.lastHealthStatus = newStatus;
-        this.config.onHealthChange?.(this.lastHealthStatus, newStatus, {
-          status: 'error',
-          timestamp: new Date().toISOString(),
-          providers: {},
-          rate_limits: {},
-        });
+        this.config.onHealthChange?.(this.lastHealthStatus, newStatus, detailedHealthFallback());
       }
     }
   }
@@ -204,30 +194,14 @@ class HealthMonitor {
       return 'unhealthy';
     }
 
-    const providers = health.providers || {};
-    const providerEntries = Object.entries(providers);
+    const tally = tallyProviderHealth(health.providers || {});
 
-    if (providerEntries.length === 0) {
+    if (tally.providerCount === 0) {
       return health.status === 'ok' ? 'healthy' : 'unhealthy';
     }
 
-    const healthyCount = providerEntries.filter(([, status]) => status.status === 'healthy').length;
-    const degradedCount = providerEntries.filter(([, status]) => status.status === 'degraded').length;
-    const unhealthyCount = providerEntries.filter(([, status]) => status.status === 'unhealthy').length;
-    const totalProviders = providerEntries.length;
-
-    // If more than 50% are unhealthy, overall status is unhealthy
-    if (unhealthyCount / totalProviders > 0.5) {
-      return 'unhealthy';
-    }
-
-    // If all are healthy, status is healthy
-    if (healthyCount === totalProviders) {
-      return 'healthy';
-    }
-
-    // Otherwise degraded
-    return 'degraded';
+    // Shared rule: >50% unhealthy → unhealthy; all healthy → healthy; else degraded
+    return tally.status;
   }
 
   /**

@@ -4,8 +4,7 @@
  */
 
 import { ProviderHealthChecker, ProviderHealthStatus } from './ProviderHealthChecker.js';
-import * as fs from 'fs';
-import * as path from 'path';
+import { groupBy, providerOf } from './internal.js';
 
 export interface DiscoveryReport {
   timestamp: number;
@@ -76,32 +75,17 @@ export class DiscoveryOrchestrator {
   }
   
   async fetchAllModels(): Promise<string[]> {
-    try {
-      const response = await fetch(`${this.omnirouteUrl}/models`);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch models: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      return data.data.map((m: any) => m.id);
-    } catch (error) {
-      console.error('Error fetching models:', error);
-      throw error;
+    const response = await fetch(`${this.omnirouteUrl}/models`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch models: ${response.status}`);
     }
+
+    const data = await response.json() as { data: Array<{ id: string }> };
+    return data.data.map(m => m.id);
   }
-  
+
   groupByProvider(models: string[]): Record<string, string[]> {
-    const byProvider: Record<string, string[]> = {};
-    
-    for (const model of models) {
-      const provider = model.split('/')[0];
-      if (!byProvider[provider]) {
-        byProvider[provider] = [];
-      }
-      byProvider[provider].push(model);
-    }
-    
-    return byProvider;
+    return groupBy(models, providerOf);
   }
   
   async testProviderRepresentatives(byProvider: Record<string, string[]>) {

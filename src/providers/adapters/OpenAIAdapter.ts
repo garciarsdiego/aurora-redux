@@ -2,6 +2,27 @@ import { BaseProviderAdapter } from './BaseAdapter.js';
 import type { LLMRequest, LLMResponse } from '../types.js';
 
 /**
+ * Minimal shape of an OpenAI chat completion response
+ */
+interface OpenAIChatResponse {
+  model: string;
+  choices?: Array<{ message?: { content: string } }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+}
+
+// OpenAI pricing (as of 2024)
+const PRICING: Record<string, { input: number; output: number }> = {
+  'gpt-4o': { input: 0.005, output: 0.015 },
+  'gpt-4o-mini': { input: 0.00015, output: 0.0006 },
+  'gpt-4-turbo': { input: 0.01, output: 0.03 },
+  'gpt-3.5-turbo': { input: 0.0005, output: 0.0015 }
+};
+
+/**
  * OpenAI Provider Adapter
  */
 export class OpenAIAdapter extends BaseProviderAdapter {
@@ -18,48 +39,59 @@ export class OpenAIAdapter extends BaseProviderAdapter {
     this.endpoint = endpoint;
   }
 
+  /**
+   * Build the fetch init shared by call() and stream()
+   */
+  private buildRequestInit(request: LLMRequest, stream: boolean) {
+    const config = this.getModelConfig(request.model);
+
+    return {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`
+      },
+      body: JSON.stringify({
+        model: request.model,
+        messages: request.messages,
+        max_tokens: request.max_tokens || config.max_tokens,
+        temperature: request.temperature ?? config.temperature,
+        tools: request.tools,
+        ...(stream ? { stream: true } : {})
+      })
+    };
+  }
+
   async call(request: LLMRequest): Promise<LLMResponse> {
     if (!this.validateRequest(request)) {
       throw new Error(`Invalid request for OpenAI adapter: model ${request.model} not supported`);
     }
 
-    const config = this.getModelConfig(request.model);
-    const maxTokens = request.max_tokens || config.max_tokens;
-
     try {
-      const response = await fetch(`${this.endpoint}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.apiKey}`
-        },
-        body: JSON.stringify({
-          model: request.model,
-          messages: request.messages,
-          max_tokens: maxTokens,
-          temperature: request.temperature ?? config.temperature,
-          tools: request.tools
-        })
-      });
+      const response = await fetch(`${this.endpoint}/chat/completions`, this.buildRequestInit(request, false));
 
       if (!response.ok) {
         throw new Error(`OpenAI API error: ${response.status} ${response.statusText}`);
       }
 
-      const data = await response.json();
+      const data = await response.json() as OpenAIChatResponse;
+      const message = data.choices?.[0]?.message;
+      if (!message || !data.usage) {
+        throw new Error(`OpenAI API returned an unexpected response format for model ${request.model}`);
+      }
 
       return {
-        content: data.choices[0].message.content,
+        content: message.content,
         model: data.model,
         usage: {
           prompt_tokens: data.usage.prompt_tokens,
           completion_tokens: data.usage.completion_tokens,
           total_tokens: data.usage.total_tokens
         },
-        cost_usd: this.calculateCost(data.usage.prompt_tokens, data.usage.completion_tokens, request.model)
+        cost_usd: this.computeCost(data.usage.prompt_tokens, data.usage.completion_tokens, request.model, PRICING, 'gpt-3.5-turbo')
       };
     } catch (error) {
-      throw new Error(`OpenAI call failed: ${error}`);
+      throw new Error(`OpenAI call failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
   }
 
@@ -68,92 +100,37 @@ export class OpenAIAdapter extends BaseProviderAdapter {
       throw new Error(`Invalid request for OpenAI adapter: model ${request.model} not supported`);
     }
 
-    const config = this.getModelConfig(request.model);
-    const maxTokens = request.max_tokens || config.max_tokens;
-
     try {
-      const response = await fetch(`${this.endpoint}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.apiKey}`
-        },
-        body: JSON.stringify({
-          model: request.model,
-          messages: request.messages,
-          max_tokens: maxTokens,
-          temperature: request.temperature ?? config.temperature,
-          tools: request.tools,
-          stream: true
-        })
-      });
+      const response = await fetch(`${this.endpoint}/chat/completions`, this.buildRequestInit(request, true));
 
       if (!response.ok) {
         throw new Error(`OpenAI API error: ${response.status} ${response.statusText}`);
       }
 
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('Response body is not readable');
-      }
+      for await (const data of this.parseSSEPayloads(response)) {
+        if (data === '[DONE]') {
+          return;
+        }
 
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
-              return;
-            }
-
-            try {
-              const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content;
-              if (content) {
-                yield content;
-              }
-            } catch {
-              // Ignore parse errors for keep-alive lines
-            }
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) {
+            yield content;
           }
+        } catch {
+          // Ignore parse errors for keep-alive lines
         }
       }
     } catch (error) {
-      throw new Error(`OpenAI stream failed: ${error}`);
+      throw new Error(`OpenAI stream failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
   }
 
   async estimateCost(request: LLMRequest): Promise<number> {
     const inputTokens = this.countMessageTokens(request.messages);
-    const outputTokens = request.maxTokens || 500;
+    const outputTokens = request.max_tokens || 500;
 
-    return this.calculateCost(inputTokens, outputTokens, request.model);
-  }
-
-  private calculateCost(inputTokens: number, outputTokens: number, model: string): number {
-    // OpenAI pricing (as of 2024)
-    const pricing: Record<string, { input: number; output: number }> = {
-      'gpt-4o': { input: 0.005, output: 0.015 },
-      'gpt-4o-mini': { input: 0.00015, output: 0.0006 },
-      'gpt-4-turbo': { input: 0.01, output: 0.03 },
-      'gpt-3.5-turbo': { input: 0.0005, output: 0.0015 }
-    };
-
-    const baseModel = model.split('/').pop() || model;
-    const prices = pricing[baseModel] || pricing['gpt-3.5-turbo'];
-
-    const inputCost = (inputTokens / 1000) * prices.input;
-    const outputCost = (outputTokens / 1000) * prices.output;
-
-    return inputCost + outputCost;
+    return this.computeCost(inputTokens, outputTokens, request.model, PRICING, 'gpt-3.5-turbo');
   }
 }

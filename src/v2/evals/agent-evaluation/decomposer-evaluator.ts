@@ -8,6 +8,34 @@ import type { TestCase } from './framework.js';
 import type { EvaluationOutput, AgentEvaluator } from './framework.js';
 import { decompose, type DecomposeOptions } from '../../../brain/decomposer.js';
 import type { Dag } from '../../../types/index.js';
+import { estimateCost, estimateTokens } from './cost-estimation.js';
+
+// ============================================================================
+// FALSIFIABLE CRITERIA PATTERNS (H7)
+// ============================================================================
+// Single source of truth for the strong/weak language classification — used by
+// both the hard validation and the scoring paths so they can never diverge.
+// Strong patterns indicate verifiable criteria; weak patterns indicate vagueness.
+
+const STRONG_CRITERIA_PATTERNS = ['must', 'should', 'required', 'shall', 'contains', 'exists', 'valid'];
+const WEAK_CRITERIA_PATTERNS = ['correct', 'good', 'proper', 'working', 'effective'];
+
+/**
+ * Check if criteria text contains weak (non-falsifiable) language
+ */
+function hasWeakCriteriaLanguage(criteria: string | null | undefined): boolean {
+  const text = criteria?.toLowerCase() || '';
+  return WEAK_CRITERIA_PATTERNS.some(pattern => text.includes(pattern));
+}
+
+/**
+ * Check if criteria text is falsifiable (has strong language and no weak language)
+ */
+function isFalsifiableCriteria(criteria: string | null | undefined): boolean {
+  const text = criteria?.toLowerCase() || '';
+  const hasStrong = STRONG_CRITERIA_PATTERNS.some(pattern => text.includes(pattern));
+  return hasStrong && !hasWeakCriteriaLanguage(criteria);
+}
 
 export class DecomposerEvaluator implements AgentEvaluator {
   /**
@@ -30,10 +58,10 @@ export class DecomposerEvaluator implements AgentEvaluator {
       const duration = Date.now() - startTime;
 
       // Calculate cost (rough estimation based on model tier)
-      const cost = this.estimateCost(model, duration);
+      const cost = estimateCost(model, duration);
 
       // Calculate token usage (rough estimation)
-      const tokenUsage = this.estimateTokens(model, testCase.complexity);
+      const tokenUsage = estimateTokens(testCase.complexity);
 
       // Validate against expected output
       const validation = this.validateAgainstExpected(dag, testCase.expectedOutput);
@@ -55,15 +83,13 @@ export class DecomposerEvaluator implements AgentEvaluator {
         error: validation.isValid ? undefined : validation.error
       };
 
-    } catch (error: any) {
-      const duration = Date.now() - startTime;
-
+    } catch (error) {
       return {
         success: false,
         output: null,
         cost: 0,
         tokenUsage: 0,
-        error: error.message
+        error: error instanceof Error ? error.message : String(error)
       };
     }
   }
@@ -158,9 +184,7 @@ export class DecomposerEvaluator implements AgentEvaluator {
       // Check if task count is reasonable
       const expectedCount = expected.metadata?.expectedTaskCount;
       if (expectedCount) {
-        const tolerance = Math.ceil(expectedCount * 0.5); // ±50% tolerance
-        const minTasks = Math.max(3, expectedCount - tolerance);
-        const maxTasks = expectedCount + tolerance;
+        const { tolerance, minTasks, maxTasks } = this.taskCountBounds(expectedCount);
 
         if (dag.tasks.length < minTasks) {
           return {
@@ -198,12 +222,9 @@ export class DecomposerEvaluator implements AgentEvaluator {
       }
 
       // Check falsifiable criteria quality (H7)
-      const nonFalsifiable = dag.tasks.filter(t => {
-        if (t.id === 't0') return false;
-        const criteria = t.acceptance_criteria?.toLowerCase() || '';
-        const weakPatterns = ['should', 'must be', 'correct', 'good', 'proper', 'working'];
-        return weakPatterns.some(pattern => criteria.includes(pattern));
-      });
+      const nonFalsifiable = dag.tasks.filter(
+        t => t.id !== 't0' && hasWeakCriteriaLanguage(t.acceptance_criteria)
+      );
 
       if (nonFalsifiable.length > 0) {
         return {
@@ -214,12 +235,24 @@ export class DecomposerEvaluator implements AgentEvaluator {
 
       return { isValid: true };
 
-    } catch (error: any) {
+    } catch (error) {
       return {
         isValid: false,
-        error: `Validation error: ${error.message}`
+        error: `Validation error: ${error instanceof Error ? error.message : String(error)}`
       };
     }
+  }
+
+  /**
+   * Bounds for the expected task count with ±50% tolerance
+   */
+  private taskCountBounds(expectedCount: number): { tolerance: number; minTasks: number; maxTasks: number } {
+    const tolerance = Math.ceil(expectedCount * 0.5); // ±50% tolerance
+    return {
+      tolerance,
+      minTasks: Math.max(3, expectedCount - tolerance),
+      maxTasks: expectedCount + tolerance,
+    };
   }
 
   /**
@@ -278,16 +311,7 @@ export class DecomposerEvaluator implements AgentEvaluator {
     const criteriaRate = tasksWithCriteria.length / nonT0Tasks.length;
 
     // Check quality of criteria (falsifiable language)
-    const tasksWithFalsifiable = tasksWithCriteria.filter(t => {
-      const criteria = t.acceptance_criteria?.toLowerCase() || '';
-      const strongPatterns = ['must', 'should', 'required', 'shall', 'contains', 'exists', 'valid'];
-      const weakPatterns = ['correct', 'good', 'proper', 'working', 'effective'];
-
-      const hasStrong = strongPatterns.some(pattern => criteria.includes(pattern));
-      const hasWeak = weakPatterns.some(pattern => criteria.includes(pattern));
-
-      return hasStrong && !hasWeak;
-    });
+    const tasksWithFalsifiable = tasksWithCriteria.filter(t => isFalsifiableCriteria(t.acceptance_criteria));
 
     const qualityRate = tasksWithFalsifiable.length / Math.max(1, tasksWithCriteria.length);
 
@@ -366,9 +390,7 @@ export class DecomposerEvaluator implements AgentEvaluator {
     // Check if expected number of tasks is met (within tolerance)
     if (expected.metadata?.expectedTaskCount) {
       checks++;
-      const tolerance = Math.ceil(expected.metadata.expectedTaskCount * 0.5);
-      const minTasks = Math.max(3, expected.metadata.expectedTaskCount - tolerance);
-      const maxTasks = expected.metadata.expectedTaskCount + tolerance;
+      const { minTasks, maxTasks } = this.taskCountBounds(expected.metadata.expectedTaskCount);
 
       if (dag.tasks.length >= minTasks && dag.tasks.length <= maxTasks) {
         score += 1;
@@ -433,7 +455,7 @@ export class DecomposerEvaluator implements AgentEvaluator {
     if (expected.metadata?.expectedFalsifiableCriteria) {
       checks++;
       const actualFalsifiable = dag.tasks.filter(t =>
-        t.id !== 't0' && this.hasFalsifiableCriteria(t)
+        t.id !== 't0' && isFalsifiableCriteria(t.acceptance_criteria)
       ).length;
 
       const expectedFalsifiable = expected.metadata.expectedFalsifiableCriteria;
@@ -464,61 +486,4 @@ export class DecomposerEvaluator implements AgentEvaluator {
     return false;
   }
 
-  /**
-   * Check if task has falsifiable criteria
-   */
-  private hasFalsifiableCriteria(task: any): boolean {
-    if (!task.acceptance_criteria) return false;
-
-    const criteria = task.acceptance_criteria.toLowerCase();
-    const strongPatterns = ['must', 'should', 'required', 'shall', 'contains', 'exists', 'valid'];
-    const weakPatterns = ['correct', 'good', 'proper', 'working', 'effective'];
-
-    const hasStrong = strongPatterns.some(pattern => criteria.includes(pattern));
-    const hasWeak = weakPatterns.some(pattern => criteria.includes(pattern));
-
-    return hasStrong && !hasWeak;
-  }
-
-  /**
-   * Estimate cost based on model and duration
-   */
-  private estimateCost(model: string, duration: number): number {
-    // Rough cost estimation based on model tier
-    const tier = this.getModelTier(model);
-
-    const costPerSecond = {
-      premium: 0.0001,    // ~$0.36/hour
-      balanced: 0.00005,   // ~$0.18/hour
-      cost: 0.00001,      // ~$0.036/hour
-      alternative: 0.000008 // ~$0.029/hour
-    };
-
-    const rate = costPerSecond[tier] || 0.00005;
-    return (duration / 1000) * rate;
-  }
-
-  /**
-   * Estimate token usage based on model and complexity
-   */
-  private estimateTokens(model: string, complexity: string): number {
-    const complexityMultiplier = {
-      simple: 1.0,
-      medium: 2.0,
-      complex: 4.0
-    };
-
-    const baseTokens = 1000; // Base estimation
-    return baseTokens * complexityMultiplier[complexity as keyof typeof complexityMultiplier];
-  }
-
-  /**
-   * Get model tier for cost estimation
-   */
-  private getModelTier(model: string): 'premium' | 'balanced' | 'cost' | 'alternative' {
-    if (model.includes('claude-opus') || model.includes('gpt-5.5')) return 'premium';
-    if (model.includes('claude-sonnet') || model.includes('kimi') || model.includes('opencode')) return 'balanced';
-    if (model.includes('gemini') || model.includes('deepseek') || model.includes('minimax')) return 'cost';
-    return 'alternative';
-  }
 }

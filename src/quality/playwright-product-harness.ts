@@ -175,7 +175,8 @@ interface PlaywrightHarnessOptions {
 
 const DEFAULT_START_TIMEOUT_MS = 30_000;
 const DEFAULT_READY_PATTERN = /(localhost:\d+|Local:\s*http|ready\s+in|listening on|server running)/i;
-const DEFAULT_PORTS = [3000, 5173, 8080, 4200, 4173, 8000] as const;
+/** Most common dev port — used only when the ready output names no port. */
+const FALLBACK_PORT = 3000;
 const MAX_SCREENSHOTS = 3;
 const SHELL_METACHAR_RE = /[&|;<>()\r\n]/;
 
@@ -258,17 +259,30 @@ function buildAppUrl(port: number): string {
 interface DevServerHandle {
   child: ChildProcess;
   url: string;
-  output: string;
 }
 
 async function waitForDevServer(
   child: ChildProcess,
   readyPattern: RegExp,
   timeoutMs: number,
-): Promise<{ url: string; output: string }> {
-  return new Promise<{ url: string; output: string }>((resolvePromise, rejectPromise) => {
+): Promise<{ url: string }> {
+  return new Promise<{ url: string }>((resolvePromise, rejectPromise) => {
     let combinedOutput = '';
-    let resolved = false;
+    let settled = false;
+
+    // Settles the promise exactly once and tears down everything wired
+    // below (timeout timer, stdout/stderr listeners) so a long-lived dev
+    // server does not keep feeding combinedOutput after the harness moved on.
+    // `timer`/`onData` are declared below but always initialized before any
+    // listener can fire — the Promise executor runs synchronously.
+    const settle = (finish: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout?.off('data', onData);
+      child.stderr?.off('data', onData);
+      finish();
+    };
 
     const onData = (chunk: Buffer | string): void => {
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
@@ -277,48 +291,34 @@ async function waitForDevServer(
       if (combinedOutput.length > 64 * 1024) {
         combinedOutput = combinedOutput.slice(-32 * 1024);
       }
-      if (resolved) return;
       if (!readyPattern.test(combinedOutput)) return;
-      const port = extractPortFromOutput(combinedOutput);
-      if (port === null) {
-        // Ready pattern matched but no port discoverable yet — fall back to
-        // the most common dev port heuristic.
-        const fallbackPort = DEFAULT_PORTS[0]!;
-        resolved = true;
-        resolvePromise({ url: buildAppUrl(fallbackPort), output: combinedOutput });
-        return;
-      }
-      resolved = true;
-      resolvePromise({ url: buildAppUrl(port), output: combinedOutput });
+      // Ready pattern matched; when no port is discoverable in the output,
+      // fall back to the most common dev port heuristic.
+      const port = extractPortFromOutput(combinedOutput) ?? FALLBACK_PORT;
+      settle(() => resolvePromise({ url: buildAppUrl(port) }));
     };
 
     child.stdout?.on('data', onData);
     child.stderr?.on('data', onData);
 
     child.once('error', (err) => {
-      if (resolved) return;
-      resolved = true;
-      rejectPromise(new Error(`dev server spawn error: ${err.message}`));
+      settle(() => rejectPromise(new Error(`dev server spawn error: ${err.message}`)));
     });
 
     child.once('exit', (code, signal) => {
-      if (resolved) return;
-      resolved = true;
-      rejectPromise(
+      settle(() => rejectPromise(
         new Error(
           `dev server exited before becoming ready (code=${code}, signal=${signal}). Output tail:\n${combinedOutput.slice(-2000)}`,
         ),
-      );
+      ));
     });
 
     const timer = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      rejectPromise(
+      settle(() => rejectPromise(
         new Error(
           `dev server did not match readyPattern within ${timeoutMs}ms. Output tail:\n${combinedOutput.slice(-2000)}`,
         ),
-      );
+      ));
     }, timeoutMs);
     timer.unref?.();
   });
@@ -828,13 +828,19 @@ export async function runInteractionChecks(
     try {
       const before = await readInteractionValue(page, check);
 
+      const safeLabel = check.label.replace(/[^a-z0-9_-]+/gi, '_').slice(0, 60);
+      // Best-effort capture: the path is recorded even when the screenshot
+      // itself fails, matching the primary-signal-is-the-assertion design.
+      const tryScreenshot = async (path: string): Promise<string> => {
+        try { await page.screenshot({ path }); } catch { /* best-effort */ }
+        return path;
+      };
+
       let screenshotBeforePath: string | undefined;
       let screenshotAfterPath: string | undefined;
       if (check.screenshotBeforeAfter) {
         ensureDir(artifactDir);
-        const safeLabel = check.label.replace(/[^a-z0-9_-]+/gi, '_').slice(0, 60);
-        screenshotBeforePath = join(artifactDir, `interaction-${safeLabel}-before.png`);
-        try { await page.screenshot({ path: screenshotBeforePath }); } catch { /* best-effort */ }
+        screenshotBeforePath = await tryScreenshot(join(artifactDir, `interaction-${safeLabel}-before.png`));
       }
 
       await dispatchInteraction(page, check);
@@ -843,10 +849,13 @@ export async function runInteractionChecks(
       const after = await readInteractionValue(page, check);
 
       if (check.screenshotBeforeAfter) {
-        const safeLabel = check.label.replace(/[^a-z0-9_-]+/gi, '_').slice(0, 60);
-        screenshotAfterPath = join(artifactDir, `interaction-${safeLabel}-after.png`);
-        try { await page.screenshot({ path: screenshotAfterPath }); } catch { /* best-effort */ }
+        screenshotAfterPath = await tryScreenshot(join(artifactDir, `interaction-${safeLabel}-after.png`));
       }
+
+      const screenshotPaths = {
+        ...(screenshotBeforePath ? { screenshotBeforePath } : {}),
+        ...(screenshotAfterPath ? { screenshotAfterPath } : {}),
+      };
 
       const expectation = check.domAssertion?.expect ?? check.debugHookAssertion?.expect;
       if (!expectation) {
@@ -856,8 +865,7 @@ export async function runInteractionChecks(
           before,
           after,
           error: 'InteractionCheck has neither domAssertion nor debugHookAssertion; nothing to assert.',
-          ...(screenshotBeforePath ? { screenshotBeforePath } : {}),
-          ...(screenshotAfterPath ? { screenshotAfterPath } : {}),
+          ...screenshotPaths,
         });
         continue;
       }
@@ -869,8 +877,7 @@ export async function runInteractionChecks(
         before,
         after,
         ...(reason ? { reason } : {}),
-        ...(screenshotBeforePath ? { screenshotBeforePath } : {}),
-        ...(screenshotAfterPath ? { screenshotAfterPath } : {}),
+        ...screenshotPaths,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -956,7 +963,7 @@ export async function runPlaywrightProductHarness(
 
     try {
       const ready = await waitForDevServer(child, readyPattern, startTimeoutMs);
-      server = { child, url: ready.url, output: ready.output };
+      server = { child, url: ready.url };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return {

@@ -66,7 +66,8 @@ const GLOBAL_NPM_RE = /\bnpm\s+install\s+(?:-g|--global)\b/;
 const CHMOD_777_RE = /\bchmod\s+(?:-R\s+)?777\b/;
 const WIPE_DISK_RE = /\b(mkfs|dd\s+if=\/dev\/zero)\b/;
 
-function classifyDangerousBash(command: string): string | null {
+/** Public helper — used by the preHook gate, tests, and the executor. */
+export function classifyDangerousBashCommand(command: string): string | null {
   if (DANGEROUS_RM_RE.test(command)) return 'rm -rf outside workspace allowlist';
   if (SUDO_RE.test(command)) return 'sudo not allowed';
   if (GLOBAL_NPM_RE.test(command)) return 'global npm install rejected (use local install)';
@@ -146,7 +147,7 @@ export const WORKER_TOOL_CALL_PERSONA: AgentPersona<WorkerToolCallInput, WorkerT
   preHook: async (input, _ctx) => {
     if (input.tool_name === 'bash') {
       const cmd = String(input.args['command'] ?? '');
-      const danger = classifyDangerousBash(cmd);
+      const danger = classifyDangerousBashCommand(cmd);
       if (danger) {
         return {
           skipWithResult: {
@@ -162,11 +163,3 @@ export const WORKER_TOOL_CALL_PERSONA: AgentPersona<WorkerToolCallInput, WorkerT
     return input;
   },
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Public helpers used by tests + executor
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function classifyDangerousBashCommand(command: string): string | null {
-  return classifyDangerousBash(command);
-}

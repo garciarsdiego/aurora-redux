@@ -12,7 +12,7 @@ import { canResumeRuntimeSession, runtimeProcessPool } from '../../../runtime/pr
 import { getRuntimeSession } from '../../../runtime/store.js';
 import { getRuntimeExecutorCapability } from '../../../runtime/capabilities.js';
 import type { Router } from '../types.js';
-import { badRequest, jsonOk, notFound, readJsonBody } from '../_shared.js';
+import { badRequest, jsonOk, notFound, readBodyOr400 } from '../_shared.js';
 import { collaborationStructuredError } from './shared.js';
 
 async function handleDashboardRuntimeProbe(body: unknown, res: ServerResponse): Promise<void> {
@@ -176,35 +176,35 @@ export const runtimeRouter: Router = async (req, url, res) => {
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/runtime/probes') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardRuntimeProbe(body, res);
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/runtime/sessions') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardRuntimeSessionStart(body, res);
     return true;
   }
   const runtimeSessionStaleMatch = url.pathname.match(/^\/api\/dashboard\/runtime\/sessions\/([^/]+)\/mark-stale$/);
   if (req.method === 'POST' && runtimeSessionStaleMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardRuntimeSessionMarkStale(decodeURIComponent(runtimeSessionStaleMatch[1] ?? ''), body, res);
     return true;
   }
   const runtimeSessionEndMatch = url.pathname.match(/^\/api\/dashboard\/runtime\/sessions\/([^/]+)\/end$/);
   if (req.method === 'POST' && runtimeSessionEndMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardRuntimeSessionEnd(decodeURIComponent(runtimeSessionEndMatch[1] ?? ''), body, res);
     return true;
   }
   const runtimeSessionResumeCheckMatch = url.pathname.match(/^\/api\/dashboard\/runtime\/sessions\/([^/]+)\/resume-check$/);
   if (req.method === 'POST' && runtimeSessionResumeCheckMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardRuntimeSessionResumeCheck(decodeURIComponent(runtimeSessionResumeCheckMatch[1] ?? ''), body, res);
     return true;
   }

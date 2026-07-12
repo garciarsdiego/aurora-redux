@@ -260,11 +260,13 @@ async function checkDaemonHealth(): Promise<CheckResult> {
   const port = process.env.OMNIFORGE_DAEMON_PORT
     ? Number.parseInt(process.env.OMNIFORGE_DAEMON_PORT, 10)
     : 20129;
+  const ctrl = new AbortController();
+  // finally garante o clearTimeout também no caminho de erro (ECONNREFUSED
+  // imediato) — sem isso o timer de 2s ficaria pendente segurando o event loop.
+  const timeout = setTimeout(() => ctrl.abort(), 2000);
   try {
-    const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), 2000);
     const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: ctrl.signal });
-    clearTimeout(timeout);
+    clearTimeout(timeout); // desarma antes de ler o body (o timeout cobre só o connect)
     if (!res.ok) return { name: `Daemon /health (:${port})`, severity: 'fail', detail: `HTTP ${res.status}` };
     const body = await res.json() as {
       status?: string;
@@ -290,6 +292,8 @@ async function checkDaemonHealth(): Promise<CheckResult> {
       severity: 'warn',
       detail: `unreachable (${err instanceof Error ? err.message : String(err)}) — start with 'omniforge daemon start'`,
     };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

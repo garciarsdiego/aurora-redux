@@ -9,7 +9,7 @@
 
 import type { Advisor, AdvisorContext, AdvisorResult } from '../types.js';
 import { getAdvisorMode } from '../shared/mode.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
+import { callAdvisorLlm } from '../shared/llm.js';
 import { TracerInputSchema, type TracerInput } from './schema.js';
 import { TRACER_SYSTEM_PROMPT } from './prompt.js';
 
@@ -68,11 +68,9 @@ export const tracerAdvisor: Advisor = {
     const parsed = TracerInputSchema.parse(args);
     void getAdvisorMode(ctx, args);
     const userPrompt = buildUserPrompt(parsed);
-    const text = await callOmniroute({
+    const text = await callAdvisorLlm(ctx, {
       systemPrompt: TRACER_SYSTEM_PROMPT,
       userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     return { output: text };
   },

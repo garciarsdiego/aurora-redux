@@ -31,6 +31,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type Database from 'better-sqlite3';
 import type { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 
 import { healthRouter } from './routes/health.js';
@@ -89,6 +90,7 @@ import {
 import { eventBroker } from './event-broker.js';
 import type { RouteContext, Router } from './routes/types.js';
 import { unauthorized } from './routes/_shared.js';
+import { safeJsonObject } from './_json-utils.js';
 import { VALID_WORKSPACE_RE } from '../utils/workspace.js';
 import { readSettings, writeSettings } from '../utils/settings-file.js';
 import { refreshHealthStatus } from '../v2/omniroute-bridge/health-cache.js';
@@ -125,7 +127,7 @@ function createMonitoringDashboardRouter(): Router {
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(content);
       return true;
-    } catch (error) {
+    } catch {
       res.writeHead(500, { 'Content-Type': 'text/plain' });
       res.end('Error loading monitoring dashboard');
       return true;
@@ -209,9 +211,17 @@ function rawTokenMatches(rawToken: string, expectedToken: string): boolean {
   return constantTimeTokenCompare(rawToken, expectedToken);
 }
 
-function daemonAuthDisabledForLocalRequest(req: IncomingMessage): boolean {
+// Security (Wave 5B Issue #5): single source of truth for the auth-bypass
+// modes so the boot warning banner cannot drift from the actual auth gate
+// (it used to warn only for 'off' while 'false'/'disabled'/'none' also
+// disabled Bearer auth).
+function isDaemonAuthDisabled(): boolean {
   const mode = (process.env.OMNIFORGE_DAEMON_AUTH ?? '').trim().toLowerCase();
-  if (!['off', 'false', 'disabled', 'none'].includes(mode)) return false;
+  return ['off', 'false', 'disabled', 'none'].includes(mode);
+}
+
+function daemonAuthDisabledForLocalRequest(req: IncomingMessage): boolean {
+  if (!isDaemonAuthDisabled()) return false;
   const remote = req.socket.remoteAddress ?? '';
   return remote === '127.0.0.1'
     || remote === '::1'
@@ -235,6 +245,76 @@ function requestAuthorized(req: IncomingMessage, url: URL, expectedToken: string
 
 // ── Server bootstrap ──────────────────────────────────────────────────────
 
+// Shared open→use→close wrapper for the boot/heartbeat paths below. The db
+// and config modules stay lazily imported so loading http-server keeps zero
+// eager DB dependencies.
+async function withDb<T>(fn: (db: Database.Database) => T): Promise<T> {
+  const { initDb } = await import('../db/client.js');
+  const { getDbPath } = await import('../utils/config.js');
+  const db = initDb(getDbPath());
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+// Camada C: ensure every workspace without an explicit `software_target`
+// has a usable default project_root. Provisions
+// `data/workspaces/<name>/project/` (mkdir + git init + initial commit) and
+// patches the workspace metadata so cli_spawn workers always land in a
+// git-able cwd. Runs once per daemon boot — idempotent + best-effort.
+async function ensureWorkspaceProjectRoots(dataDir: string): Promise<void> {
+  const { ensureGitInitialized } = await import('../utils/git-worktree.js');
+  await withDb((db) => {
+    const existingRows = db.prepare(
+      `SELECT name, metadata_json FROM dashboard_workspaces`,
+    ).all() as Array<{ name: string; metadata_json: string | null }>;
+    const implicitRows = db.prepare(
+      `SELECT DISTINCT workspace AS name
+         FROM workflows
+        WHERE workspace IS NOT NULL AND workspace != ''`,
+    ).all() as Array<{ name: string }>;
+    const workspaceNames = new Set<string>(['internal']);
+    for (const row of existingRows) workspaceNames.add(row.name);
+    for (const row of implicitRows) workspaceNames.add(row.name);
+    const rowsByName = new Map(existingRows.map((row) => [row.name, row]));
+    const rows = Array.from(workspaceNames)
+      .filter((name) => VALID_WORKSPACE_RE.test(name))
+      .map((name) => rowsByName.get(name) ?? { name, metadata_json: null });
+    for (const row of rows) {
+      const metadata = safeJsonObject(row.metadata_json);
+      const existingTarget = metadata['software_target'];
+      const hasProjectRoot =
+        existingTarget &&
+        typeof existingTarget === 'object' &&
+        typeof (existingTarget as { project_root?: unknown }).project_root === 'string' &&
+        ((existingTarget as { project_root?: string }).project_root ?? '').length > 0;
+      if (hasProjectRoot) {
+        // Workspace is already configured — make sure it is git-able.
+        const root = (existingTarget as { project_root: string }).project_root;
+        ensureGitInitialized(root);
+        continue;
+      }
+      // Provision a default project_root inside the daemon data dir.
+      const defaultRoot = path.resolve(dataDir, 'workspaces', row.name, 'project');
+      if (ensureGitInitialized(defaultRoot) === null) continue;
+      const nextTarget = {
+        ...(typeof existingTarget === 'object' && existingTarget !== null
+          ? (existingTarget as Record<string, unknown>)
+          : {}),
+        project_root: defaultRoot,
+      };
+      const nextMetadata = { ...metadata, software_target: nextTarget };
+      db.prepare(
+        `INSERT INTO dashboard_workspaces (name, created_at, created_by, metadata_json)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET metadata_json = excluded.metadata_json`,
+      ).run(row.name, Date.now(), 'daemon-bootstrap', JSON.stringify(nextMetadata));
+    }
+  });
+}
+
 export type ShutdownFn = () => Promise<void>;
 
 export async function startHttpMcpServer(dataDir: string, port = resolveHttpPort()): Promise<ShutdownFn> {
@@ -249,87 +329,16 @@ export async function startHttpMcpServer(dataDir: string, port = resolveHttpPort
   // daemon must boot even if the table is empty or the DB lacks the
   // migration (older installs).
   try {
-    const { initDb } = await import('../db/client.js');
-    const { getDbPath } = await import('../utils/config.js');
-    const db = initDb(getDbPath());
-    try {
-      hydrateAutoTagOverridesFromDb(db);
-    } finally {
-      db.close();
-    }
+    await withDb(hydrateAutoTagOverridesFromDb);
   } catch (err) {
     process.stderr.write(
       `[daemon] auto-tag overrides hydration skipped: ${err instanceof Error ? err.message : String(err)}\n`,
     );
   }
 
-  // Camada C: ensure every workspace without an explicit `software_target`
-  // has a usable default project_root. Provisions
-  // `data/workspaces/<name>/project/` (mkdir + git init + initial commit) and
-  // patches the workspace metadata so cli_spawn workers always land in a
-  // git-able cwd. Runs once per daemon boot — idempotent + best-effort.
+  // Camada C: workspace project_root bootstrap — idempotent + best-effort.
   try {
-    const { initDb } = await import('../db/client.js');
-    const { getDbPath } = await import('../utils/config.js');
-    const { ensureGitInitialized } = await import('../utils/git-worktree.js');
-    const db = initDb(getDbPath());
-    try {
-      const existingRows = db.prepare(
-        `SELECT name, metadata_json FROM dashboard_workspaces`,
-      ).all() as Array<{ name: string; metadata_json: string | null }>;
-      const implicitRows = db.prepare(
-        `SELECT DISTINCT workspace AS name
-           FROM workflows
-          WHERE workspace IS NOT NULL AND workspace != ''`,
-      ).all() as Array<{ name: string }>;
-      const workspaceNames = new Set<string>(['internal']);
-      for (const row of existingRows) workspaceNames.add(row.name);
-      for (const row of implicitRows) workspaceNames.add(row.name);
-      const rowsByName = new Map(existingRows.map((row) => [row.name, row]));
-      const rows = Array.from(workspaceNames)
-        .filter((name) => VALID_WORKSPACE_RE.test(name))
-        .map((name) => rowsByName.get(name) ?? { name, metadata_json: null });
-      for (const row of rows) {
-        let metadata: Record<string, unknown> = {};
-        try {
-          if (row.metadata_json) {
-            const parsed = JSON.parse(row.metadata_json) as unknown;
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              metadata = parsed as Record<string, unknown>;
-            }
-          }
-        } catch { /* malformed metadata — treat as empty */ }
-        const existingTarget = metadata['software_target'];
-        const hasProjectRoot =
-          existingTarget &&
-          typeof existingTarget === 'object' &&
-          typeof (existingTarget as { project_root?: unknown }).project_root === 'string' &&
-          ((existingTarget as { project_root?: string }).project_root ?? '').length > 0;
-        if (hasProjectRoot) {
-          // Workspace is already configured — make sure it is git-able.
-          const root = (existingTarget as { project_root: string }).project_root;
-          ensureGitInitialized(root);
-          continue;
-        }
-        // Provision a default project_root inside the daemon data dir.
-        const defaultRoot = path.resolve(dataDir, 'workspaces', row.name, 'project');
-        if (ensureGitInitialized(defaultRoot) === null) continue;
-        const nextTarget = {
-          ...(typeof existingTarget === 'object' && existingTarget !== null
-            ? (existingTarget as Record<string, unknown>)
-            : {}),
-          project_root: defaultRoot,
-        };
-        const nextMetadata = { ...metadata, software_target: nextTarget };
-        db.prepare(
-          `INSERT INTO dashboard_workspaces (name, created_at, created_by, metadata_json)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(name) DO UPDATE SET metadata_json = excluded.metadata_json`,
-        ).run(row.name, Date.now(), 'daemon-bootstrap', JSON.stringify(nextMetadata));
-      }
-    } finally {
-      db.close();
-    }
+    await ensureWorkspaceProjectRoots(dataDir);
   } catch (err) {
     process.stderr.write(
       `[daemon] workspace project_root bootstrap skipped: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -378,7 +387,7 @@ export async function startHttpMcpServer(dataDir: string, port = resolveHttpPort
     dashboardNotificationsRouter,
     dashboardExternalMcpRouter,
     omnirouteHealthRouter,
-omnirouteCostRouter,
+    omnirouteCostRouter,
     monitoringRouter,
     monitoringBasicRouter,
     createMonitoringDashboardRouter(),
@@ -471,22 +480,11 @@ omnirouteCostRouter,
   // schedules are disabled or stalled. One write/5s on a single-row upsert
   // is negligible (≈0.05% of an i/o-bound daemon).
   const heartbeatTimer = setInterval(() => {
-    void (async () => {
-      try {
-        const { initDb } = await import('../db/client.js');
-        const { getDbPath } = await import('../utils/config.js');
-        const db = initDb(getDbPath());
-        try {
-          writeDaemonHeartbeat(db);
-        } finally {
-          db.close();
-        }
-      } catch (err) {
-        process.stderr.write(
-          `[daemon] heartbeat write failed: ${err instanceof Error ? err.message : String(err)}\n`,
-        );
-      }
-    })();
+    void withDb(writeDaemonHeartbeat).catch((err) => {
+      process.stderr.write(
+        `[daemon] heartbeat write failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    });
   }, DAEMON_HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref();
 
@@ -494,14 +492,7 @@ omnirouteCostRouter,
   // the first 5 seconds after boot show a missing row, indistinguishable
   // from a daemon that never ticked).
   try {
-    const { initDb } = await import('../db/client.js');
-    const { getDbPath } = await import('../utils/config.js');
-    const db = initDb(getDbPath());
-    try {
-      writeDaemonHeartbeat(db);
-    } finally {
-      db.close();
-    }
+    await withDb(writeDaemonHeartbeat);
   } catch (err) {
     process.stderr.write(
       `[daemon] initial heartbeat write failed: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -571,14 +562,15 @@ omnirouteCostRouter,
   });
 
   process.stderr.write(`[daemon] HTTP MCP server listening on http://127.0.0.1:${port}\n`);
-  const authDisabled = (process.env.OMNIFORGE_DAEMON_AUTH ?? '').trim().toLowerCase() === 'off';
+  const authDisabled = isDaemonAuthDisabled();
   const authLabel = authDisabled ? 'local auth disabled' : 'Bearer auth';
-  // Security (Wave 5B Issue #5): make the bypass loud. When OMNIFORGE_DAEMON_AUTH=off
-  // is set, every endpoint (advisors, workflows, vault, gates) accepts requests
-  // from any process on the local machine without a token. Surface this with a
-  // banner so the operator notices.
+  // Security (Wave 5B Issue #5): make the bypass loud. When OMNIFORGE_DAEMON_AUTH
+  // is set to any disabling mode (off/false/disabled/none), every endpoint
+  // (advisors, workflows, vault, gates) accepts requests from any process on
+  // the local machine without a token. Surface this with a banner so the
+  // operator notices.
   if (authDisabled) {
-    process.stderr.write('[daemon] ⚠️  WARNING: OMNIFORGE_DAEMON_AUTH=off — Bearer auth DISABLED for loopback requests. All endpoints reachable without a token. Unset this env to re-enable.\n');
+    process.stderr.write(`[daemon] ⚠️  WARNING: OMNIFORGE_DAEMON_AUTH=${(process.env.OMNIFORGE_DAEMON_AUTH ?? '').trim()} — Bearer auth DISABLED for loopback requests. All endpoints reachable without a token. Unset this env to re-enable.\n`);
   }
   process.stderr.write(`[daemon] SSE:    GET  /mcp/sse           (${authLabel})\n`);
   process.stderr.write(`[daemon] Tools:  GET  /mcp/tools/list    (${authLabel})\n`);

@@ -39,6 +39,10 @@ export function normalizeTailEvent(
           text: event.text ?? '',
         }];
       }
+      // Non-assistant messages have no dedicated runtime event type — they
+      // normalize to the same runtime.meta shape as 'meta' events.
+      // falls through
+    case 'meta':
       return [{
         type: 'runtime.meta',
         ts,
@@ -67,14 +71,6 @@ export function normalizeTailEvent(
         ts,
         executorId,
         toolOutput: redactRuntimeValue(event.toolOutput),
-      }];
-    case 'meta':
-      return [{
-        type: 'runtime.meta',
-        ts,
-        executorId,
-        text: event.text ?? '',
-        raw: redactRuntimeValue(event),
       }];
     default:
       return [runtimeError(

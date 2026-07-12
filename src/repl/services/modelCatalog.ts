@@ -11,6 +11,11 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getOmnirouteUrl, getOmnirouteApiKey } from '../../utils/config.js';
 import { listOpencodeModels } from '../../v2/models/opencode-sync.js';
+import {
+  PROVIDER_MATRIX_CSV_REL,
+  parseProviderMatrixCsv,
+  type ProviderMatrixRow,
+} from './providerMatrixCsv.js';
 
 export type ModelKind = 'cli' | 'llm' | 'pal' | 'unknown';
 
@@ -167,7 +172,6 @@ export interface Catalog {
 }
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
-const CSV_PATH_REL = ['docs', '08-AI-PROVIDER-MATRIX.csv'];
 const DEFAULT_LIVE_TIMEOUT_MS = 15_000;
 
 let _cache: Catalog | null = null;
@@ -256,33 +260,12 @@ function resolveLiveCatalogTimeoutMs(): number {
   return Math.min(parsed, 60_000);
 }
 
-interface CsvRow {
-  model_id: string;
-  use_primary: string;
-  use_secondary: string;
-  score_primary: string;
-  score_secondary: string;
-  tier: string;
-  eq_ref: string;
-}
-
-function loadCsvCatalog(): readonly CsvRow[] {
-  const csvPath = join(process.cwd(), ...CSV_PATH_REL);
+// Parsing + path constant live in providerMatrixCsv.ts (shared with
+// input/completer.ts). This loader only adds the existsSync guard.
+function loadCsvCatalog(): readonly ProviderMatrixRow[] {
+  const csvPath = join(process.cwd(), ...PROVIDER_MATRIX_CSV_REL);
   if (!existsSync(csvPath)) return [];
-  const lines = readFileSync(csvPath, 'utf-8').split('\n').filter(Boolean);
-  // Skip header row
-  return lines.slice(1).map((line) => {
-    const cols = line.split(',');
-    return {
-      model_id: cols[0]?.trim() ?? '',
-      use_primary: cols[1]?.trim() ?? '',
-      use_secondary: cols[2]?.trim() ?? '',
-      score_primary: cols[3]?.trim() ?? '',
-      score_secondary: cols[4]?.trim() ?? '',
-      tier: cols[5]?.trim() ?? '',
-      eq_ref: cols[6]?.trim() ?? '',
-    };
-  }).filter((r) => r.model_id !== '');
+  return parseProviderMatrixCsv(readFileSync(csvPath, 'utf-8'));
 }
 
 function buildProviders(models: readonly ModelEntry[]): readonly ProviderInfo[] {
@@ -313,7 +296,7 @@ export async function loadCatalog(opts: { force?: boolean } = {}): Promise<Catal
   const liveIds = await fetchLiveModels();
   const liveError = liveIds === null ? 'live API unavailable (timeout/auth/404)' : undefined;
 
-  const csvByModelId = new Map<string, CsvRow>();
+  const csvByModelId = new Map<string, ProviderMatrixRow>();
   for (const r of csvRows) csvByModelId.set(r.model_id, r);
 
   const liveSet = new Set(liveIds ?? []);
@@ -341,7 +324,7 @@ export async function loadCatalog(opts: { force?: boolean } = {}): Promise<Catal
 
   if (models.length === 0) {
     throw new Error(
-      `Model catalog empty. Live API unreachable AND CSV missing at ${join(...CSV_PATH_REL)}.`,
+      `Model catalog empty. Live API unreachable AND CSV missing at ${join(...PROVIDER_MATRIX_CSV_REL)}.`,
     );
   }
 

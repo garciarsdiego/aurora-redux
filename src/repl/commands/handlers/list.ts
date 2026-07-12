@@ -3,6 +3,8 @@
 // message when no db handle is wired (early MA bootstrap, isolated tests).
 import type Database from 'better-sqlite3';
 import type { SlashCommand, SlashResult, ReplCtx } from '../types.js';
+import { toError } from '../../utils/errors.js';
+import { truncate, clampInt } from '../../utils/text.js';
 
 interface ListArgs {
   workspace?: string;
@@ -35,14 +37,8 @@ function relativeTime(now: number, ts: number): string {
   return `${day}d ago`;
 }
 
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return text.slice(0, max - 1) + '…';
-}
-
 function shortId(id: string): string {
   // wf_<uuid> — show wf_ + first 8 chars of uuid
-  if (id.startsWith('wf_')) return id.slice(0, 11);
   return id.slice(0, 11);
 }
 
@@ -101,12 +97,12 @@ export const listCommand: SlashCommand<ListArgs> = {
     if (!ctx.db) {
       return { output: 'MA: list requires a wired db handle; coming in Wire-up phase' };
     }
-    const limit = Math.min(Math.max(args.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const limit = clampInt(args.limit ?? DEFAULT_LIMIT, 1, MAX_LIMIT);
     try {
       const rows = queryWorkflows(ctx.db, args.workspace, args.status, limit);
       return { output: formatTable(rows) };
     } catch (err) {
-      return { error: err instanceof Error ? err : new Error(String(err)) };
+      return { error: toError(err) };
     }
   },
 };

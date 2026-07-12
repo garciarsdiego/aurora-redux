@@ -1,6 +1,6 @@
 import { getCostDatabase } from './CostDatabase.js';
-import { getCatalogQuality } from './catalog-quality.js';
-import type { ModelCandidate } from './types.js';
+import { estimateUseCaseQuality } from './catalog-quality.js';
+import type { CostRecord } from './types.js';
 
 interface OptimizationContext {
   current_cost: number;
@@ -15,6 +15,16 @@ interface OptimizationAction {
   action: 'continue' | 'downgrade_model' | 'early_terminate';
   new_model?: string;
   reasoning: string;
+}
+
+/** Average of input/output pricing per 1k tokens — used for cheapness comparisons. */
+function avgCostPerToken(record: CostRecord): number {
+  return (record.input_cost_per_1k + record.output_cost_per_1k) / 2;
+}
+
+/** Estimated cost of one average-sized request for a model. */
+function avgCostPerRequest(record: CostRecord): number {
+  return (record.avg_tokens_per_request / 1000) * (record.input_cost_per_1k + record.output_cost_per_1k);
 }
 
 export class CostOptimizer {
@@ -92,17 +102,14 @@ export class CostOptimizer {
       return null;
     }
 
-    const currentCostPerToken = (currentCost.input_cost_per_1k + currentCost.output_cost_per_1k) / 2;
+    const currentCostPerToken = avgCostPerToken(currentCost);
 
     const allCosts = this.costDatabase.getAllCosts();
     const candidates = allCosts
-      .filter(cost => {
-        const costPerToken = (cost.input_cost_per_1k + cost.output_cost_per_1k) / 2;
-        return costPerToken < currentCostPerToken * 0.7; // At least 30% cheaper
-      })
+      .filter(cost => avgCostPerToken(cost) < currentCostPerToken * 0.7) // At least 30% cheaper
       .map(cost => ({
         model: cost.model,
-        costPerToken: (cost.input_cost_per_1k + cost.output_cost_per_1k) / 2,
+        costPerToken: avgCostPerToken(cost),
         quality: this.estimateQuality(cost.model, use_case)
       }))
       .filter(c => c.quality >= minQuality)
@@ -120,10 +127,7 @@ export class CostOptimizer {
       return 0;
     }
 
-    const avgCostPerTask = (currentModel.avg_tokens_per_request / 1000) * 
-                            (currentModel.input_cost_per_1k + currentModel.output_cost_per_1k);
-
-    return avgCostPerTask * context.remaining_tasks;
+    return avgCostPerRequest(currentModel) * context.remaining_tasks;
   }
 
   /**
@@ -137,31 +141,17 @@ export class CostOptimizer {
       return false;
     }
 
-    const currentCostPerToken = (currentCost.input_cost_per_1k + currentCost.output_cost_per_1k) / 2;
-    const candidateCostPerToken = (candidateCost.input_cost_per_1k + candidateCost.output_cost_per_1k) / 2;
-
-    return candidateCostPerToken < currentCostPerToken * 0.7; // At least 30% cheaper
+    return avgCostPerToken(candidateCost) < avgCostPerToken(currentCost) * 0.7; // At least 30% cheaper
   }
 
   /**
    * Estimate quality for a model (0-1).
    *
-   * De-mock (OPS-08): base quality sourced from the live provider matrix
-   * (capability registry) instead of a stale hardcoded map. The use-case
-   * multiplier remains a routing heuristic.
+   * Delegates to the shared catalog-quality helper so this heuristic stays in
+   * sync with CostAwareRouter (same base quality source, same use-case table).
    */
   private estimateQuality(model: string, use_case: string): number {
-    const baseQuality = getCatalogQuality(model);
-
-    const useCaseMultiplier: Record<string, number> = {
-      'code': 1.0,
-      'debug': 0.95,
-      'planning': 1.05,
-      'review': 1.0,
-      'chat': 0.9
-    };
-
-    return Math.min(1.0, baseQuality * (useCaseMultiplier[use_case] || 1.0));
+    return estimateUseCaseQuality(model, use_case);
   }
 
   /**
@@ -196,16 +186,11 @@ export class CostOptimizer {
     // Estimate savings if downgrading
     let estimatedSavings = 0;
     if (action.action === 'downgrade_model' && action.new_model) {
-      const currentCost = this.costDatabase.getCost(currentModel);
-      const newCost = this.costDatabase.getCost(action.new_model);
-      
-      if (currentCost && newCost) {
-        const currentCostPerTask = (currentCost.avg_tokens_per_request / 1000) * 
-                                  (currentCost.input_cost_per_1k + currentCost.output_cost_per_1k);
-        const newCostPerTask = (newCost.avg_tokens_per_request / 1000) * 
-                              (newCost.input_cost_per_1k + newCost.output_cost_per_1k);
-        
-        estimatedSavings = (currentCostPerTask - newCostPerTask) * remainingTasks;
+      const currentRecord = this.costDatabase.getCost(currentModel);
+      const newRecord = this.costDatabase.getCost(action.new_model);
+
+      if (currentRecord && newRecord) {
+        estimatedSavings = (avgCostPerRequest(currentRecord) - avgCostPerRequest(newRecord)) * remainingTasks;
       }
     }
 

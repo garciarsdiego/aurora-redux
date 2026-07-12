@@ -15,6 +15,7 @@ import type {
   RateLimiterOptions,
   RateLimitMetrics,
 } from './types.js';
+import { MetricsTracker } from './metrics-tracker.js';
 
 export class TokenBucketLimiter {
   private readonly rpm: number;
@@ -22,15 +23,15 @@ export class TokenBucketLimiter {
   private readonly tokensPerMs: number;
   private readonly buckets: Map<string, TokenBucket>;
   private readonly now: () => number;
-  private readonly metrics: Map<string, RateLimitMetrics>;
+  private readonly tracker: MetricsTracker;
 
   constructor(opts: RateLimiterOptions) {
     this.rpm = Math.max(1, opts.rpm);
     this.burst = Math.max(1, opts.burst ?? this.rpm);
     this.tokensPerMs = this.rpm / 60_000;
     this.buckets = new Map();
-    this.metrics = new Map();
     this.now = opts.now ?? Date.now;
+    this.tracker = new MetricsTracker(this.now, () => ({ remaining: this.burst, limit: this.rpm }));
   }
 
   /**
@@ -45,7 +46,7 @@ export class TokenBucketLimiter {
       : { tokens: this.burst, lastRefillMs: currentMs };
 
     // Update metrics
-    this.updateMetrics(key);
+    this.tracker.check(key);
 
     // Refill: continuous accrual based on elapsed time.
     const elapsed = Math.max(0, currentMs - bucket.lastRefillMs);
@@ -59,7 +60,7 @@ export class TokenBucketLimiter {
       const deficit = 1 - bucket.tokens;
       const retryAfterMs = Math.ceil(deficit / this.tokensPerMs);
       this.buckets.set(key, bucket);
-      this.recordDenial(key);
+      this.tracker.deny(key);
       return {
         allowed: false,
         retryAfterMs,
@@ -71,7 +72,7 @@ export class TokenBucketLimiter {
 
     bucket.tokens -= 1;
     this.buckets.set(key, bucket);
-    this.recordAllowance(key, Math.floor(bucket.tokens));
+    this.tracker.allow(key, Math.floor(bucket.tokens));
     return {
       allowed: true,
       remaining: Math.floor(bucket.tokens),
@@ -84,18 +85,7 @@ export class TokenBucketLimiter {
    * Get metrics for a specific key.
    */
   getMetrics(key: string): RateLimitMetrics {
-    const metrics = this.metrics.get(key);
-    if (!metrics) {
-      return {
-        totalChecks: 0,
-        allowed: 0,
-        denied: 0,
-        remaining: this.burst,
-        limit: this.rpm,
-        lastCheckMs: this.now(),
-      };
-    }
-    return { ...metrics };
+    return this.tracker.get(key);
   }
 
   /**
@@ -104,11 +94,10 @@ export class TokenBucketLimiter {
   reset(key?: string): void {
     if (key) {
       this.buckets.delete(key);
-      this.metrics.delete(key);
     } else {
       this.buckets.clear();
-      this.metrics.clear();
     }
+    this.tracker.reset(key);
   }
 
   /**
@@ -116,39 +105,6 @@ export class TokenBucketLimiter {
    */
   inspectBucket(key: string): TokenBucket | undefined {
     return this.buckets.get(key);
-  }
-
-  private updateMetrics(key: string): void {
-    const existing = this.metrics.get(key);
-    if (!existing) {
-      this.metrics.set(key, {
-        totalChecks: 1,
-        allowed: 0,
-        denied: 0,
-        remaining: this.burst,
-        limit: this.rpm,
-        lastCheckMs: this.now(),
-      });
-      return;
-    }
-    existing.totalChecks += 1;
-    existing.lastCheckMs = this.now();
-  }
-
-  private recordAllowance(key: string, remaining: number): void {
-    const metrics = this.metrics.get(key);
-    if (metrics) {
-      metrics.allowed += 1;
-      metrics.remaining = remaining;
-    }
-  }
-
-  private recordDenial(key: string): void {
-    const metrics = this.metrics.get(key);
-    if (metrics) {
-      metrics.denied += 1;
-      metrics.remaining = 0;
-    }
   }
 }
 

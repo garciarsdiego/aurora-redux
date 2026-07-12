@@ -1,10 +1,20 @@
 import { config as dotenvConfig } from 'dotenv';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, sep as pathSep } from 'node:path';
 
 // Workspace name allowlist — alphanumeric + underscore + hyphen only.
 // Blocks `..`, `/`, `\`, `.` traversal sequences before any path resolve.
 export const VALID_WORKSPACE_RE = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * True when `candidate` equals `root` or lives strictly inside it. Both paths
+ * must already be resolved/normalized by the caller. Shared by git-worktree.ts
+ * and workspace-profile.ts so future edge-case fixes (e.g. Windows case
+ * insensitivity) land in exactly one place.
+ */
+export function isPathInsideRoot(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${pathSep}`);
+}
 
 export function assertValidWorkspace(workspace: string): void {
   if (!VALID_WORKSPACE_RE.test(workspace)) {

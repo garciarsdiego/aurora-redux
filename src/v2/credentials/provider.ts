@@ -9,6 +9,7 @@ import type {
   DecryptedCredential,
   CredentialMetadata,
   CredentialProviderConfig,
+  CredentialType,
   CredentialAuditLog,
 } from './types.js';
 import { createStorage } from './storage.js';
@@ -41,7 +42,7 @@ export class CredentialProvider {
       metadata: {
         id: generateCredentialId(),
         name,
-        type: type as any,
+        type: type as CredentialType,
         service,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),

@@ -14,6 +14,7 @@ import React from 'react';
 import { render } from 'ink';
 import { App } from './app.js';
 import { registerAllCommands } from './commands/registerAll.js';
+import { errorMessage } from './utils/errors.js';
 import type { BootConfig } from './bootstrap.js';
 
 const BANNER = 'omniforge\n';
@@ -55,8 +56,7 @@ async function main(): Promise<void> {
     const entries = await loadHistoryEntries(readBootConfig().workspace);
     historySnapshot = entries.map((e) => e.raw);
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[repl] bootstrap failed: ${msg}\n`);
+    process.stderr.write(`[repl] bootstrap failed: ${errorMessage(err)}\n`);
     process.exit(1);
   }
 
@@ -69,7 +69,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  const msg = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`[repl] fatal: ${msg}\n`);
+  process.stderr.write(`[repl] fatal: ${errorMessage(err)}\n`);
   process.exit(1);
 });

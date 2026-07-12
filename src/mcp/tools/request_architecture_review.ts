@@ -1,12 +1,11 @@
 import { z } from 'zod';
 import { initDb } from '../../db/client.js';
 import { getDbPath } from '../../utils/config.js';
-import { insertEvent } from '../../db/persist.js';
 import { buildFinalProductEvidenceBundle } from '../../quality/final-evidence.js';
 import { saveQualityReview } from '../../quality/store.js';
 import type { QualityIssue } from '../../quality/types.js';
-import { createContextMessage, createContextThread, ensureRunContextChannel } from '../../context/store.js';
 import { redactContextJson } from '../../context/redaction.js';
+import { loadReviewWorkflow, recordReviewContext, resolveApprovalStatus } from './review-common.js';
 
 const RequestArchitectureReviewSchema = z.object({
   workflow_id: z.string().min(1),
@@ -36,13 +35,10 @@ function architectureIssuesFromEvidence(workflowId: string, evidence: ReturnType
 
 export async function requestArchitectureReviewTool(raw: unknown): Promise<string> {
   const input = RequestArchitectureReviewSchema.parse(raw);
+  const approvalStatus = resolveApprovalStatus(input.run_mode);
   const db = initDb(getDbPath());
   try {
-    const workflow = db.prepare(`SELECT * FROM workflows WHERE id = ?`).get(input.workflow_id) as Record<string, unknown> | undefined;
-    if (!workflow) throw new Error(`Workflow not found: ${input.workflow_id}`);
-    if (input.run_mode === 'approved-run' && !input.approved_by?.trim()) {
-      throw new Error('approved_by is required when run_mode=approved-run');
-    }
+    const workflow = loadReviewWorkflow(db, input);
 
     const evidence = buildFinalProductEvidenceBundle(db, input.workflow_id);
     const issues = architectureIssuesFromEvidence(input.workflow_id, evidence);
@@ -80,48 +76,24 @@ export async function requestArchitectureReviewTool(raw: unknown): Promise<strin
           metadata: { issue_code: issue.code, safe_context: issue.safeContext ?? {} },
         })),
       runMode: input.run_mode,
-      approvalStatus: input.run_mode === 'approved-run' ? 'approved' : 'not_required',
+      approvalStatus,
       auditStatus: 'recorded',
     });
 
-    const channel = ensureRunContextChannel(db, {
+    recordReviewContext(db, {
       workspace: String(workflow['workspace']),
-      runId: input.workflow_id,
-      title: `Run ${input.workflow_id}`,
-    });
-    const thread = createContextThread(db, {
-      channelId: channel.id,
-      kind: 'decision',
-      title: 'Architecture review',
-      runId: input.workflow_id,
-      metadata: { quality_review_id: review.id, run_mode: input.run_mode },
-    });
-    createContextMessage(db, {
-      threadId: thread.id,
-      senderType: 'reviewer',
+      workflowId: input.workflow_id,
+      reviewId: review.id,
+      runMode: input.run_mode,
+      threadTitle: 'Architecture review',
       senderId: 'omniforge_request_architecture_review',
-      kind: 'advisor_review',
       body: `Architecture review ${outcome} with ${issues.length} issue(s).`,
-      metadata: {
-        quality_review_id: review.id,
-        run_mode: input.run_mode,
-        approval_status: input.run_mode === 'approved-run' ? 'approved' : 'not_required',
-        audit_status: 'recorded',
-      },
-    });
-    insertEvent(db, {
-      workflow_id: input.workflow_id,
-      task_id: null,
-      type: 'mcp_architecture_review_requested',
-      payload: {
-        quality_review_id: review.id,
+      eventType: 'mcp_architecture_review_requested',
+      eventPayload: {
         outcome,
         issue_count: issues.length,
-        run_mode: input.run_mode,
-        approval_status: input.run_mode === 'approved-run' ? 'approved' : 'not_required',
-        audit_status: 'recorded',
-        approved_by: input.approved_by ?? null,
       },
+      approvedBy: input.approved_by ?? null,
     });
 
     return JSON.stringify(redactContextJson({
@@ -130,7 +102,7 @@ export async function requestArchitectureReviewTool(raw: unknown): Promise<strin
       outcome,
       issues,
       run_mode: input.run_mode,
-      approval_status: input.run_mode === 'approved-run' ? 'approved' : 'not_required',
+      approval_status: approvalStatus,
       audit_status: 'recorded',
     }), null, 2);
   } finally {

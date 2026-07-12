@@ -13,13 +13,14 @@ import type {
   Advisor,
   AdvisorContext,
   AdvisorResult,
-  StepwiseAdvisorContext,
   StepwiseAdvisorResult,
 } from '../types.js';
-import { appendStep, ensureConversation, getHistory } from '../shared/conversationMemory.js';
 import { shouldUseStepwiseMemory } from '../shared/mode.js';
-import { extractContinueFocus, formatStepHistoryBlock } from '../shared/stepwisePrompt.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
+import {
+  formatIssueLine,
+  runStepwiseAdvisor,
+  type StepwisePromptExtras,
+} from '../shared/stepwisePrompt.js';
 import { PrecommitInputSchema, type PrecommitInput } from './schema.js';
 import { PRECOMMIT_SYSTEM_PROMPT } from './prompt.js';
 
@@ -28,10 +29,7 @@ const DESCRIPTION =
   'Use for multi-repository validation, security review, change impact assessment, and completeness verification. ' +
   'Guides through structured investigation with expert analysis.';
 
-export interface PrecommitPromptExtras {
-  priorOutputsBlock?: string;
-  trackedFindingsLines?: string;
-}
+export type PrecommitPromptExtras = StepwisePromptExtras;
 
 function buildUserPrompt(parsed: PrecommitInput, extras?: PrecommitPromptExtras): string {
   const lines: string[] = [];
@@ -92,11 +90,7 @@ function buildUserPrompt(parsed: PrecommitInput, extras?: PrecommitPromptExtras)
   if (parsed.issues_found.length > 0) {
     lines.push('');
     lines.push('=== ISSUES IDENTIFIED ===');
-    parsed.issues_found.forEach((issue) => {
-      const severity = (issue['severity'] as string | undefined) ?? 'unknown';
-      const description = (issue['description'] as string | undefined) ?? 'No description';
-      lines.push(`[${severity.toUpperCase()}] ${description}`);
-    });
+    parsed.issues_found.forEach((issue) => lines.push(formatIssueLine(issue)));
   }
 
   if (parsed.images && parsed.images.length > 0) {
@@ -117,43 +111,11 @@ export const precommitAdvisor: Advisor = {
   isStepwise: true,
   async run(ctx: AdvisorContext, args: unknown): Promise<AdvisorResult | StepwiseAdvisorResult> {
     const parsed = PrecommitInputSchema.parse(args);
-    const stepCtx = ctx as StepwiseAdvisorContext;
-    const useStepwiseMemory = shouldUseStepwiseMemory(ctx, args);
-
-    let extras: PrecommitPromptExtras | undefined;
-    if (useStepwiseMemory && stepCtx.step != null) {
-      ensureConversation(stepCtx.step.conversationId, 'precommit', ctx.workspace);
-      const priorOutputsBlock = formatStepHistoryBlock(getHistory(stepCtx.step.conversationId));
-      const trackedFindingsLines =
-        stepCtx.step.findings.length > 0 ? stepCtx.step.findings.map((f) => `- ${f}`).join('\n') : undefined;
-      extras = { priorOutputsBlock, trackedFindingsLines };
-    }
-
-    const userPrompt = buildUserPrompt(parsed, extras);
-    const text = await callOmniroute({
+    return runStepwiseAdvisor(ctx, {
+      advisorName: 'precommit',
       systemPrompt: PRECOMMIT_SYSTEM_PROMPT,
-      userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      useStepwiseMemory: shouldUseStepwiseMemory(ctx, args),
+      buildUserPrompt: (extras) => buildUserPrompt(parsed, extras),
     });
-
-    if (useStepwiseMemory && stepCtx.step != null) {
-      appendStep(stepCtx.step.conversationId, stepCtx.step.stepNumber, text);
-    }
-
-    const focus = extractContinueFocus(text);
-    if (
-      useStepwiseMemory &&
-      stepCtx.step != null &&
-      stepCtx.step.stepNumber < stepCtx.step.totalSteps &&
-      focus
-    ) {
-      return {
-        output: text,
-        nextStep: { stepNumber: stepCtx.step.stepNumber + 1, request: focus },
-      };
-    }
-
-    return { output: text };
   },
 };

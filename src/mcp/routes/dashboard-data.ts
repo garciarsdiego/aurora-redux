@@ -53,7 +53,7 @@ import {
 import { loadCatalog as loadOmnirouteCatalog } from '../../repl/services/modelCatalog.js';
 import { getDisabledProviders } from '../../utils/setup-config.js';
 import type { Router } from './types.js';
-import { badRequest, jsonOk, readJsonBody, readLargeJsonBody } from './_shared.js';
+import { badRequest, jsonOk, readBodyOr400, readLargeJsonBody } from './_shared.js';
 // Sprint F4 (Plan/Build/Discuss): single-task runner used by the Composer
 // when the operator picks Build or Discuss instead of Plan. Lives in a
 // separate ops module so the synthesis logic (DAG construction per
@@ -629,14 +629,14 @@ export const dashboardDataRouter: Router = async (req, url, res, _ctx) => {
 
   // Mutations -----------------------------------------------------------
   if (req.method === 'POST' && url.pathname === '/api/dashboard/config') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardConfig(body, res);
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/workspaces') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWorkspaceCreate(body, res);
     return true;
   }
@@ -644,34 +644,34 @@ export const dashboardDataRouter: Router = async (req, url, res, _ctx) => {
   // /workspaces/:name PATCH match below (otherwise "validate-root" gets
   // captured as a workspace name).
   if (req.method === 'POST' && url.pathname === '/api/dashboard/workspaces/validate-root') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWorkspaceValidateRoot(body, res);
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/workspaces/open-root') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWorkspaceOpenRoot(body, res);
     return true;
   }
   const workspaceMatch = url.pathname.match(/^\/api\/dashboard\/workspaces\/([^/]+)$/);
   if (req.method === 'PATCH' && workspaceMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWorkspaceUpdate(decodeURIComponent(workspaceMatch[1] ?? ''), body, res);
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/planner-sessions') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardPlannerSessionSave(body, res);
     return true;
   }
   const plannerMatch = url.pathname.match(/^\/api\/dashboard\/planner-sessions\/([^/]+)$/);
   if (req.method === 'PATCH' && plannerMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardPlannerSessionRename(decodeURIComponent(plannerMatch[1] ?? ''), body, res);
     return true;
   }
@@ -680,8 +680,8 @@ export const dashboardDataRouter: Router = async (req, url, res, _ctx) => {
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/admin/clear') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardDataClear(body, res);
     return true;
   }

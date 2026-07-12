@@ -7,8 +7,8 @@
 
 import type Database from 'better-sqlite3';
 import { startTraceSpan, endTraceSpan, type TraceSpanKind } from '../observability/tracing.js';
-import { logInfo, logWarn, logError, logDebug } from '../observability/log-aggregation.js';
-import { checkBasicHealth, checkDetailedHealth, type HealthCheckResult, type DetailedHealthResult } from './client.js';
+import { logInfo, logError } from '../observability/log-aggregation.js';
+import { checkBasicHealth, checkDetailedHealth, tallyProviderHealth, type HealthCheckResult, type DetailedHealthResult, type BridgeResult, type BasicHealthResult } from './client.js';
 import { getCachedHealth, getCacheStats } from './health-cache.js';
 import { getFailoverState, type FailoverState } from './failover.js';
 import { getHealthMonitorStats, type HealthMonitorStats } from './health-monitor.js';
@@ -130,7 +130,10 @@ class HealthObservability {
       // Record metrics
       this.recordMetrics(result, duration);
 
-      return result as any;
+      // checkBasicHealth() devolve BridgeResult<BasicHealthResult> (sem
+      // providers/rate_limits); o contrato público permanece HealthCheckResult,
+      // então estreitamos o cast aqui em vez de usar `any`.
+      return result as HealthCheckResult;
     } catch (error) {
       const duration = Date.now() - startTime;
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -168,16 +171,14 @@ class HealthObservability {
     };
 
     if ('providers' in data && data.providers) {
-      const providers = data.providers as Record<string, { status: string; latency_ms: number }>;
-      const providerEntries = Object.entries(providers);
-      attrs.provider_count = providerEntries.length;
-      attrs.healthy_providers = providerEntries.filter(([, p]) => p.status === 'healthy').length;
-      attrs.degraded_providers = providerEntries.filter(([, p]) => p.status === 'degraded').length;
-      attrs.unhealthy_providers = providerEntries.filter(([, p]) => p.status === 'unhealthy').length;
+      const tally = tallyProviderHealth(data.providers);
+      attrs.provider_count = tally.providerCount;
+      attrs.healthy_providers = tally.healthyCount;
+      attrs.degraded_providers = tally.degradedCount;
+      attrs.unhealthy_providers = tally.unhealthyCount;
 
-      const latencies = providerEntries.map(([, p]) => p.latency_ms).filter((l): l is number => l != null);
-      if (latencies.length > 0) {
-        attrs.avg_latency_ms = latencies.reduce((sum, l) => sum + l, 0) / latencies.length;
+      if (tally.avgLatencyMs != null) {
+        attrs.avg_latency_ms = tally.avgLatencyMs;
       }
     }
 
@@ -187,7 +188,7 @@ class HealthObservability {
   /**
    * Record health metrics
    */
-  private recordMetrics(result: any, durationMs: number): void {
+  private recordMetrics(result: BridgeResult<BasicHealthResult> | HealthCheckResult, durationMs: number): void {
     const now = Date.now();
     const failoverState = getFailoverState();
     const monitorStats = getHealthMonitorStats();
@@ -201,25 +202,13 @@ class HealthObservability {
     let avgLatencyMs: number | null = null;
 
     if (result.ok && result.data && 'providers' in result.data) {
-      const providers = result.data.providers as Record<string, { status: string; latency_ms: number }>;
-      const providerEntries = Object.entries(providers);
-      providerCount = providerEntries.length;
-      healthyProviders = providerEntries.filter(([, p]) => p.status === 'healthy').length;
-      degradedProviders = providerEntries.filter(([, p]) => p.status === 'degraded').length;
-      unhealthyProviders = providerEntries.filter(([, p]) => p.status === 'unhealthy').length;
-
-      const latencies = providerEntries.map(([, p]) => p.latency_ms).filter((l): l is number => l != null);
-      if (latencies.length > 0) {
-        avgLatencyMs = latencies.reduce((sum, l) => sum + l, 0) / latencies.length;
-      }
-
-      if (unhealthyProviders / providerCount > 0.5) {
-        omnirouteStatus = 'unhealthy';
-      } else if (healthyProviders === providerCount) {
-        omnirouteStatus = 'healthy';
-      } else {
-        omnirouteStatus = 'degraded';
-      }
+      const tally = tallyProviderHealth(result.data.providers);
+      providerCount = tally.providerCount;
+      healthyProviders = tally.healthyCount;
+      degradedProviders = tally.degradedCount;
+      unhealthyProviders = tally.unhealthyCount;
+      avgLatencyMs = tally.avgLatencyMs;
+      omnirouteStatus = tally.status;
     } else if (result.ok) {
       omnirouteStatus = 'healthy';
     } else {

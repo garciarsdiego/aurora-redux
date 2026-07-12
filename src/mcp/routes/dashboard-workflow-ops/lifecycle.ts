@@ -20,7 +20,7 @@ import { requestWorkflowControl } from '../../../db/workflow-control.js';
 import { recordWorkflowCliPermissionMode } from '../../../db/workflow-cli-permission.js';
 import { withCliPermissionMode, type CliPermissionMode } from '../../../executors/cli.js';
 import type { Router } from '../types.js';
-import { badRequest, jsonOk, readJsonBody } from '../_shared.js';
+import { badRequest, jsonOk, readBodyOr400 } from '../_shared.js';
 import {
   dashboardCliPermissionMode,
   runDashboardDag,
@@ -183,36 +183,36 @@ export const lifecycleRouter: Router = async (req, url, res, ctx) => {
   }
   const wfStateMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/state$/);
   if (req.method === 'PATCH' && wfStateMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWorkflowState(decodeURIComponent(wfStateMatch[1] ?? ''), body, res);
     return true;
   }
   const wfAlertAckMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/alerts\/ack$/);
   if (req.method === 'POST' && wfAlertAckMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWorkflowAlertAcknowledge(decodeURIComponent(wfAlertAckMatch[1] ?? ''), body, res);
     return true;
   }
   const wfControlMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/control$/);
   if (req.method === 'POST' && wfControlMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWorkflowControl(decodeURIComponent(wfControlMatch[1] ?? ''), body, res);
     return true;
   }
   const wfRepeatMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/repeat$/);
   if (req.method === 'POST' && wfRepeatMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardWorkflowRepeat(decodeURIComponent(wfRepeatMatch[1] ?? ''), body, res);
     return true;
   }
   const wfResumeMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/resume$/);
   if (req.method === 'POST' && wfResumeMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardWorkflowResume(
       decodeURIComponent(wfResumeMatch[1] ?? ''),
       body,

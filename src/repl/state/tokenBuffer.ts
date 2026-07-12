@@ -15,6 +15,7 @@
 // (droppedFromCap) for debugging.
 
 import { TOKEN_BUFFER_CAP } from '../config.js';
+import { errorMessage } from '../utils/errors.js';
 
 type Listener = () => void;
 
@@ -40,13 +41,9 @@ class TokenBuffer {
 
   /** Append a multi-line text block (from cli_spawn NDJSON, etc.) atomically. */
   pushBlock(text: string): void {
-    if (text.length === 0) return;
-    if (this._tokens.length >= TOKEN_BUFFER_CAP) {
-      this._tokens.shift();
-      this._droppedFromCap++;
-    }
-    this._tokens.push(text);
-    this._scheduleFlush();
+    // Same mechanics as push — the separate name expresses the semantic intent
+    // (one atomic multi-line block instead of a single token).
+    this.push(text);
   }
 
   /** Clear buffer + metrics. Used when starting a new stream or test isolation. */
@@ -130,8 +127,7 @@ class TokenBuffer {
     for (const listener of this._listeners) {
       try { listener(); } catch (err) {
         // Listener errors are not the buffer's problem; surface to stderr.
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[tokenBuffer] listener error: ${msg}\n`);
+        process.stderr.write(`[tokenBuffer] listener error: ${errorMessage(err)}\n`);
       }
     }
   }
@@ -144,6 +140,3 @@ export const tokenBuffer = new TokenBuffer();
 export function resetTokenBuffer(): void {
   tokenBuffer.reset(null);
 }
-
-// Backwards-compat marker (M0 placeholder export).
-export const TOKEN_BUFFER_PLACEHOLDER = false;

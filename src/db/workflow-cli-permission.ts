@@ -1,22 +1,11 @@
 import type Database from 'better-sqlite3';
 
 import { insertEvent } from './persist.js';
+import { safeJsonObject } from './safe-json.js';
 import type { CliPermissionMode } from '../executors/cli.js';
 
 function parseMode(value: unknown): CliPermissionMode | undefined {
   return value === 'safe' || value === 'autonomous' ? value : undefined;
-}
-
-function safeJsonObject(raw: unknown): Record<string, unknown> {
-  if (typeof raw !== 'string' || raw.trim() === '') return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
 }
 
 function modeFromEventPayload(raw: unknown): CliPermissionMode | undefined {

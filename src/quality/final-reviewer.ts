@@ -1,6 +1,5 @@
 import type Database from 'better-sqlite3';
 import { insertEvent, setWorkflowDone } from '../db/persist.js';
-import { callOmnirouteWithUsage } from '../utils/omniroute-call.js';
 import {
   getFinalQualityReviewerModel,
   getFinalVisualQualityReviewerModel,
@@ -10,10 +9,8 @@ import type { ReviewImageAttachment } from '../utils/image-attachment.js';
 import type {
   FinalProductEvidenceBundle,
   PlaywrightHarnessEvidence,
-  ProductEvidenceIssue,
   QualityFixTaskDraft,
   QualityIssue,
-  QualityReviewOutcome,
   QualityReviewRow,
 } from './types.js';
 import {
@@ -26,6 +23,14 @@ import {
 } from './final-evidence.js';
 import { saveQualityReview } from './store.js';
 import { createQualityFixTasks } from './fix-tasks.js';
+import { qualityIssuesFromProductEvidence, safeParseJson } from './internal-utils.js';
+import {
+  defaultReviewerInvoker,
+  extractJsonObject,
+  normalizeIssues,
+  normalizeOutcome,
+  normalizeScore,
+} from './reviewer-parsing.js';
 import {
   runPlaywrightProductHarness,
   type PlaywrightHarnessInput,
@@ -84,63 +89,15 @@ const SYSTEM_PROMPT = [
   'Never include secrets. Prefer specific fix tasks over vague advice.',
 ].join('\n');
 
-function defaultInvoker(input: FinalQualityReviewInvokerInput): Promise<string> {
-  return callOmnirouteWithUsage({
-    systemPrompt: input.systemPrompt,
-    userPrompt: input.userPrompt,
-    model: input.model,
-    temperature: 0,
-    images: input.images,
-  }).then((result) => result.content);
-}
-
-function extractJsonObject(raw: string): Record<string, unknown> {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) return JSON.parse(trimmed) as Record<string, unknown>;
-  const fenced = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(trimmed)?.[1];
-  if (fenced) return JSON.parse(fenced) as Record<string, unknown>;
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start !== -1 && end > start) return JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>;
-  throw new Error('Final reviewer did not return a JSON object.');
-}
-
-function normalizeOutcome(value: unknown): QualityReviewOutcome {
-  return value === 'passed' || value === 'needs_fixes' || value === 'blocked'
-    ? value
-    : 'needs_fixes';
-}
-
-function normalizeSeverity(value: unknown): QualityIssue['severity'] {
-  return value === 'info' || value === 'warning' || value === 'error' || value === 'blocking'
-    ? value
-    : 'warning';
-}
-
-function normalizeIssues(raw: unknown): QualityIssue[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.map((item, index) => {
-    const issue = item && typeof item === 'object' ? item as Record<string, unknown> : {};
-    return {
-      severity: normalizeSeverity(issue['severity']),
-      code: typeof issue['code'] === 'string' && issue['code'].trim()
-        ? issue['code'].trim()
-        : `final_quality_issue_${index + 1}`,
-      origin: typeof issue['origin'] === 'string' && issue['origin'].trim()
-        ? issue['origin'].trim()
-        : 'final_reviewer',
-      message: typeof issue['message'] === 'string' && issue['message'].trim()
-        ? issue['message'].trim()
-        : 'Final reviewer found an unspecified quality issue.',
-      suggestedAction: typeof issue['suggestedAction'] === 'string' && issue['suggestedAction'].trim()
-        ? issue['suggestedAction'].trim()
-        : 'Inspect the final evidence bundle and add targeted fix tasks.',
-      safeContext: issue['safeContext'] && typeof issue['safeContext'] === 'object'
-        ? issue['safeContext'] as Record<string, unknown>
-        : {},
-    };
-  });
-}
+// Defaults applied by the shared reviewer-parsing helpers when the final
+// reviewer omits/garbles a field in its strict-JSON response.
+const ISSUE_DEFAULTS = {
+  codePrefix: 'final_quality_issue',
+  origin: 'final_reviewer',
+  message: 'Final reviewer found an unspecified quality issue.',
+  suggestedAction: 'Inspect the final evidence bundle and add targeted fix tasks.',
+};
+const SCORE_FALLBACKS = { passed: 0.85, needsFixes: 0.35 };
 
 function normalizeFixTasks(raw: unknown): QualityFixTaskDraft[] {
   if (!Array.isArray(raw)) return [];
@@ -168,60 +125,11 @@ function normalizeFixTasks(raw: unknown): QualityFixTaskDraft[] {
   });
 }
 
-function normalizeScore(value: unknown, outcome: QualityReviewOutcome): number {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    if (value < 0) return 0;
-    if (value > 1) return 1;
-    return value;
-  }
-  return outcome === 'passed' ? 0.85 : outcome === 'blocked' ? 0 : 0.35;
-}
-
-function issuesFromHarness(bundle: FinalProductEvidenceBundle): QualityIssue[] {
-  return bundle.productHarness.issues.map((issue) => ({
-    severity: issue.severity,
-    code: issue.code,
-    origin: 'product_harness',
-    message: issue.message,
-    suggestedAction: issue.suggestedAction,
-    safeContext: issue.safeContext ?? {},
-  }));
-}
-
-/**
- * F6-2: Translates ProductEvidenceIssue (used by harnesses) into the broader
- * QualityIssue shape with `origin = 'playwright_harness'`.
- */
-function issuesFromPlaywright(
-  productEvidence: ProductEvidenceIssue[],
-): QualityIssue[] {
-  return productEvidence.map((issue) => ({
-    severity: issue.severity,
-    code: issue.code,
-    origin: 'playwright_harness',
-    message: issue.message,
-    suggestedAction: issue.suggestedAction,
-    safeContext: issue.safeContext ?? {},
-  }));
-}
-
-function safeParseTaskInputJson(raw: string | null | undefined): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
 function workflowHasVisualReviewerProfile(db: Database.Database, workflowId: string): boolean {
   const rows = db
     .prepare(`SELECT input_json FROM tasks WHERE workflow_id = ?`)
     .all(workflowId) as Array<{ input_json: string | null }>;
-  return rows.some((row) => safeParseTaskInputJson(row.input_json)['reviewer_profile'] === 'visual');
+  return rows.some((row) => safeParseJson(row.input_json)['reviewer_profile'] === 'visual');
 }
 
 function modelSupportsImageInput(model: string): boolean {
@@ -252,6 +160,16 @@ interface PlaywrightHarnessAttempt {
   reason?: string;
 }
 
+/** Non-fatal skip: empty evidence with a human reason + machine reason code. */
+function skippedAttempt(evidenceReason: string, reason: string): PlaywrightHarnessAttempt {
+  return {
+    evidence: { status: 'skipped', reason: evidenceReason, mismatches: [], screenshotPaths: [] },
+    issues: [],
+    skipped: true,
+    reason,
+  };
+}
+
 /**
  * F6-2: Runs the Playwright harness when the workflow looks web-shaped.
  * Skipping is non-fatal: `skipped` is reported back to the caller, which
@@ -268,28 +186,13 @@ async function attemptPlaywrightHarness(
   if (mode === 'off') return null;
   const contract = loadArchitectureContractForWorkflow(db, workflowId);
   if (!contract) {
-    return {
-      evidence: { status: 'skipped', reason: 'no architecture contract', mismatches: [], screenshotPaths: [] },
-      issues: [],
-      skipped: true,
-      reason: 'no_architecture_contract',
-    };
+    return skippedAttempt('no architecture contract', 'no_architecture_contract');
   }
   if (!Array.isArray(contract.testSelectors) || contract.testSelectors.length === 0) {
-    return {
-      evidence: { status: 'skipped', reason: 'contract has no testSelectors', mismatches: [], screenshotPaths: [] },
-      issues: [],
-      skipped: true,
-      reason: 'no_test_selectors',
-    };
+    return skippedAttempt('contract has no testSelectors', 'no_test_selectors');
   }
   if (!isWebAppProject(contract.projectRoot)) {
-    return {
-      evidence: { status: 'skipped', reason: 'projectRoot is not a recognized web app', mismatches: [], screenshotPaths: [] },
-      issues: [],
-      skipped: true,
-      reason: 'not_web_app',
-    };
+    return skippedAttempt('projectRoot is not a recognized web app', 'not_web_app');
   }
 
   const run = runner ?? runPlaywrightProductHarness;
@@ -314,12 +217,7 @@ async function attemptPlaywrightHarness(
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return {
-      evidence: { status: 'skipped', reason: `harness threw: ${message}`, mismatches: [], screenshotPaths: [] },
-      issues: [],
-      skipped: true,
-      reason: 'harness_threw',
-    };
+    return skippedAttempt(`harness threw: ${message}`, 'harness_threw');
   }
 
   const evidence = buildPlaywrightHarnessEvidence(raw);
@@ -329,7 +227,8 @@ async function attemptPlaywrightHarness(
   const productIssues = playwrightHarnessIssues(evidence);
   return {
     evidence,
-    issues: issuesFromPlaywright(productIssues),
+    // F6-2: ProductEvidenceIssue -> QualityIssue with origin 'playwright_harness'.
+    issues: qualityIssuesFromProductEvidence(productIssues, 'playwright_harness'),
     skipped: false,
   };
 }
@@ -365,7 +264,7 @@ export async function runFinalQualityReview(
   const baseModel = input.model ?? getFinalQualityReviewerModel();
   const bundle = buildFinalProductEvidenceBundle(db, input.workflowId);
   const visualProfileRequested = workflowHasVisualReviewerProfile(db, input.workflowId);
-  const staticHarnessIssues = issuesFromHarness(bundle);
+  const staticHarnessIssues = qualityIssuesFromProductEvidence(bundle.productHarness.issues, 'product_harness');
 
   // F6-2: Run Playwright harness in parallel with the static harness logic.
   // It is gated on contract testSelectors and the web-app heuristic; if it
@@ -446,13 +345,13 @@ export async function runFinalQualityReview(
 
   let parsed: Record<string, unknown>;
   try {
-    const raw = await (input.invoker ?? defaultInvoker)({
+    const raw = await (input.invoker ?? defaultReviewerInvoker)({
       systemPrompt: SYSTEM_PROMPT,
       userPrompt: buildUserPrompt(bundle, reviewerImages.length > 0),
       model,
       ...(reviewerImages.length > 0 ? { images: reviewerImages } : {}),
     });
-    parsed = extractJsonObject(raw);
+    parsed = extractJsonObject(raw, 'Final reviewer did not return a JSON object.');
   } catch (err) {
     parsed = {
       outcome: input.mode === 'enforced' ? 'blocked' : 'skipped',
@@ -472,14 +371,14 @@ export async function runFinalQualityReview(
   }
 
   const outcome = normalizeOutcome(parsed['outcome']);
-  const issues = normalizeIssues(parsed['issues']);
+  const issues = normalizeIssues(parsed['issues'], ISSUE_DEFAULTS);
   const review = saveQualityReview(db, {
     workflowId: input.workflowId,
     scope: 'workflow_final',
     reviewerKind: 'robust_ai',
     reviewerModel: model,
     outcome,
-    score: parsed['score'] == null ? null : normalizeScore(parsed['score'], outcome),
+    score: parsed['score'] == null ? null : normalizeScore(parsed['score'], outcome, SCORE_FALLBACKS),
     issues,
     evidence: [
       {

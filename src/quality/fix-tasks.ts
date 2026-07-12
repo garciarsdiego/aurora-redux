@@ -7,6 +7,7 @@ import {
 } from '../db/persist.js';
 import type { Task, TaskKind } from '../types/index.js';
 import { parseQualityFixTasks } from './store.js';
+import { safeParseJson } from './internal-utils.js';
 import type { QualityReviewRow } from './types.js';
 
 const ALLOWED_FIX_KINDS = new Set<TaskKind>([
@@ -38,10 +39,16 @@ function existingFixTasksForReview(
   workflowId: string,
   reviewId: string,
 ): Task[] {
-  return loadWorkflowTasks(db, workflowId).filter((task) =>
-    typeof task.input_json === 'string' &&
-    task.input_json.includes(`"source_review_id":"${reviewId}"`),
-  );
+  // Parse input_json and check quality_fix.source_review_id instead of a
+  // substring match on the serialized JSON — the substring approach silently
+  // broke deduplication if the JSON was ever re-serialized with different
+  // spacing/key order (e.g. by a migration or UPDATE).
+  return loadWorkflowTasks(db, workflowId).filter((task) => {
+    const qualityFix = safeParseJson(task.input_json)['quality_fix'];
+    return !!qualityFix
+      && typeof qualityFix === 'object'
+      && (qualityFix as Record<string, unknown>)['source_review_id'] === reviewId;
+  });
 }
 
 function defaultDependsOn(tasks: Task[]): string[] {

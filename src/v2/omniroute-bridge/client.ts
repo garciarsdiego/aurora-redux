@@ -7,6 +7,7 @@ import {
   getOmnirouteUseResponsesApi,
   getOmnirouteFallbackModels,
 } from '../../utils/config.js';
+import { normalizeResponsesContent, extractResponsesDelta } from './responses.js';
 
 const TIMEOUT_MS = 5000;
 
@@ -427,6 +428,27 @@ export async function streamCompletionPartWithFallback(opts: _StreamPartOpts): P
   }
 }
 
+// Shared SSE scaffolding: yields the `data:` payloads of an event stream
+// (buffered '\n\n' framing). Chunk-specific parsing stays in each caller.
+async function* _iterateSseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+    for (const part of parts) {
+      for (const line of part.split('\n').filter((l) => l.startsWith('data:'))) {
+        yield line.replace(/^data:\s*/, '');
+      }
+    }
+  }
+}
+
 async function _streamChatCompletionPart({ config, model, messages, onToken }: _StreamPartOpts): Promise<StreamPartResult> {
   const response = await fetch(`${config.baseUrl}/chat/completions`, {
     method: 'POST',
@@ -438,30 +460,17 @@ async function _streamChatCompletionPart({ config, model, messages, onToken }: _
     throw new Error(`${response.status}: ${(await response.text()).slice(0, 300)}`);
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let finishReason: string | null = null;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      for (const line of part.split('\n').filter((l) => l.startsWith('data:'))) {
-        const data = line.replace(/^data:\s*/, '');
-        if (data === '[DONE]') return { finishReason, api: 'chat.completions' };
-        try {
-          const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }> };
-          const choice = chunk.choices?.[0] ?? {};
-          if (choice.finish_reason) finishReason = choice.finish_reason;
-          const text = choice.delta?.content ?? '';
-          if (text) onToken(text);
-        } catch { /* keepalive */ }
-      }
-    }
+  for await (const data of _iterateSseData(response.body)) {
+    if (data === '[DONE]') return { finishReason, api: 'chat.completions' };
+    try {
+      const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }> };
+      const choice = chunk.choices?.[0] ?? {};
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+      const text = choice.delta?.content ?? '';
+      if (text) onToken(text);
+    } catch { /* keepalive */ }
   }
   return { finishReason, api: 'chat.completions' };
 }
@@ -474,7 +483,7 @@ async function _streamResponsesCompletionPart({ config, model, messages, onToken
 
   const input = messages
     .filter((m) => m.role !== 'system')
-    .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: _normalizeResponsesContent(m.content) }));
+    .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: normalizeResponsesContent(m.content) }));
 
   const response = await fetch(`${config.baseUrl}/responses`, {
     method: 'POST',
@@ -486,61 +495,21 @@ async function _streamResponsesCompletionPart({ config, model, messages, onToken
     throw new Error(`responses ${response.status}: ${(await response.text()).slice(0, 300)}`);
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let finishReason: string | null = null;
   let usage: unknown = null;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      for (const line of part.split('\n').filter((l) => l.startsWith('data:'))) {
-        const data = line.replace(/^data:\s*/, '');
-        if (data === '[DONE]') return { finishReason, api: 'responses', usage };
-        try {
-          const event = JSON.parse(data) as Record<string, unknown>;
-          const token = _extractResponsesDelta(event);
-          if (token) onToken(token);
-          const resp = event['response'] as Record<string, unknown> | undefined;
-          if (resp?.['status'] === 'completed') finishReason = 'stop';
-          usage = resp?.['usage'] ?? event['usage'] ?? usage;
-        } catch { /* SSE keepalive */ }
-      }
-    }
+  for await (const data of _iterateSseData(response.body)) {
+    if (data === '[DONE]') return { finishReason, api: 'responses', usage };
+    try {
+      const event = JSON.parse(data) as Record<string, unknown>;
+      const token = extractResponsesDelta(event);
+      if (token) onToken(token);
+      const resp = event['response'] as Record<string, unknown> | undefined;
+      if (resp?.['status'] === 'completed') finishReason = 'stop';
+      usage = resp?.['usage'] ?? event['usage'] ?? usage;
+    } catch { /* SSE keepalive */ }
   }
   return { finishReason, api: 'responses', usage };
-}
-
-function _normalizeResponsesContent(
-  content: ChatMessage['content'],
-): Array<{ type: string; text?: string; image_url?: string }> {
-  if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (part.type === 'text') return { type: 'input_text', text: part.text ?? '' };
-      if (part.type === 'image_url') {
-        const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url ?? '';
-        return { type: 'input_image', image_url: url };
-      }
-      return { type: 'input_text', text: JSON.stringify(part) };
-    });
-  }
-  return [{ type: 'input_text', text: String(content ?? '') }];
-}
-
-function _extractResponsesDelta(event: Record<string, unknown>): string {
-  if (event['type'] === 'response.output_text.delta') return String(event['delta'] ?? '');
-  if (event['type'] === 'response.output_item.delta') return String((event['delta'] as Record<string, unknown>)?.['text'] ?? '');
-  if (event['type'] === 'response.content_part.delta') {
-    const d = event['delta'];
-    return typeof d === 'string' ? d : String((d as Record<string, unknown>)?.['text'] ?? '');
-  }
-  const d = event['delta'] as Record<string, unknown> | undefined;
-  return String(d?.['text'] ?? event['output_text_delta'] ?? '');
 }
 
 // ── Health Check Functions ──────────────────────────────────────────────────────
@@ -551,7 +520,11 @@ function basicHealthFallback(): BasicHealthResult {
   return { status: 'error', timestamp: new Date().toISOString() };
 }
 
-function detailedHealthFallback(): DetailedHealthResult {
+/**
+ * Empty DetailedHealthResult used as fallback when a health check fails.
+ * Shared with health-cache and health-monitor to avoid duplicating the literal.
+ */
+export function detailedHealthFallback(): DetailedHealthResult {
   return {
     status: 'error',
     timestamp: new Date().toISOString(),
@@ -560,12 +533,55 @@ function detailedHealthFallback(): DetailedHealthResult {
   };
 }
 
+export interface ProviderHealthTally {
+  providerCount: number;
+  healthyCount: number;
+  degradedCount: number;
+  unhealthyCount: number;
+  avgLatencyMs: number | null;
+  /** Derived status: >50% unhealthy → unhealthy; all healthy → healthy; otherwise degraded. */
+  status: 'healthy' | 'degraded' | 'unhealthy';
+}
+
 /**
- * Basic health check - returns quickly with minimal information
- * Use for liveness probes
+ * Tally provider health counts, average latency and the derived overall
+ * status. Shared by failover, health-monitor and health-observability so the
+ * ">50% unhealthy" rule lives in a single place.
  */
-export async function checkBasicHealth(): Promise<BridgeResult<BasicHealthResult>> {
-  const url = `${getOmnirouteUrl()}/api/health`;
+export function tallyProviderHealth(
+  providers: Record<string, { status: string; latency_ms?: number }> = {},
+): ProviderHealthTally {
+  const entries = Object.entries(providers);
+  const providerCount = entries.length;
+  const healthyCount = entries.filter(([, p]) => p.status === 'healthy').length;
+  const degradedCount = entries.filter(([, p]) => p.status === 'degraded').length;
+  const unhealthyCount = entries.filter(([, p]) => p.status === 'unhealthy').length;
+
+  const latencies = entries.map(([, p]) => p.latency_ms).filter((l): l is number => l != null);
+  const avgLatencyMs = latencies.length > 0
+    ? latencies.reduce((sum, l) => sum + l, 0) / latencies.length
+    : null;
+
+  let status: 'healthy' | 'degraded' | 'unhealthy';
+  if (providerCount > 0 && unhealthyCount / providerCount > 0.5) {
+    status = 'unhealthy';
+  } else if (healthyCount === providerCount) {
+    status = 'healthy';
+  } else {
+    status = 'degraded';
+  }
+
+  return { providerCount, healthyCount, degradedCount, unhealthyCount, avgLatencyMs, status };
+}
+
+// GET counterpart of `call<T>` above, used by the health endpoints (shorter
+// timeout, error string without the bridge prefix — preserved as-is).
+async function getJson<T>(
+  endpoint: string,
+  fallback: T,
+  label: string,
+): Promise<BridgeResult<T>> {
+  const url = `${getOmnirouteUrl()}${endpoint}`;
   const apiKey = getOmnirouteApiKey();
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -579,21 +595,29 @@ export async function checkBasicHealth(): Promise<BridgeResult<BasicHealthResult
 
     if (!res.ok) {
       const text = await res.text().catch(() => '<unreadable>');
-      logBridgeError('basic_health', res.status, text);
-      return { ok: false, data: basicHealthFallback(), error: `HTTP ${res.status}` };
+      logBridgeError(label, res.status, text);
+      return { ok: false, data: fallback, error: `HTTP ${res.status}` };
     }
 
-    const data = await res.json() as BasicHealthResult;
+    const data = await res.json() as T;
     return { ok: true, data };
   } catch (err) {
     const isTimeout =
       err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError');
     const msg = isTimeout
-      ? `basic_health: timeout after ${HEALTH_TIMEOUT_MS}ms`
-      : `basic_health: ${err instanceof Error ? err.message : String(err)}`;
+      ? `${label}: timeout after ${HEALTH_TIMEOUT_MS}ms`
+      : `${label}: ${err instanceof Error ? err.message : String(err)}`;
     console.error(`[omniroute-bridge] ${msg}`);
-    return { ok: false, data: basicHealthFallback(), error: msg };
+    return { ok: false, data: fallback, error: msg };
   }
+}
+
+/**
+ * Basic health check - returns quickly with minimal information
+ * Use for liveness probes
+ */
+export async function checkBasicHealth(): Promise<BridgeResult<BasicHealthResult>> {
+  return getJson<BasicHealthResult>('/api/health', basicHealthFallback(), 'basic_health');
 }
 
 /**
@@ -601,41 +625,5 @@ export async function checkBasicHealth(): Promise<BridgeResult<BasicHealthResult
  * Use for health monitoring and failover decisions
  */
 export async function checkDetailedHealth(): Promise<HealthCheckResult> {
-  const url = `${getOmnirouteUrl()}/api/monitoring/health`;
-  const apiKey = getOmnirouteApiKey();
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-
-  try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers,
-      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '<unreadable>');
-      logBridgeError('detailed_health', res.status, text);
-      return {
-        ok: false,
-        data: detailedHealthFallback(),
-        error: `HTTP ${res.status}`,
-      };
-    }
-
-    const data = await res.json() as DetailedHealthResult;
-    return { ok: true, data };
-  } catch (err) {
-    const isTimeout =
-      err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError');
-    const msg = isTimeout
-      ? `detailed_health: timeout after ${HEALTH_TIMEOUT_MS}ms`
-      : `detailed_health: ${err instanceof Error ? err.message : String(err)}`;
-    console.error(`[omniroute-bridge] ${msg}`);
-    return {
-      ok: false,
-      data: detailedHealthFallback(),
-      error: msg,
-    };
-  }
+  return getJson<DetailedHealthResult>('/api/monitoring/health', detailedHealthFallback(), 'detailed_health');
 }

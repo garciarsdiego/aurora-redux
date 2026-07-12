@@ -4,6 +4,7 @@
 import type { SlashCommand, SlashResult, ReplCtx } from '../types.js';
 import { loadWorkflowById } from '../../../db/persist.js';
 import { resumeWorkflow } from '../../../brain/executor/resume.js';
+import { toError } from '../../utils/errors.js';
 
 interface ResumeArgs {
   wf_id: string;
@@ -44,7 +45,7 @@ export const resumeCommand: SlashCommand<ResumeArgs> = {
     try {
       workflow = loadWorkflowById(ctx.db, args.wf_id);
     } catch (err) {
-      return { error: err instanceof Error ? err : new Error(String(err)) };
+      return { error: toError(err) };
     }
     if (!workflow) {
       return { error: new Error(`Workflow not found: ${args.wf_id}`) };
@@ -61,7 +62,7 @@ export const resumeCommand: SlashCommand<ResumeArgs> = {
         events: [{ type: 'workflow.resumed', payload: { workflow_id: finalWf.id, status: finalWf.status } }],
       };
     } catch (err) {
-      return { error: err instanceof Error ? err : new Error(String(err)) };
+      return { error: toError(err) };
     }
   },
 };

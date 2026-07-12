@@ -1,6 +1,5 @@
 import type Database from 'better-sqlite3';
 import { insertEvent, setTaskFailed } from '../db/persist.js';
-import { callOmnirouteWithUsage } from '../utils/omniroute-call.js';
 import {
   getTaskQualityReviewerModel,
   type QualityGateMode,
@@ -8,12 +7,18 @@ import {
 import type {
   QualityEvidenceRef,
   QualityIssue,
-  QualityReviewOutcome,
   QualityReviewRow,
   TaskQualityEvidenceBundle,
 } from './types.js';
 import { buildTaskQualityEvidenceBundle } from './evidence.js';
 import { saveQualityReview } from './store.js';
+import {
+  defaultReviewerInvoker,
+  extractJsonObject,
+  normalizeIssues,
+  normalizeOutcome,
+  normalizeScore,
+} from './reviewer-parsing.js';
 
 export interface LightTaskQualityReviewInvokerInput {
   systemPrompt: string;
@@ -52,14 +57,15 @@ const SYSTEM_PROMPT = [
   'Never include secrets. Do not invent files that are not in the evidence bundle.',
 ].join('\n');
 
-function defaultInvoker(input: LightTaskQualityReviewInvokerInput): Promise<string> {
-  return callOmnirouteWithUsage({
-    systemPrompt: input.systemPrompt,
-    userPrompt: input.userPrompt,
-    model: input.model,
-    temperature: 0,
-  }).then((result) => result.content);
-}
+// Defaults applied by the shared reviewer-parsing helpers when the light
+// reviewer omits/garbles a field in its strict-JSON response.
+const ISSUE_DEFAULTS = {
+  codePrefix: 'quality_issue',
+  origin: 'reviewer',
+  message: 'Reviewer flagged this task without a specific message.',
+  suggestedAction: 'Inspect the evidence bundle and retry or create a targeted fix task.',
+};
+const SCORE_FALLBACKS = { passed: 0.8, needsFixes: 0.4 };
 
 function evidenceRefsFromBundle(bundle: TaskQualityEvidenceBundle): QualityEvidenceRef[] {
   return [
@@ -102,67 +108,6 @@ function issueFromFilesystem(bundle: TaskQualityEvidenceBundle): QualityIssue {
       evidence: bundle.filesystem.evidence,
     },
   };
-}
-
-function extractJsonObject(raw: string): Record<string, unknown> {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-    return JSON.parse(trimmed) as Record<string, unknown>;
-  }
-  const fenced = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(trimmed)?.[1];
-  if (fenced) return JSON.parse(fenced) as Record<string, unknown>;
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    return JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>;
-  }
-  throw new Error('Reviewer did not return a JSON object.');
-}
-
-function normalizeOutcome(value: unknown): QualityReviewOutcome {
-  return value === 'passed' || value === 'needs_fixes' || value === 'blocked'
-    ? value
-    : 'needs_fixes';
-}
-
-function normalizeSeverity(value: unknown): QualityIssue['severity'] {
-  return value === 'info' || value === 'warning' || value === 'error' || value === 'blocking'
-    ? value
-    : 'warning';
-}
-
-function normalizeIssues(raw: unknown): QualityIssue[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.map((item, index) => {
-    const issue = item && typeof item === 'object' ? item as Record<string, unknown> : {};
-    return {
-      severity: normalizeSeverity(issue['severity']),
-      code: typeof issue['code'] === 'string' && issue['code'].trim()
-        ? issue['code'].trim()
-        : `quality_issue_${index + 1}`,
-      origin: typeof issue['origin'] === 'string' && issue['origin'].trim()
-        ? issue['origin'].trim()
-        : 'reviewer',
-      message: typeof issue['message'] === 'string' && issue['message'].trim()
-        ? issue['message'].trim()
-        : 'Reviewer flagged this task without a specific message.',
-      suggestedAction: typeof issue['suggestedAction'] === 'string' && issue['suggestedAction'].trim()
-        ? issue['suggestedAction'].trim()
-        : 'Inspect the evidence bundle and retry or create a targeted fix task.',
-      safeContext: issue['safeContext'] && typeof issue['safeContext'] === 'object'
-        ? issue['safeContext'] as Record<string, unknown>
-        : {},
-    };
-  });
-}
-
-function normalizeScore(value: unknown, outcome: QualityReviewOutcome): number {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    if (value < 0) return 0;
-    if (value > 1) return 1;
-    return value;
-  }
-  return outcome === 'passed' ? 0.8 : outcome === 'blocked' ? 0 : 0.4;
 }
 
 function buildUserPrompt(bundle: TaskQualityEvidenceBundle): string {
@@ -214,12 +159,12 @@ export async function runLightTaskQualityReview(
 
   let parsed: Record<string, unknown>;
   try {
-    const raw = await (input.invoker ?? defaultInvoker)({
+    const raw = await (input.invoker ?? defaultReviewerInvoker)({
       systemPrompt: SYSTEM_PROMPT,
       userPrompt: buildUserPrompt(bundle),
       model,
     });
-    parsed = extractJsonObject(raw);
+    parsed = extractJsonObject(raw, 'Reviewer did not return a JSON object.');
   } catch (err) {
     parsed = {
       outcome: input.mode === 'enforced' ? 'blocked' : 'skipped',
@@ -238,7 +183,7 @@ export async function runLightTaskQualityReview(
   }
 
   const outcome = normalizeOutcome(parsed['outcome']);
-  const issues = normalizeIssues(parsed['issues']);
+  const issues = normalizeIssues(parsed['issues'], ISSUE_DEFAULTS);
   const review = saveQualityReview(db, {
     workflowId: input.workflowId,
     taskId: input.taskId,
@@ -246,7 +191,7 @@ export async function runLightTaskQualityReview(
     reviewerKind: 'light_ai',
     reviewerModel: model,
     outcome,
-    score: parsed['score'] == null ? null : normalizeScore(parsed['score'], outcome),
+    score: parsed['score'] == null ? null : normalizeScore(parsed['score'], outcome, SCORE_FALLBACKS),
     issues,
     evidence,
     runMode: input.mode === 'enforced' ? 'approved-run' : 'dry-run',

@@ -27,6 +27,7 @@ import {
   type ModelKind,
   type ProviderInfo,
 } from '../services/modelCatalog.js';
+import { errorMessage } from '../utils/errors.js';
 
 export type ModelTarget = 'DECOMPOSER' | 'TASK' | 'REVIEWER' | 'CONSOLIDATOR' | 'ALL' | 'RESET';
 
@@ -74,6 +75,8 @@ interface TargetRow {
 interface ModelPickerProps {
   readonly onClose: () => void;
   readonly onAppliedNotify?: (msg: string) => void;
+  /** Pre-targeted role (from `/model <target>`) — opens at the provider step. */
+  readonly initialTarget?: Exclude<ModelTarget, 'RESET'>;
 }
 
 type Step =
@@ -169,8 +172,11 @@ function buildTargetRows(): readonly TargetRow[] {
 export function ModelPickerModal({
   onClose,
   onAppliedNotify,
+  initialTarget,
 }: ModelPickerProps): React.ReactElement {
-  const [step, setStep] = useState<Step>({ kind: 'targets' });
+  const [step, setStep] = useState<Step>(
+    initialTarget ? { kind: 'providers', target: initialTarget } : { kind: 'targets' },
+  );
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [tick, setTick] = useState(0); // bumps after apply to refresh target rows
@@ -202,7 +208,7 @@ export function ModelPickerModal({
     loadCatalog().then(
       (cat) => { if (!cancelled) setCatalog(cat); },
       (err: unknown) => {
-        if (!cancelled) setCatalogError(err instanceof Error ? err.message : String(err));
+        if (!cancelled) setCatalogError(errorMessage(err));
       },
     );
     return () => { cancelled = true; };

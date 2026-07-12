@@ -80,7 +80,7 @@ export async function orchestrateConsolidation(
     return {
       summary: buildFallbackSummary(child_outcomes),
       conflicts: [],
-      gaps: child_outcomes.map((o) => `${o.id}: ${o.status}`),
+      gaps: formatOutcomeStatusLines(child_outcomes),
       files_written_total: [],
       consolidation_mode: 'fallback',
       error: 'All child workflows failed',
@@ -96,6 +96,30 @@ export async function orchestrateConsolidation(
     files_written_total: [],
     consolidation_mode: 'fallback',
   };
+}
+
+/**
+ * Format the "Failed/cancelled agents" block shared by the consolidated and
+ * fallback summaries.
+ */
+function formatFailedAgents(
+  failed: ConsolidationOrchestratorInput['child_outcomes'],
+): string {
+  let block = `**Failed/cancelled agents (${failed.length}):**\n`;
+  for (const outcome of failed) {
+    block += `- ${outcome.id}: ${outcome.status} (${outcome.error ?? 'no error'})\n`;
+  }
+  return block;
+}
+
+/**
+ * One `id: status` line per outcome — shared by gap detection and the
+ * all-failed fallback path.
+ */
+function formatOutcomeStatusLines(
+  outcomes: ConsolidationOrchestratorInput['child_outcomes'],
+): string[] {
+  return outcomes.map((o) => `${o.id}: ${o.status}`);
 }
 
 /**
@@ -118,10 +142,7 @@ function buildConsolidatedSummary(
   }
 
   if (failed.length > 0) {
-    summary += `**Failed/cancelled agents (${failed.length}):**\n`;
-    for (const outcome of failed) {
-      summary += `- ${outcome.id}: ${outcome.status} (${outcome.error ?? 'no error'})\n`;
-    }
+    summary += formatFailedAgents(failed);
   }
 
   return summary;
@@ -134,14 +155,7 @@ function buildFallbackSummary(
   outcomes: ConsolidationOrchestratorInput['child_outcomes'],
 ): string {
   const failed = outcomes.filter((o) => o.status !== 'completed');
-
-  let summary = `Multi-agent workflow execution complete.\n\n`;
-  summary += `**Failed/cancelled agents (${failed.length}):**\n`;
-  for (const outcome of failed) {
-    summary += `- ${outcome.id}: ${outcome.status} (${outcome.error ?? 'no error'})\n`;
-  }
-
-  return summary;
+  return `Multi-agent workflow execution complete.\n\n${formatFailedAgents(failed)}`;
 }
 
 /**
@@ -149,16 +163,8 @@ function buildFallbackSummary(
  * This is a simplified version; full conflict detection requires LLM analysis.
  */
 function detectConflicts(
-  outcomes: ConsolidationOrchestratorInput['child_outcomes'],
-): Array<{
-  topic: string;
-  task_a: string;
-  task_a_claim: string;
-  task_b: string;
-  task_b_claim: string;
-  resolution: string;
-  reasoning: string;
-}> {
+  _outcomes: ConsolidationOrchestratorInput['child_outcomes'],
+): ConsolidationOrchestratorResult['conflicts'] {
   // For now, return empty array
   // Full conflict detection requires LLM analysis via consolidator persona
   return [];
@@ -170,14 +176,7 @@ function detectConflicts(
 function detectGaps(
   outcomes: ConsolidationOrchestratorInput['child_outcomes'],
 ): string[] {
-  const gaps: string[] = [];
-  const failed = outcomes.filter((o) => o.status !== 'completed');
-  
-  for (const outcome of failed) {
-    gaps.push(`${outcome.id}: ${outcome.status}`);
-  }
-
-  return gaps;
+  return formatOutcomeStatusLines(outcomes.filter((o) => o.status !== 'completed'));
 }
 
 /**
@@ -191,11 +190,13 @@ export function extractConsolidationFromMetadata(
 
   try {
     const metadata = JSON.parse(workflow.metadata) as Record<string, unknown>;
-    const consolidation = metadata['consolidation'] as ConsolidationOrchestratorResult | undefined;
+    const consolidation = metadata['consolidation'];
 
-    if (!consolidation) return null;
+    if (!consolidation || typeof consolidation !== 'object' || Array.isArray(consolidation)) {
+      return null;
+    }
 
-    return consolidation;
+    return consolidation as ConsolidationOrchestratorResult;
   } catch {
     return null;
   }

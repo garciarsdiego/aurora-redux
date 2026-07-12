@@ -54,9 +54,17 @@ function readVersion(): VersionInfo {
   for (const c of candidates) {
     try {
       const raw = readFileSync(c, 'utf8');
-      const parsed = JSON.parse(raw) as VersionInfo;
+      const parsed = JSON.parse(raw) as Partial<VersionInfo>;
       if (parsed && typeof parsed.version === 'string') {
-        return parsed;
+        // Project only the VersionInfo fields — the last candidate is
+        // package.json, and returning the parsed object whole would leak
+        // scripts/dependencies into `structured` and the JSON output.
+        return {
+          version: parsed.version,
+          ...(typeof parsed.commit === 'string' ? { commit: parsed.commit } : {}),
+          ...(typeof parsed.builtAt === 'string' ? { builtAt: parsed.builtAt } : {}),
+          ...(typeof parsed.node === 'string' ? { node: parsed.node } : {}),
+        };
       }
     } catch {
       // try next candidate

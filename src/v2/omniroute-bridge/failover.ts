@@ -6,7 +6,7 @@
  * and provides fallback strategies.
  */
 
-import { checkBasicHealth, checkDetailedHealth, type HealthCheckResult, type DetailedHealthResult, type ProviderHealthStatus } from './client.js';
+import { checkDetailedHealth, tallyProviderHealth, type HealthCheckResult, type DetailedHealthResult, type ProviderHealthStatus } from './client.js';
 import { getCachedHealth, getCacheStats } from './health-cache.js';
 import { logError, logWarn, logInfo } from '../observability/log-aggregation.js';
 
@@ -135,23 +135,17 @@ class FailoverManager {
       return 'unhealthy';
     }
 
-    const providers = health.providers || {};
-    const providerEntries = Object.entries(providers);
+    const tally = tallyProviderHealth(health.providers || {});
 
-    if (providerEntries.length === 0) {
+    if (tally.providerCount === 0) {
       // No provider data - assume healthy if overall status is ok
       return health.status === 'ok' ? 'healthy' : 'unhealthy';
     }
 
-    const healthyCount = providerEntries.filter(([, status]) => status.status === 'healthy').length;
-    const degradedCount = providerEntries.filter(([, status]) => status.status === 'degraded').length;
-    const unhealthyCount = providerEntries.filter(([, status]) => status.status === 'unhealthy').length;
-    const totalProviders = providerEntries.length;
-
-    const healthPercentage = (healthyCount / totalProviders) * 100;
+    const healthPercentage = (tally.healthyCount / tally.providerCount) * 100;
 
     // If more than 50% are unhealthy, overall status is unhealthy
-    if (unhealthyCount / totalProviders > 0.5) {
+    if (tally.unhealthyCount / tally.providerCount > 0.5) {
       return 'unhealthy';
     }
 
@@ -161,7 +155,7 @@ class FailoverManager {
     }
 
     // If any are degraded but overall is healthy, mark as degraded
-    if (degradedCount > 0) {
+    if (tally.degradedCount > 0) {
       return 'degraded';
     }
 
@@ -208,16 +202,12 @@ class FailoverManager {
   private shouldTriggerFailover(now: number): boolean {
     this.cleanOldFailures(now);
 
-    // Check if we've exceeded the failure threshold
-    if (this.state.consecutiveFailures >= this.config.failureThreshold) {
-      if (!this.state.isFailoverActive) {
-        this.activateFailover(now);
-      }
-      return true;
-    }
-
-    // Also check total failures in window
-    if (this.failureHistory.length >= this.config.failureThreshold) {
+    // Trigger when either the consecutive-failure threshold or the
+    // total-failures-in-window threshold is exceeded
+    if (
+      this.state.consecutiveFailures >= this.config.failureThreshold ||
+      this.failureHistory.length >= this.config.failureThreshold
+    ) {
       if (!this.state.isFailoverActive) {
         this.activateFailover(now);
       }

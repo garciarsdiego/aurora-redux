@@ -13,59 +13,60 @@ import type {
   OmniRouteRateLimitInfo,
 } from './types.js';
 import { TokenBucketLimiter } from './token-bucket.js';
+import { MetricsTracker } from './metrics-tracker.js';
 
 export class AdaptiveLimiter {
   private readonly baseRpm: number;
   private readonly burstMultiplier: number;
-  private readonly syncIntervalMs: number;
   private readonly now: () => number;
   private limiter: TokenBucketLimiter;
   private currentRpm: number;
-  private lastSyncMs: number;
   private omniRouteLimits: Map<string, OmniRouteRateLimitInfo>;
-  private metrics: Map<string, RateLimitMetrics>;
+  private tracker: MetricsTracker;
 
   constructor(opts: AdaptiveLimiterOptions) {
     this.baseRpm = Math.max(1, opts.baseRpm);
     this.burstMultiplier = opts.burstMultiplier ?? 1;
-    this.syncIntervalMs = opts.syncIntervalMs ?? 60_000; // Default 1 minute
     this.now = opts.now ?? Date.now;
 
     this.currentRpm = this.baseRpm;
-    this.limiter = new TokenBucketLimiter({
+    this.limiter = this.buildLimiter();
+
+    this.omniRouteLimits = new Map();
+    this.tracker = new MetricsTracker(this.now, () => ({
+      remaining: this.currentRpm,
+      limit: this.currentRpm,
+    }));
+  }
+
+  /**
+   * Build a token-bucket limiter sized for the current adaptive RPM.
+   */
+  private buildLimiter(): TokenBucketLimiter {
+    return new TokenBucketLimiter({
       rpm: this.currentRpm,
       burst: Math.floor(this.currentRpm * this.burstMultiplier),
       now: this.now,
     });
-
-    this.lastSyncMs = this.now();
-    this.omniRouteLimits = new Map();
-    this.metrics = new Map();
   }
 
   /**
    * Check if a request for the given key is allowed.
-   * Automatically syncs with OmniRoute if sync interval has passed.
+   * Note: limits are pushed externally via updateOmniRouteLimit()
+   * (see config-sync.ts) — there is no self-sync on check.
    */
   check(key: string): RateLimitDecision {
-    // Auto-sync if interval has passed
-    const currentMs = this.now();
-    if (currentMs - this.lastSyncMs >= this.syncIntervalMs) {
-      this.syncLimits();
-      this.lastSyncMs = currentMs;
-    }
-
     // Update metrics
-    this.updateMetrics(key);
+    this.tracker.check(key);
 
     // Delegate to token-bucket limiter
     const decision = this.limiter.check(key);
 
     // Update metrics based on decision
     if (decision.allowed) {
-      this.recordAllowance(key, decision.remaining ?? 0);
+      this.tracker.allow(key, decision.remaining ?? 0);
     } else {
-      this.recordDenial(key);
+      this.tracker.deny(key);
     }
 
     // Add adaptive metadata
@@ -102,11 +103,7 @@ export class AdaptiveLimiter {
       }
 
       // Update underlying limiter with new RPM
-      this.limiter = new TokenBucketLimiter({
-        rpm: this.currentRpm,
-        burst: Math.floor(this.currentRpm * this.burstMultiplier),
-        now: this.now,
-      });
+      this.limiter = this.buildLimiter();
     }
   }
 
@@ -114,18 +111,7 @@ export class AdaptiveLimiter {
    * Get metrics for a specific key.
    */
   getMetrics(key: string): RateLimitMetrics {
-    const metrics = this.metrics.get(key);
-    if (!metrics) {
-      return {
-        totalChecks: 0,
-        allowed: 0,
-        denied: 0,
-        remaining: this.currentRpm,
-        limit: this.currentRpm,
-        lastCheckMs: this.now(),
-      };
-    }
-    return { ...metrics };
+    return this.tracker.get(key);
   }
 
   /**
@@ -147,56 +133,9 @@ export class AdaptiveLimiter {
    */
   reset(): void {
     this.currentRpm = this.baseRpm;
-    this.limiter = new TokenBucketLimiter({
-      rpm: this.currentRpm,
-      burst: Math.floor(this.currentRpm * this.burstMultiplier),
-      now: this.now,
-    });
-    this.lastSyncMs = this.now();
+    this.limiter = this.buildLimiter();
     this.omniRouteLimits.clear();
-    this.metrics.clear();
-  }
-
-  /**
-   * Force a sync with OmniRoute (called by config sync).
-   */
-  private syncLimits(): void {
-    // In a real implementation, this would fetch from OmniRoute health endpoint
-    // For now, we rely on updateOmniRouteLimit() being called externally
-    // This is a no-op placeholder for future enhancement
-  }
-
-  private updateMetrics(key: string): void {
-    const existing = this.metrics.get(key);
-    if (!existing) {
-      this.metrics.set(key, {
-        totalChecks: 1,
-        allowed: 0,
-        denied: 0,
-        remaining: this.currentRpm,
-        limit: this.currentRpm,
-        lastCheckMs: this.now(),
-      });
-      return;
-    }
-    existing.totalChecks += 1;
-    existing.lastCheckMs = this.now();
-  }
-
-  private recordAllowance(key: string, remaining: number): void {
-    const metrics = this.metrics.get(key);
-    if (metrics) {
-      metrics.allowed += 1;
-      metrics.remaining = remaining;
-    }
-  }
-
-  private recordDenial(key: string): void {
-    const metrics = this.metrics.get(key);
-    if (metrics) {
-      metrics.denied += 1;
-      metrics.remaining = 0;
-    }
+    this.tracker.reset();
   }
 }
 

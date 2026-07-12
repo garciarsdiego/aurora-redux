@@ -10,6 +10,33 @@ import type { EvaluationOutput, AgentEvaluator } from './framework.js';
 import type { Dag } from '../../../types/index.js';
 import { validateDag } from '../../../brain/dag-validator.js';
 
+/**
+ * Result shape produced by simulateOrchestration (local typing only —
+ * TestCase.input/expectedOutput remain `any` in the exported types).
+ */
+interface OrchestrationResult {
+  executionOrder: string[];
+  parallelGroups: string[][];
+  criticalPath: string[];
+  maxParallelism: number;
+  success: boolean;
+  totalDuration: string;
+  executionStrategy: 'parallel' | 'sequential';
+}
+
+/** Expected `execution` block of a test case's expectedOutput (local typing only). */
+interface ExpectedExecution {
+  success?: boolean;
+  executionOrder?: string[];
+  executionStrategy?: string;
+  parallelTasks?: string[];
+  criticalPath?: string[];
+  errorHandling?: {
+    detectedFailure?: boolean;
+    retryAttempted?: boolean;
+  };
+}
+
 export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Evaluate a test case using the Omniforge orchestration logic
@@ -25,12 +52,12 @@ export class OrchestratorEvaluator implements AgentEvaluator {
       const validation = validateDag(dag);
 
       // Simulate orchestration (execution order calculation)
-      const orchestrationResult = this.simulateOrchestration(dag, testCase.input.context);
+      const orchestrationResult = this.simulateOrchestration(dag);
 
       const duration = Date.now() - startTime;
 
       // Calculate cost (minimal for orchestration - mostly CPU)
-      const cost = this.estimateCost(dag.tasks.length, duration);
+      const cost = this.estimateCost(duration);
 
       // Token usage is minimal for orchestration (no LLM calls)
       const tokenUsage = 0;
@@ -61,15 +88,13 @@ export class OrchestratorEvaluator implements AgentEvaluator {
         error: validationResult.isValid ? undefined : validationResult.error
       };
 
-    } catch (error: any) {
-      const duration = Date.now() - startTime;
-
+    } catch (error) {
       return {
         success: false,
         output: null,
         cost: 0,
         tokenUsage: 0,
-        error: error.message
+        error: error instanceof Error ? error.message : String(error)
       };
     }
   }
@@ -95,11 +120,11 @@ export class OrchestratorEvaluator implements AgentEvaluator {
       };
     }
 
-    const orchestration = result.output.orchestration;
+    const orchestration = result.output.orchestration as OrchestrationResult;
     const dagValidation = result.output.dagValidation;
 
     // Dependency Resolution - are dependencies resolved correctly?
-    const dependencyResolution = this.calculateDependencyResolution(orchestration);
+    const dependencyResolution = this.calculateDependencyResolution(orchestration, result.output.dag as Dag);
 
     // Parallelization Efficiency - are independent tasks parallelized?
     const parallelizationEfficiency = this.calculateParallelizationEfficiency(orchestration, testCase);
@@ -130,7 +155,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
     const accuracy = dagValidation.valid ? 1.0 : 0.0;
 
     // Completeness (has expected elements)
-    const completeness = this.calculateCompleteness(orchestration, testCase.expectedOutput);
+    const completeness = this.calculateCompleteness(orchestration);
 
     // Correctness (orchestration quality and alignment)
     const correctness = this.calculateCorrectness(orchestration, testCase.expectedOutput);
@@ -183,9 +208,8 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Simulate orchestration (execution order calculation)
    */
-  private simulateOrchestration(dag: Dag, context?: any) {
+  private simulateOrchestration(dag: Dag): OrchestrationResult {
     const tasks = dag.tasks;
-    const taskMap = new Map(tasks.map(t => [t.id, t]));
     const executed = new Set<string>();
     const executionOrder: string[] = [];
     const parallelGroups: string[][] = [];
@@ -218,8 +242,8 @@ export class OrchestratorEvaluator implements AgentEvaluator {
     // Calculate critical path
     const criticalPath = this.calculateCriticalPath(dag);
 
-    // Calculate max parallelism
-    const maxParallelism = Math.max(...parallelGroups.map(g => g.length));
+    // Calculate max parallelism (0 for an empty DAG — spread of Math.max would yield -Infinity)
+    const maxParallelism = parallelGroups.reduce((max, g) => Math.max(max, g.length), 0);
 
     return {
       executionOrder,
@@ -227,7 +251,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
       criticalPath,
       maxParallelism,
       success: executed.size === tasks.length,
-      totalDuration: this.estimateTotalDuration(dag, parallelGroups, context),
+      totalDuration: this.estimateTotalDuration(parallelGroups),
       executionStrategy: parallelGroups.some(g => g.length > 1) ? 'parallel' : 'sequential',
     };
   }
@@ -295,7 +319,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Estimate total duration based on parallelization
    */
-  private estimateTotalDuration(dag: Dag, parallelGroups: string[][], context?: any): string {
+  private estimateTotalDuration(parallelGroups: string[][]): string {
     // Rough estimation: each group takes 1 unit of time
     const sequentialSteps = parallelGroups.length;
     return `~${sequentialSteps} time units`;
@@ -305,7 +329,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
    * Validate orchestration result against expected output
    */
   private validateAgainstExpected(
-    orchestration: any,
+    orchestration: OrchestrationResult,
     dagValidation: any,
     expected: any
   ): {
@@ -323,7 +347,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
 
       if (!expected.execution) return { isValid: true };
 
-      const exec = expected.execution;
+      const exec = expected.execution as ExpectedExecution;
 
       // Check success expectation
       if (exec.success !== undefined && exec.success !== orchestration.success) {
@@ -376,10 +400,10 @@ export class OrchestratorEvaluator implements AgentEvaluator {
 
       return { isValid: true };
 
-    } catch (error: any) {
+    } catch (error) {
       return {
         isValid: false,
-        error: `Validation error: ${error.message}`
+        error: `Validation error: ${error instanceof Error ? error.message : String(error)}`
       };
     }
   }
@@ -387,14 +411,12 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate dependency resolution score
    */
-  private calculateDependencyResolution(orchestration: any): number {
+  private calculateDependencyResolution(orchestration: OrchestrationResult, dag: Dag): number {
     // Check if all dependencies are satisfied
     const executionOrder = orchestration.executionOrder;
-    const dag = orchestration.dag;
 
     if (!dag || !executionOrder) return 0;
 
-    const taskMap = new Map<string, any>(dag.tasks.map((t: any) => [t.id, t]));
     const executedIndex = new Map<string, number>(
       executionOrder.map((id: string, i: number): [string, number] => [id, i]),
     );
@@ -423,9 +445,10 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate parallelization efficiency score
    */
-  private calculateParallelizationEfficiency(orchestration: any, testCase: TestCase): number {
+  private calculateParallelizationEfficiency(orchestration: OrchestrationResult, testCase: TestCase): number {
     const parallelGroups = orchestration.parallelGroups;
-    const expected = testCase.expectedOutput.execution;
+    // `execution` may be absent from expectedOutput — guard with optional chaining below
+    const expected = testCase.expectedOutput.execution as ExpectedExecution | undefined;
 
     if (!parallelGroups || parallelGroups.length === 0) return 0;
 
@@ -435,13 +458,13 @@ export class OrchestratorEvaluator implements AgentEvaluator {
     const parallelizationRatio = parallelTasks / Math.max(1, totalTasks);
 
     // Check against expected strategy
-    if (expected.executionStrategy === 'parallel') {
+    if (expected?.executionStrategy === 'parallel') {
       // Should have high parallelization
       return parallelizationRatio >= 0.6 ? 1.0 : parallelizationRatio / 0.6;
-    } else if (expected.executionStrategy === 'sequential') {
+    } else if (expected?.executionStrategy === 'sequential') {
       // Should have low parallelization
       return parallelizationRatio <= 0.2 ? 1.0 : 1 - (parallelizationRatio - 0.2) / 0.8;
-    } else if (expected.executionStrategy === 'hybrid') {
+    } else if (expected?.executionStrategy === 'hybrid') {
       // Should have moderate parallelization
       return parallelizationRatio >= 0.3 && parallelizationRatio <= 0.7 ? 1.0 : 0.5;
     }
@@ -452,11 +475,11 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate critical path accuracy score
    */
-  private calculateCriticalPathAccuracy(orchestration: any, testCase: TestCase): number {
+  private calculateCriticalPathAccuracy(orchestration: OrchestrationResult, testCase: TestCase): number {
     const criticalPath = orchestration.criticalPath;
-    const expected = testCase.expectedOutput.execution;
+    const expected = testCase.expectedOutput.execution as ExpectedExecution | undefined;
 
-    if (!expected.criticalPath) return 1.0; // Not specified
+    if (!expected?.criticalPath) return 1.0; // Not specified (or `execution` absent)
 
     // Check if critical path matches expected
     if (this.arraysEqual(expected.criticalPath, criticalPath)) {
@@ -476,10 +499,10 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate error handling score
    */
-  private calculateErrorHandling(orchestration: any, testCase: TestCase): number {
-    const expected = testCase.expectedOutput.execution;
+  private calculateErrorHandling(orchestration: OrchestrationResult, testCase: TestCase): number {
+    const expected = testCase.expectedOutput.execution as ExpectedExecution | undefined;
 
-    if (!expected.errorHandling) return 1.0; // Not specified
+    if (!expected?.errorHandling) return 1.0; // Not specified (or `execution` absent)
 
     let score = 0;
     let checks = 0;
@@ -506,7 +529,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate resource utilization score
    */
-  private calculateResourceUtilization(orchestration: any): number {
+  private calculateResourceUtilization(orchestration: OrchestrationResult): number {
     const maxParallelism = orchestration.maxParallelism;
     const totalTasks = orchestration.executionOrder.length;
 
@@ -528,11 +551,11 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate execution order correctness score
    */
-  private calculateExecutionOrderCorrectness(orchestration: any, testCase: TestCase): number {
+  private calculateExecutionOrderCorrectness(orchestration: OrchestrationResult, testCase: TestCase): number {
     const executionOrder = orchestration.executionOrder;
-    const expected = testCase.expectedOutput.execution;
+    const expected = testCase.expectedOutput.execution as ExpectedExecution | undefined;
 
-    if (!expected.executionOrder) return 1.0; // Not specified
+    if (!expected?.executionOrder) return 1.0; // Not specified (or `execution` absent)
 
     return this.arraysEqual(expected.executionOrder, executionOrder) ? 1.0 : 0.0;
   }
@@ -540,7 +563,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate completeness score
    */
-  private calculateCompleteness(orchestration: any, expected: any): number {
+  private calculateCompleteness(orchestration: OrchestrationResult): number {
     let score = 0;
     let checks = 0;
 
@@ -568,7 +591,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate correctness score
    */
-  private calculateCorrectness(orchestration: any, expected: any): number {
+  private calculateCorrectness(orchestration: OrchestrationResult, expected: any): number {
     let score = 0;
     let checks = 0;
 
@@ -597,9 +620,9 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   }
 
   /**
-   * Estimate cost based on task count and duration
+   * Estimate cost based on duration
    */
-  private estimateCost(taskCount: number, duration: number): number {
+  private estimateCost(duration: number): number {
     // Orchestration is CPU-bound, minimal cost
     const costPerSecond = 0.000001; // Very low cost
     return (duration / 1000) * costPerSecond;

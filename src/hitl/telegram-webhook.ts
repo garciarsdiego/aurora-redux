@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type Database from 'better-sqlite3';
 import { insertEvent, resolveHitlGate } from '../db/persist.js';
-import { parseTelegramCallbackData, answerTelegramCallback, type TelegramGateDecision } from './telegram.js';
+import { parseTelegramCallbackData, answerTelegramCallback, answerTelegramCallbackError } from './telegram.js';
 
 /**
  * Handle Telegram webhook update for inline keyboard button callbacks.
@@ -16,7 +16,7 @@ export async function handleTelegramWebhook(
   let update: Record<string, unknown>;
   try {
     update = JSON.parse(body) as Record<string, unknown>;
-  } catch (err) {
+  } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid JSON body' }));
     return;
@@ -90,10 +90,10 @@ export async function handleTelegramWebhook(
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[Telegram Webhook] Error handling callback: ${errorMessage}`);
 
-    // Try to answer the callback with error message
+    // Answer the callback with a neutral error message — the gate was NOT
+    // resolved, so never simulate an approval here.
     try {
-      const callbackId = (callbackQuery as { id?: unknown }).id as string;
-      await answerTelegramCallback(botToken, callbackId, 'approve'); // Default to approve on error
+      await answerTelegramCallbackError(botToken, callbackId);
     } catch {
       // Ignore answer errors
     }

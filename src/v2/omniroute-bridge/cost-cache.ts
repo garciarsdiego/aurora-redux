@@ -24,10 +24,9 @@ interface SyncStatusCacheEntry {
 }
 
 let _costReportCache: CostReportCacheEntry | null = null;
-let _isRefreshingCostReport = false;
 
 const _syncStatusCache = new Map<string, SyncStatusCacheEntry>();
-let _isSyncing = new Set<string>();
+const _isSyncing = new Set<string>();
 
 // ── Cost Report Cache ─────────────────────────────────────────────────────
 

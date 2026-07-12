@@ -2,6 +2,7 @@ import type { Task } from '../types/index.js';
 import { callOmnirouteWithUsage } from '../utils/omniroute-call.js';
 import { callOmnirouteStream } from '../utils/omniroute-stream.js';
 import { getTaskModel, getUsePersonas } from '../utils/config.js';
+import { safeParseJson } from '../utils/safe-parse-json.js';
 import type { WorkflowProgressEvent } from '../brain/executor/types.js';
 import {
   loadProviderMatrixCatalog,
@@ -26,14 +27,19 @@ export function resolveModel(task: Task): string {
 }
 
 function readModelRoute(task: Task): ModelRouteRequest | null {
-  const raw = task.model_route ?? (() => {
-    try {
-      const ctx = JSON.parse(task.input_json ?? '{}') as Record<string, unknown>;
-      return ctx['model_route'];
-    } catch {
-      return undefined;
-    }
-  })();
+  // W2-E parity (the safeParseJson migration applied to advisor.ts and
+  // cli/prompt-builder.ts had been missed here): no db handle at this layer,
+  // so the audit event degrades to a silent null — same malformed-→-ignore
+  // semantics as before, but observable for db-aware callers.
+  let raw: unknown = task.model_route;
+  if (raw === undefined || raw === null) {
+    const ctx = safeParseJson<Record<string, unknown>>(task.input_json, {
+      where: 'omniroute.readModelRoute',
+      taskId: task.id,
+      workflowId: task.workflow_id,
+    });
+    raw = ctx?.['model_route'];
+  }
   if (!raw || typeof raw !== 'object') return null;
   const data = raw as {
     use_case?: unknown;
@@ -66,8 +72,15 @@ function buildUserPrompt(task: Task): string {
   }
 
   if (task.input_json) {
-    try {
-      const ctx = JSON.parse(task.input_json) as Record<string, unknown>;
+    // W2-E parity: silent JSON.parse replaced by safeParseJson — malformed
+    // input_json still just skips the context block, but the parse failure
+    // becomes observable via the task_input_json_malformed audit event.
+    const ctx = safeParseJson<Record<string, unknown>>(task.input_json, {
+      where: 'omniroute.buildUserPrompt',
+      taskId: task.id,
+      workflowId: task.workflow_id,
+    });
+    if (ctx) {
       if (ctx['objective']) lines.push(`Context: ${ctx['objective']}`);
       if (ctx['execution_plan']) {
         lines.push(
@@ -89,8 +102,6 @@ function buildUserPrompt(task: Task): string {
       if (ctx['carry_from_upstream']) {
         lines.push('', 'CARRY FROM UPSTREAM (parsed handoff per parent):', ctx['carry_from_upstream'] as string);
       }
-    } catch {
-      // malformed input_json — skip silently
     }
   }
 
@@ -172,6 +183,10 @@ export async function runOmniRouteTask(
   // Streaming path (opt-in via task.stream_output, only valid for kind='llm_call').
   // Yields each delta as a chunk event; accumulates the full text into output_json
   // so reviewer/consolidator see the same string they'd see in non-stream mode.
+  // Resolve the model ONCE — resolveModel may hit loadProviderMatrixCatalog +
+  // selectModel, and the same value is needed for both the stream call and
+  // task.model_used below.
+  const model = resolveModel(task);
   const startTs = Date.now();
   let firstChunkTs: number | null = null;
   const chunks: string[] = [];
@@ -189,7 +204,7 @@ export async function runOmniRouteTask(
     for await (const delta of callOmnirouteStream({
       systemPrompt: SYSTEM_PROMPT,
       userPrompt: buildUserPrompt(task),
-      model: resolveModel(task),
+      model,
       ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       onUsage: (u) => { finalUsage = u; },
     })) {
@@ -229,7 +244,7 @@ export async function runOmniRouteTask(
     });
   }
 
-  task.model_used = resolveModel(task);
+  task.model_used = model;
   task.input_tokens = finalUsage?.input_tokens ?? null;
   task.output_tokens = finalUsage?.output_tokens ?? null;
   task.llm_call_cost_usd = finalUsage?.total_cost_usd ?? null;

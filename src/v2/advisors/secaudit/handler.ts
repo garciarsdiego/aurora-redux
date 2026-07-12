@@ -4,11 +4,11 @@
 
 import type { Advisor, AdvisorContext, AdvisorResult } from '../types.js';
 import { getAdvisorMode } from '../shared/mode.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
-import { SecauditInputSchema } from './schema.js';
+import { callAdvisorLlm } from '../shared/llm.js';
+import { SecauditInputSchema, type SecauditInput } from './schema.js';
 import { SECAUDIT_SYSTEM_PROMPT } from './prompt.js';
 
-function buildUserPrompt(parsed: ReturnType<typeof SecauditInputSchema.parse>): string {
+function buildUserPrompt(parsed: SecauditInput): string {
   const lines: string[] = [
     `=== SECURITY AUDIT REQUEST ===`,
     `Step ${parsed.step_number} of ${parsed.total_steps}: ${parsed.step}`,
@@ -92,11 +92,9 @@ export const secauditAdvisor: Advisor = {
     const parsed = SecauditInputSchema.parse(args);
     void getAdvisorMode(ctx, args);
     const userPrompt = buildUserPrompt(parsed);
-    const text = await callOmniroute({
+    const text = await callAdvisorLlm(ctx, {
       systemPrompt: SECAUDIT_SYSTEM_PROMPT,
       userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     return { output: text };
   },

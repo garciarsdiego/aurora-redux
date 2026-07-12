@@ -43,8 +43,15 @@ export async function approveGateTool(raw: unknown): Promise<string> {
     resolveHitlGate(db, gate_id, resolvedDecision);
 
     if (feedback) {
-      // Merge feedback into context_json so it's auditable without schema change
-      const existing = row.context_json ? (JSON.parse(row.context_json) as Record<string, unknown>) : {};
+      // Merge feedback into context_json so it's auditable without schema change.
+      // Best-effort: the gate is already resolved above, so a malformed
+      // context_json must not surface as an error to the caller.
+      let existing: Record<string, unknown> = {};
+      try {
+        if (row.context_json) {
+          existing = JSON.parse(row.context_json) as Record<string, unknown>;
+        }
+      } catch { /* malformed context_json — treated as missing */ }
       const updated = { ...existing, mcp_feedback: feedback };
       withSqliteRetrySync(() =>
         db.prepare('UPDATE hitl_gates SET context_json = ? WHERE id = ?').run(

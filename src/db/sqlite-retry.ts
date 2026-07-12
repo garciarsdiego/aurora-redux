@@ -41,8 +41,9 @@ export function isSqliteBusy(err: unknown): boolean {
   return typeof message === 'string' && BUSY_MESSAGE_RE.test(message);
 }
 
-// Internal alias preserved for backward compatibility.
-const isRetryable = isSqliteBusy;
+function backoffAt(backoff: number[], attempt: number): number {
+  return backoff[attempt] ?? backoff[backoff.length - 1] ?? 100;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,10 +67,10 @@ export function withSqliteRetrySync<T>(fn: () => T, opts: SqliteRetryOptions = {
       return fn();
     } catch (err) {
       lastErr = err;
-      if (!isRetryable(err) || attempt === maxRetries) throw err;
+      if (!isSqliteBusy(err) || attempt === maxRetries) throw err;
       opts.onRetry?.(attempt, err as Error);
       // Synchronous busy-wait — better-sqlite3 is sync; we emulate backoff with a tight loop.
-      const waitUntil = Date.now() + (backoff[attempt] ?? backoff[backoff.length - 1] ?? 100);
+      const waitUntil = Date.now() + backoffAt(backoff, attempt);
       while (Date.now() < waitUntil) { /* spin */ }
     }
   }
@@ -91,9 +92,9 @@ export async function withSqliteRetry<T>(
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (!isRetryable(err) || attempt === maxRetries) throw err;
+      if (!isSqliteBusy(err) || attempt === maxRetries) throw err;
       opts.onRetry?.(attempt, err as Error);
-      await sleep(backoff[attempt] ?? backoff[backoff.length - 1] ?? 100);
+      await sleep(backoffAt(backoff, attempt));
     }
   }
   throw lastErr;

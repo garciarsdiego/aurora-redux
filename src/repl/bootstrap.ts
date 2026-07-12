@@ -12,14 +12,13 @@
 import type Database from 'better-sqlite3';
 import { initDb } from '../db/client.js';
 import { getDbPath } from '../utils/config.js';
-import { loadWorkspaceEnv } from '../utils/workspace.js';
+import { loadWorkspaceEnv, VALID_WORKSPACE_RE } from '../utils/workspace.js';
 import { loadHistoryEntries } from './input/history.js';
 import { healthCheck as daemonHealthCheck } from './services/daemonClient.js';
 import { useReplStore } from './state/store.js';
 import { redact } from './utils/redaction.js';
+import { errorMessage } from './utils/errors.js';
 import { gracefulShutdown } from './shutdown.js';
-
-const VALID_WORKSPACE_RE = /^[a-zA-Z0-9_-]+$/;
 
 export interface BootConfig {
   readonly workspace: string;
@@ -66,8 +65,7 @@ export async function bootstrap(config: BootConfig): Promise<BootResult> {
     // History is read-only at this point; PromptInput receives it via prop in App.
     // We don't push to a Zustand slice — App owns the live snapshot.
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[bootstrap] history preload failed: ${redact(msg)}\n`);
+    process.stderr.write(`[bootstrap] history preload failed: ${redact(errorMessage(err))}\n`);
   }
 
   // 5. Initialize Zustand session slice with workspace + model override.

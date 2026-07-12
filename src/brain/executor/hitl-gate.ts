@@ -9,13 +9,16 @@ import {
   setTaskFailed,
 } from '../../db/persist.js';
 import { withSqliteRetrySync } from '../../db/sqlite-retry.js';
-import { loadHitlConfig } from '../../hitl/config.js';
+import { loadHitlConfig, type HitlConfig } from '../../hitl/config.js';
 import { sendSlackGateNotification } from '../../hitl/slack.js';
 import { startHitlListener, stopHitlListener } from '../../hitl/listener.js';
 import { sendTelegramGateNotification } from '../../hitl/telegram.js';
 import { matchesAutoApprovePolicy } from '../../hitl/policy.js';
 import { notifyGatePending } from '../../mcp/notification-service.js';
 import { HitlModifyError } from './types.js';
+
+type HitlPromptInfo = import('../../hitl/cli.js').HitlPromptInfo;
+type HitlDecision = 'approve' | 'reject' | 'modify';
 
 // Aurora W4 — workflow IDs that have already emitted a
 // `hitl_terminal_disabled_detached` event in this daemon's lifetime. Used to
@@ -194,7 +197,7 @@ function buildPromptInfo(
   workspace: string,
   objective: string,
   allTasks?: Task[],
-): import('../../hitl/cli.js').HitlPromptInfo {
+): HitlPromptInfo {
   const isPlanGate = task.depends_on.length === 0 && task.hitl;
 
   return {
@@ -225,6 +228,213 @@ function buildPromptInfo(
   };
 }
 
+/**
+ * Resolution channel selection: slack/telegram require their respective
+ * credentials to be configured; every other combination falls back to the
+ * terminal (cli) channel.
+ */
+function selectHitlChannel(hitlConfig: HitlConfig | null): 'slack' | 'telegram' | 'cli' {
+  if (hitlConfig?.channel === 'slack' && hitlConfig.slack_webhook_url) return 'slack';
+  if (
+    hitlConfig?.channel === 'telegram' &&
+    hitlConfig.telegram_bot_token &&
+    hitlConfig.telegram_chat_id != null
+  ) {
+    return 'telegram';
+  }
+  return 'cli';
+}
+
+/**
+ * WIRE-04 — audit row for a failed gate_pending notification dispatch. Shared
+ * by the async-rejection and synchronous-throw catches of the fire-and-forget
+ * dispatch in runHitlGate.
+ */
+function auditNotificationDispatchFailed(
+  db: Database.Database,
+  wfId: string,
+  taskId: string,
+  gateId: string,
+  err: unknown,
+): void {
+  try {
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: taskId,
+      type: 'notification_dispatch_failed',
+      payload: {
+        kind: 'gate_pending',
+        gate_id: gateId,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
+  } catch { /* observability failure must not break the HITL flow */ }
+}
+
+interface HitlChannelResolution {
+  decision: HitlDecision;
+  /** True when a DB-poll path already flipped the gate row (skip double-resolve). */
+  resolvedByListener: boolean;
+}
+
+// Slack flow — webhook notification + local HTTP listener + DB poll, with a
+// terminal-prompt fallback when the listener cannot start (or the poll times out).
+async function resolveViaSlack(params: {
+  db: Database.Database;
+  task: Task;
+  wfId: string;
+  workspace: string;
+  objective: string;
+  gateId: string;
+  hitlConfig: HitlConfig;
+  webhookUrl: string;
+  promptInfo: HitlPromptInfo;
+  doHitl: (info: HitlPromptInfo) => Promise<'approve' | 'reject'>;
+}): Promise<HitlChannelResolution> {
+  const { db, task, wfId, workspace, objective, gateId, hitlConfig, webhookUrl, promptInfo, doHitl } = params;
+  const port = hitlConfig.slack_listener_port;
+  const publicUrl = hitlConfig.slack_listener_public_url;
+  const listenerUrl = publicUrl ? `${publicUrl}/hitl/respond` : undefined;
+
+  await sendSlackGateNotification({
+    webhookUrl,
+    taskName: task.name,
+    workspace,
+    kind: task.kind,
+    model: task.model,
+    objective,
+    gateId,
+    listenerUrl,
+  });
+  insertEvent(db, {
+    workflow_id: wfId,
+    task_id: task.id,
+    type: 'hitl_slack_sent',
+    payload: { channel: 'slack', listener_port: port, public_url: publicUrl ?? null },
+  });
+
+  let server: import('node:http').Server | undefined;
+  try {
+    server = await startHitlListener(db, port);
+    console.log(`[HITL] Aguardando em http://localhost:${port}/hitl/respond (gate: ${gateId})`);
+    const decision = await pollGateUntilResolved(db, gateId, 2_000, 10 * 60 * 1000);
+    return { decision, resolvedByListener: true };
+  } catch (err) {
+    console.warn(`[HITL] ${(err as Error).message} — fallback para terminal`);
+    return { decision: await doHitl(promptInfo), resolvedByListener: false };
+  } finally {
+    if (server) stopHitlListener(server);
+  }
+}
+
+// Telegram flow — bot notification, then DB poll for resolution via
+// omniforge_approve_gate (10 min timeout). On timeout, the gate is resolved to
+// 'timed_out' (not left pending) before the error propagates (Wave-1.5 triage #2).
+async function resolveViaTelegram(params: {
+  db: Database.Database;
+  task: Task;
+  wfId: string;
+  workspace: string;
+  objective: string;
+  gateId: string;
+  botToken: string;
+  chatId: string | number;
+}): Promise<HitlChannelResolution> {
+  const { db, task, wfId, workspace, objective, gateId, botToken, chatId } = params;
+  const result = await sendTelegramGateNotification({
+    botToken,
+    chatId,
+    taskName: task.name,
+    workspace,
+    kind: task.kind,
+    model: task.model,
+    objective,
+    gateId,
+  });
+  insertEvent(db, {
+    workflow_id: wfId,
+    task_id: task.id,
+    type: 'hitl_telegram_sent',
+    payload: { chat_id: chatId, sent: result.sent, error: result.error },
+  });
+  const rawDecision = await pollGateOrMarkTimedOut(db, wfId, task.id, gateId, 2_000, 10 * 60 * 1000);
+  if (rawDecision === 'modify') {
+    throw new HitlModifyError(readGateFeedback(db, gateId));
+  }
+  return { decision: rawDecision, resolvedByListener: true };
+}
+
+// Channel "cli" — race the terminal prompt against DB polling so the
+// dashboard's POST /gate/:id/resolve (which marks the gate approved
+// in SQLite) also unblocks the executor. Pre-fix the operator could
+// approve from the dashboard, see the gate marked resolved in the
+// DB, and watch the daemon hang forever waiting on stdin.
+// Whichever resolves first wins; the loser is intentionally orphaned
+// — node will GC the readline interface, and the next gate prompt
+// creates a fresh one.
+//
+// Example smoke test 2026-04-30: when the daemon was started detached
+// (`stdio: ['ignore', logFd, logFd]`), process.stdin is ignored / not
+// a TTY. readline.question() then resolves immediately with empty
+// string, which becomes 'reject'. The CLI promise won the race in
+// <1s and gates were auto-rejected before the operator could click
+// approve in the dashboard. Detection: if stdin is NOT a TTY, skip
+// the CLI prompt entirely — only the dashboard / API path can
+// resolve the gate. The 10-min DB poll timeout still applies.
+async function resolveViaCli(params: {
+  db: Database.Database;
+  task: Task;
+  wfId: string;
+  gateId: string;
+  promptInfo: HitlPromptInfo;
+  doHitl: (info: HitlPromptInfo) => Promise<'approve' | 'reject'>;
+  forceCliPrompt: boolean;
+}): Promise<HitlChannelResolution> {
+  const { db, task, wfId, gateId, promptInfo, doHitl, forceCliPrompt } = params;
+  const stdinIsTty = process.stdin.isTTY === true || forceCliPrompt;
+
+  // Aurora W4 — surface a one-shot hint to the dashboard so the operator
+  // realises that the daemon is running detached and the terminal prompt
+  // is intentionally disabled (only dashboard / MCP approve_gate can
+  // resolve the gate). Emit BEFORE the DB poll so the event lands first
+  // in the SSE stream / inbox view. Module-scoped Set dedupes per
+  // workflow per daemon lifetime — see `_hitlDetachedEmittedFor` above.
+  if (!stdinIsTty && !_hitlDetachedEmittedFor.has(wfId)) {
+    _recordHitlDetachedEmit(wfId);
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: task.id,
+      type: 'hitl_terminal_disabled_detached',
+      payload: { reason: 'stdin_not_tty', resolution: 'dashboard_inbox_only' },
+    });
+  }
+
+  let resolvedByListener = false;
+  const dbPromise = pollGateOrMarkTimedOut(db, wfId, task.id, gateId, 1_000, 10 * 60 * 1000)
+    .then((d) => {
+      // Mark so the outer code knows the DB transition already happened
+      // and doesn't double-resolve.
+      resolvedByListener = true;
+      return d;
+    });
+  let rawDecision: HitlDecision;
+  if (stdinIsTty) {
+    rawDecision = await Promise.race([doHitl(promptInfo), dbPromise]);
+    // The terminal prompt may have won the race; the poll is now detached
+    // and keeps running. Swallow its eventual settle so a late timeout
+    // cannot surface as an unhandled rejection. The gate is resolved below
+    // regardless, so markGateTimedOut (conditional on status='pending')
+    // no-ops on the detached poll's timeout.
+    void dbPromise.catch(() => {});
+  } else {
+    rawDecision = await dbPromise;
+  }
+  if (rawDecision === 'modify') {
+    throw new HitlModifyError(readGateFeedback(db, gateId));
+  }
+  return { decision: rawDecision, resolvedByListener };
+}
+
 export async function runHitlGate(
   db: Database.Database,
   task: Task,
@@ -232,21 +442,14 @@ export async function runHitlGate(
   workspace: string,
   objective: string,
   autoApprove: boolean,
-  doHitl: (info: import('../../hitl/cli.js').HitlPromptInfo) => Promise<'approve' | 'reject'>,
+  doHitl: (info: HitlPromptInfo) => Promise<'approve' | 'reject'>,
   allTasks?: Task[],
   forceCliPrompt = false,
 ): Promise<void> {
   const gateId = newHitlGateId();
   const hitlConfig = loadHitlConfig(workspace);
   const promptInfo = buildPromptInfo(task, wfId, workspace, objective, allTasks);
-  const channel =
-    hitlConfig?.channel === 'slack' && hitlConfig.slack_webhook_url
-      ? 'slack'
-      : hitlConfig?.channel === 'telegram' &&
-          hitlConfig.telegram_bot_token &&
-          hitlConfig.telegram_chat_id != null
-        ? 'telegram'
-        : 'cli';
+  const channel = selectHitlChannel(hitlConfig);
 
   insertHitlGate(db, {
     id: gateId,
@@ -263,7 +466,7 @@ export async function runHitlGate(
     payload: { gate_id: gateId, auto_approve: autoApprove, channel },
   });
 
-  let decision: 'approve' | 'reject' | 'modify';
+  let decision: HitlDecision;
   let resolvedByListener = false;
 
   const policyApproved = matchesAutoApprovePolicy(task, hitlConfig, workspace);
@@ -285,162 +488,53 @@ export async function runHitlGate(
   if (!autoApprove && !policyApproved) {
     try {
       void notifyGatePending(gateId, wfId, task.name).catch((err) => {
-        try {
-          insertEvent(db, {
-            workflow_id: wfId,
-            task_id: task.id,
-            type: 'notification_dispatch_failed',
-            payload: {
-              kind: 'gate_pending',
-              gate_id: gateId,
-              error: err instanceof Error ? err.message : String(err),
-            },
-          });
-        } catch { /* observability failure must not break the HITL flow */ }
+        auditNotificationDispatchFailed(db, wfId, task.id, gateId, err);
       });
     } catch (err) {
-      try {
-        insertEvent(db, {
-          workflow_id: wfId,
-          task_id: task.id,
-          type: 'notification_dispatch_failed',
-          payload: {
-            kind: 'gate_pending',
-            gate_id: gateId,
-            error: err instanceof Error ? err.message : String(err),
-          },
-        });
-      } catch { /* observability failure must not break the HITL flow */ }
+      auditNotificationDispatchFailed(db, wfId, task.id, gateId, err);
     }
   }
 
   if (autoApprove || policyApproved) {
     decision = 'approve';
   } else if (channel === 'slack' && hitlConfig?.slack_webhook_url) {
-    const port = hitlConfig.slack_listener_port;
-    const publicUrl = hitlConfig.slack_listener_public_url;
-    const listenerUrl = publicUrl ? `${publicUrl}/hitl/respond` : undefined;
-
-    await sendSlackGateNotification({
-      webhookUrl: hitlConfig.slack_webhook_url,
-      taskName: task.name,
+    ({ decision, resolvedByListener } = await resolveViaSlack({
+      db,
+      task,
+      wfId,
       workspace,
-      kind: task.kind,
-      model: task.model,
       objective,
       gateId,
-      listenerUrl,
-    });
-    insertEvent(db, {
-      workflow_id: wfId,
-      task_id: task.id,
-      type: 'hitl_slack_sent',
-      payload: { channel: 'slack', listener_port: port, public_url: publicUrl ?? null },
-    });
-
-    let server: import('node:http').Server | undefined;
-    try {
-      server = await startHitlListener(db, port);
-      console.log(`[HITL] Aguardando em http://localhost:${port}/hitl/respond (gate: ${gateId})`);
-      decision = await pollGateUntilResolved(db, gateId, 2_000, 10 * 60 * 1000);
-      resolvedByListener = true;
-    } catch (err) {
-      console.warn(`[HITL] ${(err as Error).message} — fallback para terminal`);
-      decision = await doHitl(promptInfo);
-    } finally {
-      if (server) stopHitlListener(server);
-    }
+      hitlConfig,
+      webhookUrl: hitlConfig.slack_webhook_url,
+      promptInfo,
+      doHitl,
+    }));
+  } else if (
+    channel === 'telegram' &&
+    hitlConfig?.telegram_bot_token &&
+    hitlConfig.telegram_chat_id != null
+  ) {
+    ({ decision, resolvedByListener } = await resolveViaTelegram({
+      db,
+      task,
+      wfId,
+      workspace,
+      objective,
+      gateId,
+      botToken: hitlConfig.telegram_bot_token,
+      chatId: hitlConfig.telegram_chat_id,
+    }));
   } else {
-    if (
-      channel === 'telegram' &&
-      hitlConfig?.telegram_bot_token &&
-      hitlConfig.telegram_chat_id != null
-    ) {
-      const result = await sendTelegramGateNotification({
-        botToken: hitlConfig.telegram_bot_token,
-        chatId: hitlConfig.telegram_chat_id,
-        taskName: task.name,
-        workspace,
-        kind: task.kind,
-        model: task.model,
-        objective,
-        gateId,
-      });
-      insertEvent(db, {
-        workflow_id: wfId,
-        task_id: task.id,
-        type: 'hitl_telegram_sent',
-        payload: { chat_id: hitlConfig.telegram_chat_id, sent: result.sent, error: result.error },
-      });
-      // Poll DB for resolution via omniforge_approve_gate (10 min timeout).
-      // On timeout, the gate is resolved to 'timed_out' (not left pending) before
-      // the error propagates (Wave-1.5 triage #2).
-      const rawDecision = await pollGateOrMarkTimedOut(db, wfId, task.id, gateId, 2_000, 10 * 60 * 1000);
-      resolvedByListener = true;
-      if (rawDecision === 'modify') {
-        throw new HitlModifyError(readGateFeedback(db, gateId));
-      }
-      decision = rawDecision;
-    } else {
-      // Channel "cli" — race the terminal prompt against DB polling so the
-      // dashboard's POST /gate/:id/resolve (which marks the gate approved
-      // in SQLite) also unblocks the executor. Pre-fix the operator could
-      // approve from the dashboard, see the gate marked resolved in the
-      // DB, and watch the daemon hang forever waiting on stdin.
-      // Whichever resolves first wins; the loser is intentionally orphaned
-      // — node will GC the readline interface, and the next gate prompt
-      // creates a fresh one.
-      //
-      // Example smoke test 2026-04-30: when the daemon was started detached
-      // (`stdio: ['ignore', logFd, logFd]`), process.stdin is ignored / not
-      // a TTY. readline.question() then resolves immediately with empty
-      // string, which becomes 'reject'. The CLI promise won the race in
-      // <1s and gates were auto-rejected before the operator could click
-      // approve in the dashboard. Detection: if stdin is NOT a TTY, skip
-      // the CLI prompt entirely — only the dashboard / API path can
-      // resolve the gate. The 10-min DB poll timeout still applies.
-      const stdinIsTty = process.stdin.isTTY === true || forceCliPrompt;
-
-      // Aurora W4 — surface a one-shot hint to the dashboard so the operator
-      // realises that the daemon is running detached and the terminal prompt
-      // is intentionally disabled (only dashboard / MCP approve_gate can
-      // resolve the gate). Emit BEFORE the DB poll so the event lands first
-      // in the SSE stream / inbox view. Module-scoped Set dedupes per
-      // workflow per daemon lifetime — see `_hitlDetachedEmittedFor` above.
-      if (!stdinIsTty && !_hitlDetachedEmittedFor.has(wfId)) {
-        _recordHitlDetachedEmit(wfId);
-        insertEvent(db, {
-          workflow_id: wfId,
-          task_id: task.id,
-          type: 'hitl_terminal_disabled_detached',
-          payload: { reason: 'stdin_not_tty', resolution: 'dashboard_inbox_only' },
-        });
-      }
-
-      const dbPromise = pollGateOrMarkTimedOut(db, wfId, task.id, gateId, 1_000, 10 * 60 * 1000)
-        .then((d) => {
-          // Mark so the outer code knows the DB transition already happened
-          // and doesn't double-resolve.
-          resolvedByListener = true;
-          return d;
-        });
-      let rawDecision: 'approve' | 'reject' | 'modify';
-      if (stdinIsTty) {
-        rawDecision = await Promise.race([doHitl(promptInfo), dbPromise]);
-        // The terminal prompt may have won the race; the poll is now detached
-        // and keeps running. Swallow its eventual settle so a late timeout
-        // cannot surface as an unhandled rejection. The gate is resolved below
-        // regardless, so markGateTimedOut (conditional on status='pending')
-        // no-ops on the detached poll's timeout.
-        void dbPromise.catch(() => {});
-      } else {
-        rawDecision = await dbPromise;
-      }
-      if (rawDecision === 'modify') {
-        throw new HitlModifyError(readGateFeedback(db, gateId));
-      }
-      decision = rawDecision;
-    }
+    ({ decision, resolvedByListener } = await resolveViaCli({
+      db,
+      task,
+      wfId,
+      gateId,
+      promptInfo,
+      doHitl,
+      forceCliPrompt,
+    }));
   }
 
   if (!resolvedByListener) {

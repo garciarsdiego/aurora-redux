@@ -57,9 +57,8 @@ import {
   readJsonBody,
   safeEndSse,
   sendSseEvent,
-  sendSseHeartbeat,
   setSseHeaders,
-  SSE_HEARTBEAT_MS,
+  wireSseLifecycle,
 } from './_shared.js';
 
 // ── Route regex ──────────────────────────────────────────────────────────
@@ -201,7 +200,6 @@ function buildAdvisorInput(advisorName: string, body: CallBody): Record<string, 
   if (body.mode && !('mode' in input)) input['mode'] = body.mode;
 
   const promptValue = typeof input['prompt'] === 'string' ? input['prompt'] : '';
-  const advisorMode = body.mode ?? 'auto';
 
   // Stepwise advisors require `step` + `step_number` + `total_steps` +
   // `next_step_required` + `findings`. Fill the missing fields from prompt
@@ -221,8 +219,6 @@ function buildAdvisorInput(advisorName: string, body: CallBody): Record<string, 
   // listmodels / version accept zero-required args. challenge / apilookup /
   // chat take `prompt`. Sync advisors with required-non-prompt fields fall
   // through unchanged.
-  void advisorMode; // referenced for future per-advisor branching
-
   return input;
 }
 
@@ -349,22 +345,9 @@ async function handleStepwiseCall(
 
   // Heartbeat keeps proxies from buffering; cleanup wires every termination
   // path back to abort/close so we never leak the in-flight LLM call.
-  const heartbeat = setInterval(() => sendSseHeartbeat(res), SSE_HEARTBEAT_MS);
-  if (typeof (heartbeat as unknown as { unref?: () => void }).unref === 'function') {
-    (heartbeat as unknown as { unref: () => void }).unref();
-  }
-
-  let closed = false;
-  const cleanup = (): void => {
-    if (closed) return;
-    closed = true;
-    clearInterval(heartbeat);
+  const cleanup = wireSseLifecycle(req, res, () => {
     try { abortCtrl.abort(); } catch { /* abort on already-aborted is fine */ }
-  };
-  req.on('close', cleanup);
-  req.on('error', cleanup);
-  res.on('close', cleanup);
-  res.on('error', cleanup);
+  });
 
   // step_start frame so the UI can render a "thinking" indicator before the
   // LLM returns. The shell renders these as the timeline of steps.

@@ -28,6 +28,8 @@ import {
   AgentRejectedError,
   type AgentContext,
   type AgentPersona,
+  type PostHookResult,
+  type PreHookResult,
 } from './types.js';
 
 /**
@@ -99,17 +101,16 @@ export async function runAgent<I, O>(
   // ── 2. preHook ────────────────────────────────────────────────────────────
   if (persona.preHook) {
     const r = await persona.preHook(input, ctx);
-    if (r && typeof r === 'object' && 'skipWithResult' in (r as object)) {
-      const short = (r as { skipWithResult: O }).skipWithResult;
+    if (isSkipWithResult<I, O>(r)) {
       ctx.emit('agent_completed', {
         agent_id: persona.id,
         short_circuited: true,
         workflow_id: ctx.workflowId,
         task_id: ctx.taskId,
       });
-      return short;
+      return r.skipWithResult;
     }
-    input = r as I;
+    input = r;
   }
 
   enforcePersonaToolPermissions(
@@ -138,28 +139,28 @@ export async function runAgent<I, O>(
   // same string the non-streaming path returns, so downstream schema
   // validation, postHooks, and the agent_completed event are unchanged.
   let rawOutput: string;
-  const invokeStream: AgentStreamInvoker | undefined = persona.streaming
-    ? options.invokeStream ?? ((args) => callOmnirouteStream({
+  const resolvedModel = model ?? '<no-model>';
+  if (persona.streaming) {
+    const invokeStream: AgentStreamInvoker = options.invokeStream
+      ?? ((args) => callOmnirouteStream({
         ...args,
         userPrompt: args.userPrompt ?? DEFAULT_USER_PROMPT,
-      }))
-    : undefined;
-  if (persona.streaming && invokeStream) {
+      }));
     rawOutput = await invokeWithStreaming(
       persona,
       invokeStream,
       {
         systemPrompt,
         userPrompt: DEFAULT_USER_PROMPT,
-        model: model ?? '<no-model>',
+        model: resolvedModel,
       },
       ctx,
     );
   } else {
     rawOutput = await options.invoke({
       systemPrompt,
-      userPrompt: options.parseJson ? DEFAULT_USER_PROMPT : DEFAULT_USER_PROMPT,
-      model: model ?? '<no-model>',
+      userPrompt: DEFAULT_USER_PROMPT,
+      model: resolvedModel,
     });
   }
 
@@ -177,7 +178,7 @@ export async function runAgent<I, O>(
     rawOutput = await options.invoke({
       systemPrompt: `${systemPrompt}\n\n${reminder}`,
       userPrompt: 'Re-emit your previous response in compliance with the schema. JSON only.',
-      model: model ?? '<no-model>',
+      model: resolvedModel,
     });
     try {
       const parsedRetry = options.parseJson ? safeParseJson(rawOutput) : rawOutput;
@@ -194,18 +195,17 @@ export async function runAgent<I, O>(
   // ── 6. postHook ───────────────────────────────────────────────────────────
   if (persona.postHook) {
     const r = await persona.postHook(input, output, ctx);
-    if (r && typeof r === 'object' && 'rejectWithReason' in (r as object)) {
-      const reject = r as { rejectWithReason: string; mode?: string };
+    if (isRejectWithReason<O>(r)) {
       ctx.emit('agent_rejected', {
         agent_id: persona.id,
-        reason: reject.rejectWithReason,
-        mode: reject.mode,
+        reason: r.rejectWithReason,
+        mode: r.mode,
         workflow_id: ctx.workflowId,
         task_id: ctx.taskId,
       });
-      throw new AgentRejectedError(reject.rejectWithReason, persona.id, input, output, reject.mode);
+      throw new AgentRejectedError(r.rejectWithReason, persona.id, input, output, r.mode);
     }
-    output = r as O;
+    output = r;
   }
 
   // ── 7. Emit completion ────────────────────────────────────────────────────
@@ -217,6 +217,18 @@ export async function runAgent<I, O>(
   });
 
   return output;
+}
+
+/** Narrows a preHook result to the short-circuit shape without casts. */
+function isSkipWithResult<I, O>(r: PreHookResult<I, O>): r is { skipWithResult: O } {
+  const candidate: unknown = r;
+  return typeof candidate === 'object' && candidate !== null && 'skipWithResult' in candidate;
+}
+
+/** Narrows a postHook result to the rejection shape without casts. */
+function isRejectWithReason<O>(r: PostHookResult<O>): r is { rejectWithReason: string; mode?: string } {
+  const candidate: unknown = r;
+  return typeof candidate === 'object' && candidate !== null && 'rejectWithReason' in candidate;
 }
 
 /**
@@ -321,9 +333,6 @@ export function createInMemoryContext(overrides: Partial<AgentContext> = {}): Ag
   const warnings: string[] = [];
   return {
     retryCount: 0,
-    ...overrides,
-    events,
-    warnings,
     emit(event, payload) {
       events.push({ event, payload });
     },
@@ -333,5 +342,10 @@ export function createInMemoryContext(overrides: Partial<AgentContext> = {}): Ag
     log() {
       // no-op in tests; pipe to console if needed via overrides
     },
+    // Overrides come last so callers can replace emit/warn/log (in which case
+    // the default events/warnings recorders stop capturing — by design).
+    ...overrides,
+    events,
+    warnings,
   };
 }

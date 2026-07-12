@@ -1,10 +1,16 @@
-import { Database } from 'better-sqlite3';
+import type Database from 'better-sqlite3';
 import { initDb } from '../db/client.js';
 import { getDbPath } from '../utils/config.js';
 import type { CostRecord, CostEstimate } from './types.js';
 
+/**
+ * Shape of a model_costs SELECT row — the queries always project exactly the
+ * CostRecord columns, so the row shares the record's shape.
+ */
+type ModelCostRow = CostRecord;
+
 export class CostDatabase {
-  private db: Database;
+  private db: Database.Database;
 
   constructor() {
     this.db = initDb(getDbPath());
@@ -16,14 +22,14 @@ export class CostDatabase {
   getCost(model: string, provider: string = 'omniroute'): CostRecord | null {
     const row = this.db.prepare(
       'SELECT model, provider, input_cost_per_1k, output_cost_per_1k, avg_tokens_per_request, max_tokens, last_updated FROM model_costs WHERE model = ? AND provider = ?'
-    ).get(model, provider);
+    ).get(model, provider) as ModelCostRow | undefined;
 
     if (!row) {
       // Try to find by model only (any provider)
       const anyProviderRow = this.db.prepare(
         'SELECT model, provider, input_cost_per_1k, output_cost_per_1k, avg_tokens_per_request, max_tokens, last_updated FROM model_costs WHERE model = ? LIMIT 1'
-      ).get(model);
-      
+      ).get(model) as ModelCostRow | undefined;
+
       return anyProviderRow ? this.rowToCostRecord(anyProviderRow) : null;
     }
 
@@ -36,7 +42,7 @@ export class CostDatabase {
   getAllCosts(): CostRecord[] {
     const rows = this.db.prepare(
       'SELECT model, provider, input_cost_per_1k, output_cost_per_1k, avg_tokens_per_request, max_tokens, last_updated FROM model_costs'
-    ).all();
+    ).all() as ModelCostRow[];
 
     return rows.map(row => this.rowToCostRecord(row));
   }
@@ -130,7 +136,7 @@ export class CostDatabase {
        FROM model_costs
        ORDER BY (input_cost_per_1k + output_cost_per_1k) ASC
        LIMIT ?`
-    ).all(limit);
+    ).all(limit) as ModelCostRow[];
 
     return rows.map(row => this.rowToCostRecord(row));
   }
@@ -141,7 +147,7 @@ export class CostDatabase {
   getModelsByProvider(provider: string): CostRecord[] {
     const rows = this.db.prepare(
       'SELECT model, provider, input_cost_per_1k, output_cost_per_1k, avg_tokens_per_request, max_tokens, last_updated FROM model_costs WHERE provider = ?'
-    ).all(provider);
+    ).all(provider) as ModelCostRow[];
 
     return rows.map(row => this.rowToCostRecord(row));
   }
@@ -272,7 +278,7 @@ export class CostDatabase {
     last_used: number | null;
   }> {
     const filters: string[] = [];
-    const params: any[] = [];
+    const params: Array<string | number> = [];
     if (opts?.model) {
       filters.push('model = ?');
       params.push(opts.model);
@@ -368,7 +374,7 @@ export class CostDatabase {
     );
   }
 
-  private rowToCostRecord(row: any): CostRecord {
+  private rowToCostRecord(row: ModelCostRow): CostRecord {
     return {
       model: row.model,
       provider: row.provider,

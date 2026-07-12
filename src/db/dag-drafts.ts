@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import type { Dag } from '../types/index.js';
 import { DagSchema } from '../types/schemas.js';
 import { redactSecrets } from '../v2/security/redact.js';
+import { withSqliteRetrySync } from './sqlite-retry.js';
 
 export type DagDraftStatus = 'draft' | 'archived' | 'started';
 
@@ -46,6 +47,9 @@ interface DagDraftRow {
   created_at: number;
   updated_at: number;
 }
+
+const DAG_DRAFT_COLUMNS = `id, workspace, title, objective, dag_json, status, source,
+              started_workflow_id, created_at, updated_at`;
 
 const SECRET_TOKEN_PATTERNS = [
   /\bsk-[A-Za-z0-9_-]{12,}\b/g,
@@ -115,21 +119,28 @@ export function createDagDraft(db: Database.Database, input: CreateDagDraftInput
   const now = Date.now();
   const id = newDagDraftId();
 
-  db.prepare(
-    `INSERT INTO dag_drafts
+  withSqliteRetrySync(() =>
+    db.prepare(
+      `INSERT INTO dag_drafts
        (id, workspace, title, objective, dag_json, status, source,
         started_workflow_id, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'draft', ?, NULL, ?, ?)`,
-  ).run(id, workspace, title, objective, dagJson, source, now, now);
+    ).run(id, workspace, title, objective, dagJson, source, now, now),
+  );
 
-  return loadDagDraft(db, id)!;
+  return loadDagDraftOrThrow(db, id);
+}
+
+function loadDagDraftOrThrow(db: Database.Database, id: string): DagDraft {
+  const draft = loadDagDraft(db, id);
+  if (!draft) throw new Error(`DAG draft not found after write: ${id}`);
+  return draft;
 }
 
 export function loadDagDraft(db: Database.Database, id: string): DagDraft | null {
   const row = db
     .prepare(
-      `SELECT id, workspace, title, objective, dag_json, status, source,
-              started_workflow_id, created_at, updated_at
+      `SELECT ${DAG_DRAFT_COLUMNS}
          FROM dag_drafts
         WHERE id = ?`,
     )
@@ -154,8 +165,7 @@ export function listDagDrafts(
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const rows = db
     .prepare(
-      `SELECT id, workspace, title, objective, dag_json, status, source,
-              started_workflow_id, created_at, updated_at
+      `SELECT ${DAG_DRAFT_COLUMNS}
          FROM dag_drafts
         ${where}
         ORDER BY updated_at DESC, created_at DESC`,
@@ -186,8 +196,9 @@ export function patchDagDraft(
     : existing.started_workflow_id;
   const updatedAt = Date.now();
 
-  db.prepare(
-    `UPDATE dag_drafts
+  withSqliteRetrySync(() =>
+    db.prepare(
+      `UPDATE dag_drafts
         SET title = ?,
             objective = ?,
             dag_json = ?,
@@ -195,12 +206,15 @@ export function patchDagDraft(
             started_workflow_id = ?,
             updated_at = ?
       WHERE id = ?`,
-  ).run(title, objective, dagJson, status, startedWorkflowId, updatedAt, id);
+    ).run(title, objective, dagJson, status, startedWorkflowId, updatedAt, id),
+  );
 
-  return loadDagDraft(db, id)!;
+  return loadDagDraftOrThrow(db, id);
 }
 
 export function deleteDagDraft(db: Database.Database, id: string): boolean {
-  const result = db.prepare('DELETE FROM dag_drafts WHERE id = ?').run(id);
+  const result = withSqliteRetrySync(() =>
+    db.prepare('DELETE FROM dag_drafts WHERE id = ?').run(id),
+  );
   return result.changes > 0;
 }

@@ -33,10 +33,7 @@ export function parseOperatorModels(objective: string): Map<string, string> {
   // We scan line by line so the line-anchor for the task name is the same
   // physical line as the model directive.
   const lines = objective.split(/\r?\n/);
-  // Heuristic: a task line begins with something like "tN", "tN —", "tN -", a name,
-  // followed by a body that may contain "(model: <id>)".
   const modelDirective = /\(model\s*:\s*([^\s)]+)\s*\)/i;
-  const taskAnchor = /\b(t\d+|task\s+\d+|—\s*(.+?)\s+(?:cli:|advisor:|pal:|tool:))/i;
 
   for (const line of lines) {
     const mModel = modelDirective.exec(line);
@@ -78,7 +75,7 @@ export function enforceOperatorModels(
   const newTasks: DagTask[] = dag.tasks.map((task) => {
     const taskName = (task.name ?? '').toLowerCase();
     for (const [namePrefix, intendedModel] of operatorModels) {
-      if (taskName.startsWith(namePrefix.slice(0, Math.min(20, namePrefix.length)))) {
+      if (taskName.startsWith(namePrefix.slice(0, 20))) {
         if (task.model !== intendedModel) {
           fixes.push({
             task_name: task.name ?? '(unnamed)',

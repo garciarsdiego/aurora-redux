@@ -142,19 +142,50 @@ function memoBin(key: string, factory: () => string): string {
   return v;
 }
 
-export function codexBin(): string {
-  return memoBin('codex', () => {
-    const override = process.env.CLI_CODEX_BIN;
+// Shared config-driven pipeline for the per-CLI resolvers below. Every CLI
+// except claude follows the exact same shape: env override (existsSync-gated)
+// → bare name on non-win32 → latest-version pick across absolute candidates
+// → PATH probe over fallback names → hardcoded default. Adding a new CLI is
+// one resolveCliBinary call. claudeBin stays hand-rolled — its .cmd-over-.exe
+// preference is load-bearing (see the round-6 ENOENT comments on it).
+interface ResolveCliBinaryConfig {
+  /** Memoization key AND the bare command returned on non-win32 platforms. */
+  name: string;
+  /** Env var that force-overrides resolution when it points at a real file. */
+  envVar: string;
+  /** win32 absolute-path candidates fed to pickLatestVersion (lazy — only
+   *  evaluated on the memoized first resolution). */
+  candidates?: () => string[];
+  /** Names probed via resolveExistingBinary when no candidate resolves. */
+  fallbackNames: string[];
+  /** Last-ditch default when nothing on disk or PATH matches. */
+  fallbackDefault: string;
+}
+
+function resolveCliBinary(cfg: ResolveCliBinaryConfig): string {
+  return memoBin(cfg.name, () => {
+    const override = process.env[cfg.envVar];
     if (override && existsSync(override)) return override;
-    if (process.platform !== 'win32') return 'codex';
-    const localAppData = process.env.LOCALAPPDATA;
-    const candidates = [
-      ...(localAppData ? [join(localAppData, 'OpenAI', 'Codex', 'bin', 'codex.exe')] : []),
-      ...commonNpmShimDirs().map(d => join(d, 'codex.cmd')),
-    ];
-    const latest = pickLatestVersion(candidates);
+    if (process.platform !== 'win32') return cfg.name;
+    const latest = cfg.candidates ? pickLatestVersion(cfg.candidates()) : null;
     if (latest) return latest;
-    return resolveExistingBinary(['codex.exe', 'codex.cmd', 'codex']) ?? 'codex.exe';
+    return resolveExistingBinary(cfg.fallbackNames) ?? cfg.fallbackDefault;
+  });
+}
+
+export function codexBin(): string {
+  return resolveCliBinary({
+    name: 'codex',
+    envVar: 'CLI_CODEX_BIN',
+    candidates: () => {
+      const localAppData = process.env.LOCALAPPDATA;
+      return [
+        ...(localAppData ? [join(localAppData, 'OpenAI', 'Codex', 'bin', 'codex.exe')] : []),
+        ...commonNpmShimDirs().map(d => join(d, 'codex.cmd')),
+      ];
+    },
+    fallbackNames: ['codex.exe', 'codex.cmd', 'codex'],
+    fallbackDefault: 'codex.exe',
   });
 }
 
@@ -191,90 +222,78 @@ export function claudeBin(): string {
   });
 }
 
-export function geminiBin(): string {
-  return memoBin('gemini', () => {
-    const override = process.env.CLI_GEMINI_BIN;
-    if (override && existsSync(override)) return override;
-    if (process.platform !== 'win32') return 'gemini';
-    const candidates = commonNpmShimDirs().map(d => join(d, 'gemini.cmd'));
-    const latest = pickLatestVersion(candidates);
-    if (latest) return latest;
-    return resolveExistingBinary(['gemini.cmd', 'gemini.exe', 'gemini']) ?? 'gemini.cmd';
-  });
-}
+// NOTE: geminiBin() was removed 2026-07-11 — dead code with zero importers.
+// The gemini adapter migrated to agyBin() (Antigravity CLI) on 2026-07-04
+// after gemini-cli shut down; see adapters/gemini.ts for the migration notes.
 
 // Antigravity CLI (`agy`) — successor to the deprecated gemini-cli (shut down
 // 2026-06-18). Installed at %LOCALAPPDATA%\agy\bin\agy on Windows; usually on
 // PATH. Aurora-Redux uses it for the cli:gemini spawn path.
 export function agyBin(): string {
-  return memoBin('agy', () => {
-    const override = process.env.CLI_AGY_BIN;
-    if (override && existsSync(override)) return override;
-    if (process.platform !== 'win32') return 'agy';
-    return resolveExistingBinary(['agy.exe', 'agy.cmd', 'agy']) ?? 'agy.exe';
+  return resolveCliBinary({
+    name: 'agy',
+    envVar: 'CLI_AGY_BIN',
+    fallbackNames: ['agy.exe', 'agy.cmd', 'agy'],
+    fallbackDefault: 'agy.exe',
   });
 }
 
 export function kimiBin(): string {
-  return memoBin('kimi', () => {
-    const override = process.env.CLI_KIMI_BIN;
-    if (override && existsSync(override)) return override;
-    if (process.platform !== 'win32') return 'kimi';
-    const localBin = userLocalBin();
-    const candidates = [
-      ...(localBin ? [join(localBin, 'kimi.exe'), join(localBin, 'kimi-cli.exe')] : []),
-      ...commonNpmShimDirs().map(d => join(d, 'kimi.cmd')),
-    ];
-    const latest = pickLatestVersion(candidates);
-    if (latest) return latest;
-    return resolveExistingBinary(['kimi.exe', 'kimi.cmd', 'kimi']) ?? 'kimi.cmd';
+  return resolveCliBinary({
+    name: 'kimi',
+    envVar: 'CLI_KIMI_BIN',
+    candidates: () => {
+      const localBin = userLocalBin();
+      return [
+        ...(localBin ? [join(localBin, 'kimi.exe'), join(localBin, 'kimi-cli.exe')] : []),
+        ...commonNpmShimDirs().map(d => join(d, 'kimi.cmd')),
+      ];
+    },
+    fallbackNames: ['kimi.exe', 'kimi.cmd', 'kimi'],
+    fallbackDefault: 'kimi.cmd',
   });
 }
 
 export function cursorAgentBin(): string {
-  return memoBin('cursor-agent', () => {
-    const override = process.env.CLI_CURSOR_BIN;
-    if (override && existsSync(override)) return override;
-    if (process.platform !== 'win32') return 'cursor-agent';
-    const localAppData = process.env.LOCALAPPDATA;
-    const localBin = userLocalBin();
-    const candidates = [
-      ...(localBin ? [join(localBin, 'cursor-agent.exe')] : []),
-      ...(localAppData ? [
-        join(localAppData, 'cursor-agent', 'cursor-agent.cmd'),
-        join(localAppData, 'cursor-agent', 'agent.cmd'),
-      ] : []),
-      ...commonNpmShimDirs().map(d => join(d, 'cursor-agent.cmd')),
-    ];
-    const latest = pickLatestVersion(candidates);
-    if (latest) return latest;
-    return resolveExistingBinary([
+  return resolveCliBinary({
+    name: 'cursor-agent',
+    envVar: 'CLI_CURSOR_BIN',
+    candidates: () => {
+      const localAppData = process.env.LOCALAPPDATA;
+      const localBin = userLocalBin();
+      return [
+        ...(localBin ? [join(localBin, 'cursor-agent.exe')] : []),
+        ...(localAppData ? [
+          join(localAppData, 'cursor-agent', 'cursor-agent.cmd'),
+          join(localAppData, 'cursor-agent', 'agent.cmd'),
+        ] : []),
+        ...commonNpmShimDirs().map(d => join(d, 'cursor-agent.cmd')),
+      ];
+    },
+    fallbackNames: [
       'cursor-agent.cmd', 'cursor-agent.exe', 'cursor-agent',
       'agent.cmd', 'agent',
-    ]) ?? 'cursor-agent.cmd';
+    ],
+    fallbackDefault: 'cursor-agent.cmd',
   });
 }
 
 export function kiloBin(): string {
-  return memoBin('kilo', () => {
-    const override = process.env.CLI_KILO_BIN;
-    if (override && existsSync(override)) return override;
-    if (process.platform !== 'win32') return 'kilo';
-    const candidates = commonNpmShimDirs().map(d => join(d, 'kilo.cmd'));
-    const latest = pickLatestVersion(candidates);
-    if (latest) return latest;
-    return resolveExistingBinary(['kilo.cmd', 'kilo.exe', 'kilo']) ?? 'kilo.cmd';
+  return resolveCliBinary({
+    name: 'kilo',
+    envVar: 'CLI_KILO_BIN',
+    candidates: () => commonNpmShimDirs().map(d => join(d, 'kilo.cmd')),
+    fallbackNames: ['kilo.cmd', 'kilo.exe', 'kilo'],
+    fallbackDefault: 'kilo.cmd',
   });
 }
 
 export function opencodeBin(): string {
-  return memoBin('opencode', () => {
-    const override = process.env.CLI_OPENCODE_BIN;
-    if (override && existsSync(override)) return override;
-    if (process.platform !== 'win32') return 'opencode';
-    const candidates = commonNpmShimDirs().map(d => join(d, 'opencode.cmd'));
-    const latest = pickLatestVersion(candidates);
-    if (latest) return latest;
-    return resolveExistingBinary(['opencode.cmd', 'opencode.exe', 'opencode']) ?? 'opencode.cmd';
+  return resolveCliBinary({
+    name: 'opencode',
+    envVar: 'CLI_OPENCODE_BIN',
+    candidates: () => commonNpmShimDirs().map(d => join(d, 'opencode.cmd')),
+    fallbackNames: ['opencode.cmd', 'opencode.exe', 'opencode'],
+    fallbackDefault: 'opencode.cmd',
   });
 }

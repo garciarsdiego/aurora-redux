@@ -46,7 +46,7 @@ function isUnderRoot(file: string, projectRoot: string): boolean {
   return norm === root || norm.startsWith(root + '/');
 }
 
-function matchesGlob(file: string, pattern: string): boolean {
+function globToRegExp(pattern: string): RegExp {
   // Translate glob to regex: ** -> .*, * -> [^/]*, ? -> [^/], escape others.
   const escape = (s: string) => s.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   let re = '';
@@ -58,7 +58,7 @@ function matchesGlob(file: string, pattern: string): boolean {
     else if (c === '?') { re += '[^/]'; i += 1; }
     else { re += escape(c); i += 1; }
   }
-  return new RegExp(`^${re}$`).test(file);
+  return new RegExp(`^${re}$`);
 }
 
 const BUILTIN_TEST_ALLOWLIST = [
@@ -229,7 +229,10 @@ function validatesAllowedFiles(
   const issues: ProductEvidenceIssue[] = [];
   if (contract.allowedFiles.length === 0) return issues;
 
-  const allowed = [...contract.allowedFiles, ...BUILTIN_TEST_ALLOWLIST].map(normalizePath);
+  // Pre-compile the allowed patterns once — matchesGlob-per-(file, pattern)
+  // would rebuild the same RegExp up to 500×N times across the file cap.
+  const allowed = [...contract.allowedFiles, ...BUILTIN_TEST_ALLOWLIST]
+    .map((pattern) => globToRegExp(normalizePath(pattern)));
   const projectRoot = contract.projectRoot ?? '';
 
   for (const file of changedFiles) {
@@ -239,7 +242,7 @@ function validatesAllowedFiles(
     // path is already relative (or outside the root), `relativizeUnderRoot`
     // returns the normalized form unchanged.
     const candidate = projectRoot ? relativizeUnderRoot(file, projectRoot) : normalizePath(file);
-    const matched = allowed.some((pattern) => matchesGlob(candidate, pattern));
+    const matched = allowed.some((pattern) => pattern.test(candidate));
     if (matched) continue;
 
     issues.push({
@@ -260,12 +263,16 @@ function validatesAllowedFiles(
 export function reviewArchitectureIntegration(input: ArchitectureReviewInput): ProductEvidenceIssue[] {
   const issues: ProductEvidenceIssue[] = [];
   const forbidden = input.contract?.forbiddenPatterns ?? [];
-  const sidecarForbidden =
-    !input.contract || forbidden.some((pattern) => /DOM island|sidecar|separate/i.test(pattern));
+  const forbidsSidecarPattern = forbidden.some((pattern) => /DOM island|sidecar|separate/i.test(pattern));
+  const sidecarForbidden = !input.contract || forbidsSidecarPattern;
+
+  // Shared across the sidecar/duplicate-store loop below AND the contract
+  // detectors — each file is read from disk at most once per review.
+  const contentCache = new Map<string, string>();
 
   for (const file of input.files) {
-    const content = safeRead(file);
-    if (!content) continue;
+    const content = readWithCache(file, contentCache);
+    if (content === null) continue;
     if (sidecarForbidden && isSidecarRoot(content)) {
       issues.push({
         severity: 'blocking',
@@ -314,12 +321,7 @@ export function reviewArchitectureIntegration(input: ArchitectureReviewInput): P
       });
     }
 
-    const explicitlyForbidden = (contract.forbiddenPatterns ?? []).some(
-      (p: string) => /DOM island|sidecar|separate/i.test(p),
-    );
-    const optedIn = isStandaloneOptIn(objective) && !explicitlyForbidden;
-
-    const contentCache = new Map<string, string>();
+    const optedIn = isStandaloneOptIn(objective) && !forbidsSidecarPattern;
 
     try {
       if (!optedIn) {

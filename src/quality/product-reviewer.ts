@@ -5,6 +5,7 @@ import type {
   QualityIssue,
   QualityReviewOutcome,
 } from './types.js';
+import { qualityIssuesFromProductEvidence } from './internal-utils.js';
 
 export interface ProductReviewResult {
   outcome: QualityReviewOutcome;
@@ -99,14 +100,10 @@ function issueFixTask(issue: QualityIssue): QualityFixTaskDraft {
 export function reviewFinalProductEvidenceBundle(
   bundle: FinalProductEvidenceBundle,
 ): ProductReviewResult {
-  const harnessIssues: QualityIssue[] = bundle.productHarness.issues.map((issue) => ({
-    severity: issue.severity,
-    code: issue.code,
-    origin: `product_harness:${bundle.productHarness.harness}`,
-    message: issue.message,
-    suggestedAction: issue.suggestedAction,
-    safeContext: issue.safeContext,
-  }));
+  const harnessIssues = qualityIssuesFromProductEvidence(
+    bundle.productHarness.issues,
+    `product_harness:${bundle.productHarness.harness}`,
+  );
 
   const currentErrorIssues: QualityIssue[] = bundle.structuredErrors.slice(0, 12).map((error) => ({
     severity: 'warning',

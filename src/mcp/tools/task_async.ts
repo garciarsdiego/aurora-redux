@@ -134,14 +134,21 @@ export async function omniforgeTaskCancel(raw: unknown): Promise<string> {
     body: JSON.stringify({ reason: 'mcp_task_cancel' }),
   });
 
-  const body = await res.json() as {
+  // Read the body as text first: error responses may not be JSON (e.g. an
+  // HTML 502 from a proxy, plain text on 500). Parsing best-effort keeps the
+  // real HTTP status in the error message instead of a cryptic SyntaxError.
+  const rawBody = await res.text();
+  let body: {
     wf_id?: string;
     workflow_id?: string;
     cancelled?: boolean;
     tasks_cancelled?: number;
     error?: string;
     status?: string;
-  };
+  } = {};
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch { /* non-JSON body — fall back to the status-based error below */ }
 
   if (!res.ok) {
     throw new Error(body.error ?? `Cancel request failed with HTTP ${res.status}`);

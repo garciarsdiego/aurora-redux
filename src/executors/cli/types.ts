@@ -2,9 +2,9 @@
 // types.ts — shared types for the cli executor module.
 //
 // Scope: pure type/interface declarations consumed by every other file under
-// `src/executors/cli/`. No runtime code, no imports beyond the ambient
-// `Task` shape. Splitting types out lets adapters import what they need
-// without dragging the orchestrator into a circular-import graph.
+// `src/executors/cli/`. No runtime code, no runtime imports — `import type`
+// only, erased at compilation. Splitting types out lets adapters import what
+// they need without dragging the orchestrator into a circular-import graph.
 //
 // IMPORTANT — preserve EVERY load-bearing comment block. Each interface here
 // documents semantic invariants discovered through field debugging:
@@ -13,6 +13,8 @@
 //   • CliSpec.streamJson   — H16 native-subagent-delegation observability
 //   • RunCliOpts.runtime   — Wave 2 Agents G/H gemini stream-json resume wiring
 // =============================================================================
+
+import type { WorkflowProgressEvent } from '../../brain/executor/types.js';
 
 export interface CliSpec {
   bin: string;
@@ -124,7 +126,7 @@ export interface RunCliOpts {
    * when streamJson=true (claude-code default). Non-streamJson CLIs (codex,
    * gemini, kimi) ignore this opt.
    */
-  onEvent?: (event: import('../../brain/executor/types.js').WorkflowProgressEvent) => void | Promise<void>;
+  onEvent?: (event: WorkflowProgressEvent) => void | Promise<void>;
   /**
    * Optional runtime adapter overrides for two-turn / resume flows. Wave 2
    * Agents G/H wire this to their respective harness paths (claude / gemini).

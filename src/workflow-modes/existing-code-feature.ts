@@ -62,12 +62,11 @@ function taskIdSet(tasks: DagTask[]): Set<string> {
   return new Set(tasks.map((task) => task.id));
 }
 
-function uniqueTaskId(tasks: DagTask[], base: string): string {
-  const existing = taskIdSet(tasks);
-  if (!existing.has(base)) return base;
+function uniqueTaskId(takenIds: Set<string>, base: string): string {
+  if (!takenIds.has(base)) return base;
   for (let index = 2; index < 100; index++) {
     const candidate = `${base}_${index}`;
-    if (!existing.has(candidate)) return candidate;
+    if (!takenIds.has(candidate)) return candidate;
   }
   throw new Error(`Could not allocate unique DAG task id for ${base}`);
 }
@@ -89,8 +88,10 @@ export function applyExistingCodeFeatureModeToDag(dag: Dag): Dag {
 
   const tasks = dag.tasks.map((task) => ({ ...task, depends_on: [...task.depends_on] }));
   const gateId = planGateId(tasks);
-  const scoutId = uniqueTaskId(tasks, 'architecture_scout');
-  const contractId = uniqueTaskId([...tasks, { id: scoutId } as DagTask], 'architecture_contract');
+  const takenIds = taskIdSet(tasks);
+  const scoutId = uniqueTaskId(takenIds, 'architecture_scout');
+  takenIds.add(scoutId);
+  const contractId = uniqueTaskId(takenIds, 'architecture_contract');
 
   const scoutTask: DagTask = {
     id: scoutId,
@@ -136,9 +137,20 @@ export function applyExistingCodeFeatureModeToDag(dag: Dag): Dag {
   };
 }
 
-function safeReadJson(path: string): Record<string, unknown> {
+/**
+ * Returns null when the file is absent/unreadable, and an empty object when
+ * it exists but does not parse to a JSON object. Callers can therefore tell
+ * "no file" apart from "invalid file".
+ */
+function safeReadJson(path: string): Record<string, unknown> | null {
+  let raw: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
+    raw = readFileSync(path, 'utf-8');
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
       : {};
@@ -185,12 +197,12 @@ function rel(root: string, file: string): string {
 
 function detectAppType(root: string, files: string[]): ArchitectureContract['appType'] {
   const pkg = safeReadJson(join(root, 'package.json'));
-  const deps = {
+  const deps = pkg === null ? {} : {
     ...(pkg['dependencies'] && typeof pkg['dependencies'] === 'object' ? pkg['dependencies'] as Record<string, unknown> : {}),
     ...(pkg['devDependencies'] && typeof pkg['devDependencies'] === 'object' ? pkg['devDependencies'] as Record<string, unknown> : {}),
   };
   if ('react' in deps || files.some((file) => /(^|[\\/])(main|App)\.tsx?$/.test(file))) return 'react';
-  if (existsSync(join(root, 'package.json'))) return 'node';
+  if (pkg !== null) return 'node';
   return 'unknown';
 }
 

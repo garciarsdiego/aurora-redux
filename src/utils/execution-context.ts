@@ -2,6 +2,7 @@ import { isAbsolute, resolve as pathResolve } from 'node:path';
 import type { Task } from '../types/index.js';
 import { initDb } from '../db/client.js';
 import { getDbPath } from './config.js';
+import { safeJsonObject } from './safe-parse-json.js';
 
 export interface TaskExecutionLineage {
   lane: 'software';
@@ -37,15 +38,7 @@ function resolveContextPath(raw: unknown, fallback: string, baseDir: string): st
 }
 
 function parseTaskInput(task: Pick<Task, 'input_json'>): Record<string, unknown> {
-  if (!task.input_json) return {};
-  try {
-    const parsed = JSON.parse(task.input_json) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
+  return safeJsonObject(task.input_json, { where: 'execution_context.parseTaskInput' });
 }
 
 function readWorkflowWorkspace(workflowId: string): string | null {

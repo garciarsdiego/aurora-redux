@@ -1,3 +1,4 @@
+import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { initDb } from '../../db/client.js';
 import { decompose } from '../../brain/decomposer.js';
@@ -19,9 +20,8 @@ import type { Dag, Workflow } from '../../types/index.js';
 import { notifyTelegram } from '../../utils/telegram-notify.js';
 import { redactContextText } from '../../context/redaction.js';
 import { scanForInjection } from '../../v2/injection-scan/index.js';
-import { loadSkillsFromDir } from '../../v2/skills/registry.js';
 import { applyBestSkillExecutionMode } from '../../v2/skills/apply-to-dag.js';
-import { runSkillsPreflight, type PermissionAction } from '../../v2/skills/preflight.js';
+import { runSkillsPreflight } from '../../v2/skills/preflight.js';
 import { detectTriggers, suggestSpecialistAdvisor } from '../../v2/triggers/auto-route.js';
 import { resolve as resolvePath } from 'node:path';
 import { withCliPermissionMode, type CliPermissionMode } from '../../executors/cli.js';
@@ -33,6 +33,10 @@ import {
   recordArchitectureContract,
   type WorkflowMode,
 } from '../../workflow-modes/existing-code-feature.js';
+// FASE 1B Bloco A.3 wire-up — load SKILL.md files from disk once per process
+// so the skill matcher has a corpus to choose from. Shared with
+// plan_workflow.ts. Idempotent.
+import { ensureSkillsLoaded } from './ensure-skills.js';
 
 // Keeps background promises alive so they are not GC'd before finishing.
 const bgExecutions = new Map<string, Promise<void>>();
@@ -45,16 +49,6 @@ const bgExecutions = new Map<string, Promise<void>>();
 // freshly-decomposed DAG without going through the MCP request shape.
 export function getInFlightBackgroundExecutions(): ReadonlyMap<string, Promise<void>> {
   return bgExecutions;
-}
-
-// FASE 1B Bloco A.3 wire-up — load SKILL.md files from disk once per process
-// so the skill matcher has a corpus to choose from. Idempotent.
-let _skillsLoaded = false;
-function ensureSkillsLoaded(): void {
-  if (_skillsLoaded) return;
-  const dir = process.env.OMNIFORGE_SKILLS_DIR ?? 'hermes/skills';
-  loadSkillsFromDir(dir);
-  _skillsLoaded = true;
 }
 
 function findHitlModifyError(err: unknown): HitlModifyError | null {
@@ -229,6 +223,143 @@ export function executeWorkflowInBackground(
   return bgPromise;
 }
 
+/**
+ * Camada D — resolve o software_target.project_root persistido no metadata
+ * do workspace (dashboard_workspaces.metadata_json). Retorna null quando o
+ * metadata está ausente/malformado ou não define um project_root utilizável.
+ */
+function resolveSoftwareProjectRoot(db: Database.Database, workspace: string): string | null {
+  const wsRow = db.prepare(
+    `SELECT metadata_json FROM dashboard_workspaces WHERE name = ?`,
+  ).get(workspace) as { metadata_json: string | null } | undefined;
+  let metadata: Record<string, unknown> = {};
+  try {
+    if (wsRow?.metadata_json) {
+      const parsed = JSON.parse(wsRow.metadata_json) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        metadata = parsed as Record<string, unknown>;
+      }
+    }
+  } catch { /* malformed metadata — treated as missing */ }
+  const target = metadata['software_target'];
+  const projectRoot =
+    target && typeof target === 'object'
+      ? (target as { project_root?: unknown }).project_root
+      : undefined;
+  return typeof projectRoot === 'string' && projectRoot.length > 0 ? projectRoot : null;
+}
+
+/**
+ * Records the architecture contract for existing_code_feature runs.
+ * Best-effort: failures are audited as architecture_contract_error events
+ * and never abort the workflow.
+ */
+function recordArchitectureContractEvent(
+  db: Database.Database,
+  opts: { wfId: string; workflowMode: WorkflowMode; projectRoot: string; objective: string },
+): void {
+  const { wfId, workflowMode, projectRoot, objective } = opts;
+  try {
+    const architectureContract = buildArchitectureContractFromProjectRoot({
+      runId: wfId,
+      projectRoot,
+      objective,
+    });
+    recordArchitectureContract(db, {
+      runId: wfId,
+      contract: architectureContract,
+    });
+    insertEvent(db, {
+      workflow_id: wfId,
+      type: 'architecture_contract_recorded',
+      payload: {
+        workflow_mode: workflowMode,
+        app_type: architectureContract.appType,
+        project_root: architectureContract.projectRoot,
+        state_store_count: architectureContract.existingStateStores.length,
+        ui_surface_count: architectureContract.existingUiSurfaces.length,
+      },
+    });
+  } catch (err) {
+    insertEvent(db, {
+      workflow_id: wfId,
+      type: 'architecture_contract_error',
+      payload: {
+        workflow_mode: workflowMode,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
+  }
+}
+
+/** Telemetry for the skill match (call after workflow row exists so FK holds). */
+function recordSkillMatchEvent(
+  db: Database.Database,
+  wfId: string,
+  skillResult: ReturnType<typeof applyBestSkillExecutionMode>,
+): void {
+  if (!skillResult.matchedSkill) return;
+  insertEvent(db, {
+    workflow_id: wfId,
+    type: 'skill_execution_mode_applied',
+    payload: {
+      skill: skillResult.matchedSkill.name,
+      execution_mode: skillResult.matchedSkill.execution_mode,
+      match_score: skillResult.matchScore ?? null,
+    },
+  });
+}
+
+/** Telemetry for skills preflight (FK must be satisfied — wfId exists in DB). */
+function recordSkillsPreflightEvent(
+  db: Database.Database,
+  wfId: string,
+  preflightResult: Awaited<ReturnType<typeof runSkillsPreflight>>,
+): void {
+  insertEvent(db, {
+    workflow_id: wfId,
+    type: 'skills_preflight',
+    payload: {
+      ok: preflightResult.ok,
+      skills: preflightResult.skills.map((s) => ({
+        name: s.name,
+        status: s.status,
+        permission: s.permission,
+        source: s.source ?? null,
+      })),
+      errors: preflightResult.errors,
+    },
+  });
+}
+
+/**
+ * Auto-route triggers — detect content cues in the objective (code blocks,
+ * URLs, image/PDF attachments) and surface them as an event so the operator
+ * can see which specialist advisor would be relevant. Does NOT alter the
+ * DAG; this is observability + future HITL nudge material.
+ * See src/v2/triggers/auto-route.ts.
+ */
+function recordTriggersDetectedEvent(db: Database.Database, wfId: string, objective: string): void {
+  const triggers = detectTriggers(objective);
+  if (triggers.length === 0) return;
+  const advisorHint = suggestSpecialistAdvisor(triggers);
+  insertEvent(db, {
+    workflow_id: wfId,
+    type: 'triggers_detected',
+    payload: {
+      count: triggers.length,
+      kinds: Array.from(new Set(triggers.map((t) => t.kind))),
+      advisor_hint: advisorHint,
+      // Cap the per-trigger payload to keep the event row small.
+      samples: triggers.slice(0, 5).map((t) => ({
+        kind: t.kind,
+        payload: t.payload.slice(0, 120),
+        specialist_persona_hint: t.specialist_persona_hint ?? null,
+      })),
+    },
+  });
+}
+
 export const RunWorkflowSchema = z.object({
   workspace: z.string().regex(VALID_WORKSPACE_RE, 'Invalid workspace name (alphanumeric/underscore/hyphen only)'),
   objective: z.string().min(1),
@@ -259,7 +390,7 @@ export type RunWorkflowInput = z.infer<typeof RunWorkflowSchema>;
 export async function runWorkflowTool(raw: unknown): Promise<string> {
   const input = RunWorkflowSchema.parse(raw);
   const { workspace, objective, auto_approve, precomputed_dag, workflow_mode, cli_permission_mode, max_total_cost_usd, max_duration_seconds, skills_required, skills_permission_map } = input;
-  const workflowMode = workflow_mode as WorkflowMode;
+  const workflowMode = workflow_mode;
   const planningObjective = workflowMode === 'existing_code_feature'
     ? existingCodePlanningInstruction(objective)
     : objective;
@@ -350,7 +481,7 @@ export async function runWorkflowTool(raw: unknown): Promise<string> {
       preflightResult = await runSkillsPreflight({
         skillsRequired: Array.from(skillsToPreflight),
         workspaceDir,
-        permissionMap: (skills_permission_map ?? {}) as Record<string, PermissionAction>,
+        permissionMap: skills_permission_map ?? {},
       });
 
       if (!preflightResult.ok) {
@@ -375,26 +506,7 @@ export async function runWorkflowTool(raw: unknown): Promise<string> {
     const hasCliSpawn = dag.tasks.some((t) => t.kind === 'cli_spawn');
     let softwareProjectRoot: string | null = null;
     if (hasCliSpawn || workflowMode === 'existing_code_feature') {
-      const wsRow = db.prepare(
-        `SELECT metadata_json FROM dashboard_workspaces WHERE name = ?`,
-      ).get(workspace) as { metadata_json: string | null } | undefined;
-      let metadata: Record<string, unknown> = {};
-      try {
-        if (wsRow?.metadata_json) {
-          const parsed = JSON.parse(wsRow.metadata_json) as unknown;
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            metadata = parsed as Record<string, unknown>;
-          }
-        }
-      } catch { /* malformed metadata — treated as missing */ }
-      const target = metadata['software_target'];
-      const projectRoot =
-        target && typeof target === 'object'
-          ? (target as { project_root?: unknown }).project_root
-          : undefined;
-      softwareProjectRoot = typeof projectRoot === 'string' && projectRoot.length > 0
-        ? projectRoot
-        : null;
+      softwareProjectRoot = resolveSoftwareProjectRoot(db, workspace);
       if (hasCliSpawn && !softwareProjectRoot) {
         return JSON.stringify({
           error:
@@ -430,95 +542,22 @@ export async function runWorkflowTool(raw: unknown): Promise<string> {
     insertWorkflow(db, workflowRecord);
 
     if (workflowMode === 'existing_code_feature' && softwareProjectRoot) {
-      try {
-        const architectureContract = buildArchitectureContractFromProjectRoot({
-          runId: wfId,
-          projectRoot: softwareProjectRoot,
-          objective,
-        });
-        recordArchitectureContract(db, {
-          runId: wfId,
-          contract: architectureContract,
-        });
-        insertEvent(db, {
-          workflow_id: wfId,
-          type: 'architecture_contract_recorded',
-          payload: {
-            workflow_mode: workflowMode,
-            app_type: architectureContract.appType,
-            project_root: architectureContract.projectRoot,
-            state_store_count: architectureContract.existingStateStores.length,
-            ui_surface_count: architectureContract.existingUiSurfaces.length,
-          },
-        });
-      } catch (err) {
-        insertEvent(db, {
-          workflow_id: wfId,
-          type: 'architecture_contract_error',
-          payload: {
-            workflow_mode: workflowMode,
-            error: err instanceof Error ? err.message : String(err),
-          },
-        });
-      }
-    }
-
-    // Telemetry for the skill match (after workflow row exists so FK holds).
-    if (skillResult.matchedSkill) {
-      insertEvent(db, {
-        workflow_id: wfId,
-        type: 'skill_execution_mode_applied',
-        payload: {
-          skill: skillResult.matchedSkill.name,
-          execution_mode: skillResult.matchedSkill.execution_mode,
-          match_score: skillResult.matchScore ?? null,
-        },
+      recordArchitectureContractEvent(db, {
+        wfId,
+        workflowMode,
+        projectRoot: softwareProjectRoot,
+        objective,
       });
     }
-    // Telemetry for skills preflight (FK now satisfied — wfId exists in DB).
+
+    // Telemetry (after workflow row exists so the events FK holds).
+    recordSkillMatchEvent(db, wfId, skillResult);
     if (preflightResult) {
-      insertEvent(db, {
-        workflow_id: wfId,
-        type: 'skills_preflight',
-        payload: {
-          ok: preflightResult.ok,
-          skills: preflightResult.skills.map((s) => ({
-            name: s.name,
-            status: s.status,
-            permission: s.permission,
-            source: s.source ?? null,
-          })),
-          errors: preflightResult.errors,
-        },
-      });
+      recordSkillsPreflightEvent(db, wfId, preflightResult);
     }
-
-    // Auto-route triggers — detect content cues in the objective (code blocks,
-    // URLs, image/PDF attachments) and surface them as an event so the operator
-    // can see which specialist advisor would be relevant. Does NOT alter the
-    // DAG; this is observability + future HITL nudge material.
-    // See src/v2/triggers/auto-route.ts.
-    const triggers = detectTriggers(objective);
-    if (triggers.length > 0) {
-      const advisorHint = suggestSpecialistAdvisor(triggers);
-      insertEvent(db, {
-        workflow_id: wfId,
-        type: 'triggers_detected',
-        payload: {
-          count: triggers.length,
-          kinds: Array.from(new Set(triggers.map((t) => t.kind))),
-          advisor_hint: advisorHint,
-          // Cap the per-trigger payload to keep the event row small.
-          samples: triggers.slice(0, 5).map((t) => ({
-            kind: t.kind,
-            payload: t.payload.slice(0, 120),
-            specialist_persona_hint: t.specialist_persona_hint ?? null,
-          })),
-        },
-      });
-    }
+    recordTriggersDetectedEvent(db, wfId, objective);
     if (cli_permission_mode) {
-      recordWorkflowCliPermissionMode(db, wfId, cli_permission_mode as CliPermissionMode, 'run_workflow');
+      recordWorkflowCliPermissionMode(db, wfId, cli_permission_mode, 'run_workflow');
     }
 
     // Launch execution in background — returns immediately so MCP never times out.

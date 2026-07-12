@@ -199,6 +199,19 @@ function isContextMessageSeqConflict(err: unknown): boolean {
     err.message.includes('context_messages.seq');
 }
 
+/**
+ * Guard for the write-then-read pattern used throughout this module: the row
+ * was just inserted/updated, so a missing read-back means the INSERT and
+ * SELECT desynchronized — surface that loudly instead of hiding it behind a
+ * non-null assertion.
+ */
+function mustLoad<T>(row: T | null, what: string): T {
+  if (row === null) {
+    throw new Error(`Failed to load ${what} immediately after writing it`);
+  }
+  return row;
+}
+
 export function createContextChannel(
   db: Database.Database,
   input: CreateContextChannelInput,
@@ -229,7 +242,7 @@ export function createContextChannel(
       now,
       existing.id,
     );
-    return loadContextChannel(db, existing.id)!;
+    return mustLoad(loadContextChannel(db, existing.id), `context channel ${existing.id}`);
   }
 
   const id = newContextId('ch');
@@ -249,7 +262,7 @@ export function createContextChannel(
     now,
     now,
   );
-  return loadContextChannel(db, id)!;
+  return mustLoad(loadContextChannel(db, id), `context channel ${id}`);
 }
 
 export function ensureRunContextChannel(
@@ -297,7 +310,7 @@ export function createContextThread(
     now,
     now,
   );
-  return loadContextThread(db, id)!;
+  return mustLoad(loadContextThread(db, id), `context thread ${id}`);
 }
 
 export function ensureTaskContextThread(
@@ -367,15 +380,18 @@ export function createContextMessage(
     );
   });
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
+  const maxAttempts = 4;
+  for (let attempt = 1; ; attempt++) {
     try {
       insert();
-      return loadContextMessage(db, id)!;
+      break;
     } catch (err) {
-      if (attempt === 4 || !isContextMessageSeqConflict(err)) throw err;
+      // Retry only on seq races; the final attempt rethrows unconditionally,
+      // so the loop always terminates via `break` or `throw`.
+      if (attempt === maxAttempts || !isContextMessageSeqConflict(err)) throw err;
     }
   }
-  return loadContextMessage(db, id)!;
+  return mustLoad(loadContextMessage(db, id), `context message ${id}`);
 }
 
 export function loadContextMessage(db: Database.Database, id: string): ContextMessageRow | null {
@@ -422,7 +438,10 @@ export function saveContextPacket(
     input.truncated ? 1 : 0,
     now,
   );
-  return loadContextPacketForAttempt(db, input.taskId, input.attempt, input.runId)!;
+  return mustLoad(
+    loadContextPacketForAttempt(db, input.taskId, input.attempt, input.runId),
+    `context packet for task ${input.taskId} attempt ${input.attempt}`,
+  );
 }
 
 export function loadContextPacketForAttempt(
@@ -471,7 +490,7 @@ export function saveTaskHandoff(
     input.truncated ? 1 : 0,
     now,
   );
-  return loadTaskHandoff(db, id)!;
+  return mustLoad(loadTaskHandoff(db, id), `task handoff ${id}`);
 }
 
 export function loadTaskHandoff(db: Database.Database, id: string): TaskHandoffRow | null {
@@ -520,7 +539,7 @@ export function createWorkItem(db: Database.Database, input: CreateWorkItemInput
     now,
     now,
   );
-  return loadWorkItem(db, id)!;
+  return mustLoad(loadWorkItem(db, id), `work item ${id}`);
 }
 
 export function loadWorkItem(db: Database.Database, id: string): WorkItemRow | null {
@@ -563,7 +582,7 @@ export function recordContextDecision(
     safeJson(input.metadata ?? {}),
     now,
   );
-  return loadContextDecision(db, id)!;
+  return mustLoad(loadContextDecision(db, id), `context decision ${id}`);
 }
 
 export function loadContextDecision(db: Database.Database, id: string): ContextDecisionRow | null {

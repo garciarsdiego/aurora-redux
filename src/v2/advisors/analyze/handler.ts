@@ -4,8 +4,8 @@
 
 import type { Advisor, AdvisorContext, AdvisorResult } from '../types.js';
 import { getAdvisorMode } from '../shared/mode.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
-import { AnalyzeInputSchema } from './schema.js';
+import { callAdvisorLlm } from '../shared/llm.js';
+import { AnalyzeInputSchema, type AnalyzeInput } from './schema.js';
 import { ANALYZE_SYSTEM_PROMPT } from './prompt.js';
 
 const DESCRIPTION =
@@ -13,7 +13,7 @@ const DESCRIPTION =
   'Use for architecture, performance, maintainability, and pattern analysis. ' +
   'Guides through structured code review and strategic planning.';
 
-function buildUserPrompt(parsed: ReturnType<typeof AnalyzeInputSchema.parse>): string {
+function buildUserPrompt(parsed: AnalyzeInput): string {
   const lines: string[] = [
     `=== ANALYZE WORKFLOW — STEP ${parsed.step_number} of ${parsed.total_steps} ===`,
     `Analysis Type: ${parsed.analysis_type}`,
@@ -58,11 +58,9 @@ export const analyzeAdvisor: Advisor = {
     const parsed = AnalyzeInputSchema.parse(args);
     void getAdvisorMode(ctx, args);
     const userPrompt = buildUserPrompt(parsed);
-    const text = await callOmniroute({
+    const text = await callAdvisorLlm(ctx, {
       systemPrompt: ANALYZE_SYSTEM_PROMPT,
       userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     return { output: text };
   },

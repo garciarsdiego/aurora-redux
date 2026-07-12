@@ -18,14 +18,11 @@ import type {
   Advisor,
   AdvisorContext,
   AdvisorResult,
-  StepwiseAdvisorContext,
   StepwiseAdvisorResult,
 } from '../types.js';
-import { appendStep, ensureConversation, getHistory } from '../shared/conversationMemory.js';
 import { shouldUseStepwiseMemory } from '../shared/mode.js';
-import { extractContinueFocus, formatStepHistoryBlock } from '../shared/stepwisePrompt.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
-import { DebugInputSchema } from './schema.js';
+import { runStepwiseAdvisor, type StepwisePromptExtras } from '../shared/stepwisePrompt.js';
+import { DebugInputSchema, type DebugInput } from './schema.js';
 import { DEBUG_SYSTEM_PROMPT } from './prompt.js';
 
 const DESCRIPTION =
@@ -33,14 +30,7 @@ const DESCRIPTION =
   'Use for complex bugs, mysterious errors, performance issues, race conditions, memory leaks, and integration problems. ' +
   'Guides through structured investigation with hypothesis testing and expert analysis.';
 
-interface DebugPromptExtras {
-  priorOutputsBlock?: string;
-}
-
-function buildUserPrompt(
-  parsed: ReturnType<typeof DebugInputSchema.parse>,
-  extras?: DebugPromptExtras,
-): string {
+function buildUserPrompt(parsed: DebugInput, extras?: StepwisePromptExtras): string {
   const lines: string[] = [];
 
   if (extras?.priorOutputsBlock) {
@@ -100,42 +90,11 @@ export const debugAdvisor: Advisor = {
   isStepwise: true,
   async run(ctx: AdvisorContext, args: unknown): Promise<AdvisorResult | StepwiseAdvisorResult> {
     const parsed = DebugInputSchema.parse(args);
-    const stepCtx = ctx as StepwiseAdvisorContext;
-    const useStepwiseMemory = shouldUseStepwiseMemory(ctx, args);
-
-    let extras: DebugPromptExtras | undefined;
-    if (useStepwiseMemory && stepCtx.step != null) {
-      ensureConversation(stepCtx.step.conversationId, 'debug', ctx.workspace);
-      extras = {
-        priorOutputsBlock: formatStepHistoryBlock(getHistory(stepCtx.step.conversationId)),
-      };
-    }
-
-    const userPrompt = buildUserPrompt(parsed, extras);
-    const text = await callOmniroute({
+    return runStepwiseAdvisor(ctx, {
+      advisorName: 'debug',
       systemPrompt: DEBUG_SYSTEM_PROMPT,
-      userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      useStepwiseMemory: shouldUseStepwiseMemory(ctx, args),
+      buildUserPrompt: (extras) => buildUserPrompt(parsed, extras),
     });
-
-    if (useStepwiseMemory && stepCtx.step != null) {
-      appendStep(stepCtx.step.conversationId, stepCtx.step.stepNumber, text);
-    }
-
-    const focus = extractContinueFocus(text);
-    if (
-      useStepwiseMemory &&
-      stepCtx.step != null &&
-      stepCtx.step.stepNumber < stepCtx.step.totalSteps &&
-      focus
-    ) {
-      return {
-        output: text,
-        nextStep: { stepNumber: stepCtx.step.stepNumber + 1, request: focus },
-      };
-    }
-
-    return { output: text };
   },
 };

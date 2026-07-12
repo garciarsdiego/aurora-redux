@@ -4,8 +4,8 @@
 
 import type { Advisor, AdvisorContext, AdvisorResult } from '../types.js';
 import { getAdvisorMode } from '../shared/mode.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
-import { DocgenInputSchema } from './schema.js';
+import { callAdvisorLlm } from '../shared/llm.js';
+import { DocgenInputSchema, type DocgenInput } from './schema.js';
 import { DOCGEN_SYSTEM_PROMPT } from './prompt.js';
 
 const DESCRIPTION =
@@ -13,7 +13,7 @@ const DESCRIPTION =
   'Use for documentation generation, code analysis, complexity assessment, and API documentation. ' +
   'Analyzes code structure and patterns to create thorough documentation.';
 
-function buildUserPrompt(parsed: ReturnType<typeof DocgenInputSchema.parse>): string {
+function buildUserPrompt(parsed: DocgenInput): string {
   return JSON.stringify(
     {
       step: parsed.step,
@@ -42,11 +42,9 @@ export const docgenAdvisor: Advisor = {
     const parsed = DocgenInputSchema.parse(args);
     void getAdvisorMode(ctx, args);
     const userPrompt = buildUserPrompt(parsed);
-    const text = await callOmniroute({
+    const text = await callAdvisorLlm(ctx, {
       systemPrompt: DOCGEN_SYSTEM_PROMPT,
       userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     return { output: text };
   },

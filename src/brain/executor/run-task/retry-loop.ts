@@ -16,7 +16,7 @@ import {
   incrementRetryCount,
 } from '../../../db/persist.js';
 import type { BridgeResult, BestComboResult } from '../../../v2/omniroute-bridge/index.js';
-import { withTimeout, retryDelayMs } from '../internal-utils.js';
+import { withTimeout, retryDelayMs, composeAbortSignals } from '../internal-utils.js';
 import { buildMessagesFromTask } from '../upstream.js';
 import { resolveWorkflowCliPermissionMode } from '../../../db/workflow-cli-permission.js';
 import { spanContextStorage } from '../../../v2/observability/tracing.js';
@@ -71,6 +71,29 @@ function deriveFallbackRole(task: Task): OmniforgeRole {
   }
   // llm_call (and any LLM-backed kind) → the default llm-call chain.
   return 'executor-llm-call-default';
+}
+
+// Persist a model swap onto the live task AND its DB row, tolerating legacy
+// schemas without the model_used column. Shared by the persona remediation
+// (SAFE-01) and the fallback-model path (applyFallback) below.
+function persistTaskModelSwap(
+  db: Database.Database,
+  task: Task,
+  newModel: string,
+): void {
+  task.model = newModel;
+  task.model_used = newModel;
+  try {
+    db.prepare('UPDATE tasks SET model = ?, model_used = ? WHERE id = ?').run(
+      newModel,
+      newModel,
+      task.id,
+    );
+  } catch {
+    try {
+      db.prepare('UPDATE tasks SET model = ? WHERE id = ?').run(newModel, task.id);
+    } catch { /* ignore legacy schemas */ }
+  }
 }
 
 // SAFE-01 — prepend a persona-supplied prompt-prefix into the task's objective
@@ -132,19 +155,7 @@ async function applyPersonaRemediation(params: {
     // Apply the mutated fields back onto the live task.
     if (taskCtx.model && taskCtx.model !== task.model) {
       const previousModel = task.model;
-      task.model = taskCtx.model;
-      task.model_used = taskCtx.model;
-      try {
-        db.prepare('UPDATE tasks SET model = ?, model_used = ? WHERE id = ?').run(
-          taskCtx.model,
-          taskCtx.model,
-          task.id,
-        );
-      } catch {
-        try {
-          db.prepare('UPDATE tasks SET model = ? WHERE id = ?').run(taskCtx.model, task.id);
-        } catch { /* ignore legacy schemas */ }
-      }
+      persistTaskModelSwap(db, task, taskCtx.model);
       insertEvent(db, {
         workflow_id: wfId,
         task_id: task.id,
@@ -418,25 +429,10 @@ export async function runRetryLoop(params: {
         (timeoutSignal) => {
           // Bridge the timeout signal with the task-scoped cancel signal so
           // doExecute sees a single aborting signal regardless of which one
-          // fired first. CLI children spawned with this signal are killed by
+          // fired first (Wave 5A #2 — composeAbortSignals owns the listener
+          // cleanup). CLI children spawned with this signal are killed by
           // Node's child_process.spawn({ signal }) wiring.
-          const composed = new AbortController();
-          const onTimeoutAbort = (): void => composed.abort(timeoutSignal.reason);
-          const onCancelAbort = (): void => composed.abort(taskCancelSignal.reason);
-          if (timeoutSignal.aborted) composed.abort(timeoutSignal.reason);
-          else timeoutSignal.addEventListener('abort', onTimeoutAbort, { once: true });
-          if (taskCancelSignal.aborted) composed.abort(taskCancelSignal.reason);
-          else taskCancelSignal.addEventListener('abort', onCancelAbort, { once: true });
-          // Wave 5A #2: { once: true } only auto-removes when the event fires.
-          // On the happy path (no cancel, multiple retry iterations), listeners
-          // accumulate on taskCancelSignal → MaxListenersExceededWarning. Remove
-          // both listeners once this iteration's composed controller settles.
-          const cleanupListeners = (): void => {
-            timeoutSignal.removeEventListener('abort', onTimeoutAbort);
-            taskCancelSignal.removeEventListener('abort', onCancelAbort);
-          };
-          composed.signal.addEventListener('abort', cleanupListeners, { once: true });
-          const signal = composed.signal;
+          const signal = composeAbortSignals(timeoutSignal, taskCancelSignal);
           const runInner = (): Promise<string> =>
             spanContextStorage.run(
               { db, parentSpanId: taskTraceSpanId ?? null, workflowId: wfId },
@@ -617,19 +613,7 @@ export async function runRetryLoop(params: {
         ): 'continue' | 'break' => {
           const previousModel = task.model;
           if (fallbackModel === previousModel) return 'break';
-          task.model = fallbackModel;
-          task.model_used = fallbackModel;
-          try {
-            db.prepare('UPDATE tasks SET model = ?, model_used = ? WHERE id = ?').run(
-              fallbackModel,
-              fallbackModel,
-              task.id,
-            );
-          } catch {
-            try {
-              db.prepare('UPDATE tasks SET model = ? WHERE id = ?').run(fallbackModel, task.id);
-            } catch { /* ignore legacy schemas */ }
-          }
+          persistTaskModelSwap(db, task, fallbackModel);
           insertEvent(db, {
             workflow_id: wfId,
             task_id: task.id,

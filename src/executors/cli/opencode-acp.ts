@@ -29,16 +29,15 @@ import { acpEventToRuntimeEvents } from '../../runtime/adapters/acp.js';
 import {
   spanContextStorage,
 } from '../../v2/observability/tracing.js';
-import { runtimeError, type RuntimeRunEvent } from '../../runtime/events.js';
+import { runtimeError } from '../../runtime/events.js';
 import {
-  appendRuntimeStreamEvent,
-  completeRuntimeTurn,
   createRuntimeSession,
   startRuntimeTurn,
 } from '../../runtime/store.js';
 import { applySecretPatterns } from '../../v2/security/patterns.js';
 import { isCliSafeMode } from './permission-context.js';
 import { opencodeBin } from './bin-resolver.js';
+import { createRuntimeRecorders, type RuntimeRecorderIds } from './runtime-recorders.js';
 import type { RunCliOpts } from './types.js';
 
 const OPENCODE_ACP_DEFAULT_PROMPT_TIMEOUT_MS = 120_000;
@@ -182,53 +181,17 @@ export async function runOpencodeViaAcp(
 ): Promise<string> {
   const startedAt = Date.now();
   const spanCtx = spanContextStorage.getStore();
-  let runtimeSessionId: string | null = null;
-  let runtimeTurnId: string | null = null;
-
-  const appendRuntime = (event: RuntimeRunEvent): void => {
-    if (!spanCtx || !runtimeSessionId || !runtimeTurnId) return;
-    try {
-      appendRuntimeStreamEvent(spanCtx.db, {
-        sessionId: runtimeSessionId,
-        turnId: runtimeTurnId,
-        workflowId: task.workflow_id,
-        taskId: task.id,
-        event: {
-          ...event,
-          executorId: event.executorId || runtimeExecutorId,
-          sessionId: event.sessionId ?? runtimeSessionId,
-          turnId: event.turnId ?? runtimeTurnId,
-        },
-      });
-    } catch {
-      // Runtime recording is observability only.
-    }
-  };
-
-  const completeRuntime = (
-    status: 'completed' | 'failed' | 'canceled',
-    summary?: string | null,
-    errorMessage?: string,
-  ): void => {
-    if (!spanCtx || !runtimeTurnId) return;
-    try {
-      completeRuntimeTurn(spanCtx.db, runtimeTurnId, {
-        status,
-        resultSummary: summary,
-        error: errorMessage
-          ? {
-            code: 'opencode_acp_failed',
-            origin: `task:${task.id}`,
-            message: errorMessage,
-            suggestedAction: 'Inspect runtime stream events; set OMNIFORGE_OPENCODE_TRANSPORT=spawn to bypass ACP routing if persistent.',
-            safeContext: { executorId: runtimeExecutorId, model: task.model ?? null },
-          }
-          : null,
-      });
-    } catch {
-      // best-effort
-    }
-  };
+  // Session/turn ids are stamped onto this holder once the runtime rows exist;
+  // the recorders are no-ops until then (see runtime-recorders.ts).
+  const recorderIds: RuntimeRecorderIds = { sessionId: null, turnId: null };
+  const { appendRuntime, completeRuntime } = createRuntimeRecorders({
+    spanCtx,
+    task,
+    runtimeExecutorId,
+    ids: recorderIds,
+    errorCode: 'opencode_acp_failed',
+    suggestedAction: 'Inspect runtime stream events; set OMNIFORGE_OPENCODE_TRANSPORT=spawn to bypass ACP routing if persistent.',
+  });
 
   // Pre-create the runtime session/turn rows mirroring the spawn path so the
   // dashboard's runtime tab shows the ACP execution. The ACP pool ALSO creates
@@ -264,8 +227,8 @@ export async function runOpencodeViaAcp(
         promptSummary: `${task.name} (${task.kind})`,
         metadata: { timeout_seconds: task.timeout_seconds, max_retries: task.max_retries },
       });
-      runtimeSessionId = session.id;
-      runtimeTurnId = turn.id;
+      recorderIds.sessionId = session.id;
+      recorderIds.turnId = turn.id;
       appendRuntime({
         type: 'runtime.turn.started',
         ts: startedAt,
@@ -435,8 +398,6 @@ export async function runOpencodeViaAcp(
       { timeoutMs: OPENCODE_ACP_DEFAULT_PROMPT_TIMEOUT_MS },
     );
   } catch (err) {
-    if (unhookAbort) unhookAbort();
-    if (unsubscribeChunks) unsubscribeChunks();
     const detail = err instanceof Error ? err.message : String(err);
     const message = `opencode session/prompt failed: ${detail}`;
     const wasCancel = signal?.aborted === true;
@@ -452,9 +413,13 @@ export async function runOpencodeViaAcp(
     completeRuntime(wasCancel ? 'canceled' : 'failed', null, message);
     try { acpClient.notify('session/close', { sessionId: nativeSessionId }); } catch { /* best effort */ }
     throw new Error(message);
+  } finally {
+    // Both callbacks are idempotent; the finally guarantees the unhook on
+    // every exit (success, prompt failure, cancel) without the previous
+    // duplicated call sites in the catch and success paths.
+    if (unhookAbort) unhookAbort();
+    if (unsubscribeChunks) unsubscribeChunks();
   }
-  if (unhookAbort) unhookAbort();
-  if (unsubscribeChunks) unsubscribeChunks();
 
   // Best-effort close of THIS native session. Pool keeps the underlying
   // process for the next task.

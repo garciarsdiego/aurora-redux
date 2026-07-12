@@ -5,6 +5,7 @@ import { loadWorkflowById } from '../../db/persist.js';
 import { resumeWorkflow } from '../../brain/executor/resume.js';
 import { loadWorkspaceEnv } from '../../utils/workspace.js';
 import { makeProgressPrinter } from '../progress-printer.js';
+import { printWorkflowSummary, reportRunError } from '../run-summary.js';
 
 export function registerResume(program: Command): void {
   program
@@ -42,14 +43,14 @@ export function registerResume(program: Command): void {
             onEvent,
           });
           const duration = Date.now() - started;
-          console.log('');
-          console.log('✓ Workflow resumed');
-          console.log(`  ID:        ${finalWf.id}`);
-          console.log(`  Status:    ${finalWf.status}`);
-          console.log(`  Duração:   ${duration}ms`);
+          printWorkflowSummary({
+            title: '✓ Workflow resumed',
+            id: finalWf.id,
+            status: finalWf.status,
+            durationMs: duration,
+          });
         } catch (err) {
-          console.error('Erro:', err instanceof Error ? err.message : String(err));
-          process.exitCode = 1;
+          reportRunError(err);
         }
       },
     );

@@ -40,7 +40,8 @@ export async function listWorkflowsTool(raw: unknown): Promise<string> {
     }
     params.push(limit);
 
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    // `conditions` always contains at least the _daemon filter above.
+    const where = `WHERE ${conditions.join(' AND ')}`;
 
     const rows = db
       .prepare(

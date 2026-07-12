@@ -21,6 +21,41 @@
 import type { ParsedClaudeOutput, ParsedGeminiOutput, ToolCallRecord } from './types.js';
 
 /**
+ * Extract `tool_use` blocks from ONE parsed stream-json event of Claude's
+ * `type === "assistant"` shape. Single source of truth shared by
+ * parseClaudeStreamJson (buffered pass) and runCliTask's realtime NDJSON tap
+ * — if Claude Code's NDJSON shape drifts, both consumers move together.
+ * Non-assistant events (and malformed content) yield an empty array.
+ */
+export function extractToolUsesFromEvent(ev: Record<string, unknown>): ToolCallRecord[] {
+  if (ev['type'] !== 'assistant') return [];
+  const message = ev['message'] as Record<string, unknown> | undefined;
+  const content = message?.['content'];
+  if (!Array.isArray(content)) return [];
+  const calls: ToolCallRecord[] = [];
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue;
+    const b = block as Record<string, unknown>;
+    if (b['type'] === 'tool_use' && typeof b['name'] === 'string') {
+      calls.push({ name: b['name'], input: (b['input'] as Record<string, unknown> | undefined) ?? {} });
+    }
+  }
+  return calls;
+}
+
+/**
+ * Compact one-call input summary — `subagent_type=<x>` for Agent dispatches,
+ * otherwise the first 3 input keys. Shared by the live `cli_tool_call` event
+ * (runCliTask) and formatToolCallSummary below so both render identically.
+ */
+export function summarizeToolCallInput(name: string, input: Record<string, unknown>): string {
+  if (name === 'Agent') {
+    return `subagent_type=${String(input['subagent_type'] ?? 'general-purpose')}`;
+  }
+  return Object.keys(input).slice(0, 3).join(',');
+}
+
+/**
  * Parse Claude Code's `--output-format stream-json --verbose` NDJSON stream.
  *
  * Defensive against:
@@ -53,6 +88,7 @@ export function parseClaudeStreamJson(stdout: string): ParsedClaudeOutput {
     const ev = event as Record<string, unknown>;
 
     if (ev['type'] === 'assistant') {
+      toolCalls.push(...extractToolUsesFromEvent(ev));
       const message = ev['message'] as Record<string, unknown> | undefined;
       const content = message?.['content'];
       if (Array.isArray(content)) {
@@ -60,10 +96,7 @@ export function parseClaudeStreamJson(stdout: string): ParsedClaudeOutput {
         for (const block of content) {
           if (typeof block !== 'object' || block === null) continue;
           const b = block as Record<string, unknown>;
-          if (b['type'] === 'tool_use' && typeof b['name'] === 'string') {
-            const input = (b['input'] as Record<string, unknown> | undefined) ?? {};
-            toolCalls.push({ name: b['name'], input });
-          } else if (b['type'] === 'text' && typeof b['text'] === 'string') {
+          if (b['type'] === 'text' && typeof b['text'] === 'string') {
             textForThisTurn += b['text'];
           }
         }
@@ -91,15 +124,14 @@ export function formatToolCallSummary(calls: ToolCallRecord[]): string {
   if (calls.length === 0) return '(no tool calls captured)';
   const lines: string[] = [];
   for (const tc of calls) {
+    const summary = summarizeToolCallInput(tc.name, tc.input);
     if (tc.name === 'Agent') {
-      const sub = String(tc.input['subagent_type'] ?? 'general-purpose');
       const desc = String(tc.input['description'] ?? '').slice(0, 100);
-      lines.push(`- Agent (subagent_type=${sub})${desc ? `: "${desc}"` : ''}`);
+      lines.push(`- Agent (${summary})${desc ? `: "${desc}"` : ''}`);
     } else {
       // Compact one-line form for non-Agent tools to keep the header short.
       // We only need to PROVE work happened, not log every parameter.
-      const keys = Object.keys(tc.input).slice(0, 3).join(',');
-      lines.push(`- ${tc.name}${keys ? ` (${keys})` : ''}`);
+      lines.push(`- ${tc.name}${summary ? ` (${summary})` : ''}`);
     }
   }
   return lines.join('\n');

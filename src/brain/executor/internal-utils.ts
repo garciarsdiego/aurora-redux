@@ -162,6 +162,18 @@ function resolveCostRoutingOpts(
   };
 }
 
+// Envelope comum dos step-kinds síncronos que apenas escrevem em sharedState
+// (extract_json / merge / transform): executa e devolve o wrapper
+// { ok, output_key } que os consumidores downstream esperam.
+function runSyncStateStep(
+  fn: (dagTask: DagTask, state: Record<string, unknown>) => void,
+  dagTask: DagTask,
+  state: Record<string, unknown>,
+): string {
+  fn(dagTask, state);
+  return JSON.stringify({ ok: true, output_key: dagTask.output_key ?? null });
+}
+
 export async function executeTask(
   task: Task,
   signalOrOpts?: AbortSignal | ExecuteTaskOpts,
@@ -176,6 +188,13 @@ export async function executeTask(
   // JSON.parse per task) and idempotent.
   const hydrated = hydrateDeterministicArgsFromInputJson(task);
   const effective = applyExecutorOverride(hydrated);
+
+  // sharedState for the deterministic step kinds below — thread-local to the
+  // calling runTaskLoop iteration; callers that use executeTask directly
+  // (tests, adaptive supervisor) must pass it via opts.sharedState. When
+  // absent a fresh empty object is used so that the call is always safe
+  // (step executors mutate the provided object).
+  const state = opts.sharedState ?? {};
 
   switch (effective.kind) {
     case 'llm_call':
@@ -226,30 +245,20 @@ export async function executeTask(
       return runToolCallTask(effective, opts.signal);
 
     // ── Deterministic step kinds (no CLI spawn) ──────────────────────────────
-    // sharedState is thread-local to the calling runTaskLoop iteration; callers
-    // that use executeTask directly (tests, adaptive supervisor) must pass it
-    // via opts.sharedState. When absent a fresh empty object is used so that
-    // the call is always safe (step executors mutate the provided object).
+    // These all operate on the hoisted `state` (see above the switch).
     case 'if_else': {
-      const state = opts.sharedState ?? {};
       const ctx = { workflowId: opts.workflowId ?? '' };
       type IfElseTask = Task & { if_condition?: string; if_true_step_id?: string; if_false_step_id?: string };
       const result = await executeIfElse(effective as unknown as IfElseTask, state, ctx);
       return JSON.stringify(result);
     }
     case 'switch': {
-      const state = opts.sharedState ?? {};
       const result = await executeSwitch(effective as unknown as DagTask, state);
       return JSON.stringify(result);
     }
-    case 'extract_json': {
-      const state = opts.sharedState ?? {};
-      const dagTask = effective as unknown as DagTask;
-      executeExtractJson(dagTask, state);
-      return JSON.stringify({ ok: true, output_key: dagTask.output_key ?? null });
-    }
+    case 'extract_json':
+      return runSyncStateStep(executeExtractJson, effective as unknown as DagTask, state);
     case 'print': {
-      const state = opts.sharedState ?? {};
       const dagTask = effective as unknown as DagTask;
       executePrint(dagTask, state);
       // F-LIVE-17 — return the rendered string as the task's output so the
@@ -265,25 +274,15 @@ export async function executeTask(
       return JSON.stringify({ ok: true, output_key: outKey, rendered: rendered ?? null });
     }
     case 'loop': {
-      const state = opts.sharedState ?? {};
       const executeStep = opts.executeStep ?? (async () => { /* no-op: body steps run via DAG */ });
       const result = await executeLoop(effective as unknown as DagTask, state, { executeStep });
       return JSON.stringify(result);
     }
-    case 'merge': {
-      const state = opts.sharedState ?? {};
-      const dagTask = effective as unknown as DagTask;
-      executeMerge(dagTask, state);
-      return JSON.stringify({ ok: true, output_key: dagTask.output_key ?? null });
-    }
-    case 'transform': {
-      const state = opts.sharedState ?? {};
-      const dagTask = effective as unknown as DagTask;
-      executeTransform(dagTask, state);
-      return JSON.stringify({ ok: true, output_key: dagTask.output_key ?? null });
-    }
+    case 'merge':
+      return runSyncStateStep(executeMerge, effective as unknown as DagTask, state);
+    case 'transform':
+      return runSyncStateStep(executeTransform, effective as unknown as DagTask, state);
     case 'evaluator': {
-      const state = opts.sharedState ?? {};
       const ctx = { workflowId: opts.workflowId ?? '' };
       const result = await executeEvaluator(effective as unknown as DagTask, state, ctx);
       return JSON.stringify(result);
@@ -321,6 +320,35 @@ export function withTimeout<T>(
       (err: unknown) => { clearTimeout(timer); reject(err as Error); },
     );
   });
+}
+
+/**
+ * Bridge a withTimeout-created timeout signal with an (optional) workflow/task
+ * cancel signal into a single composed AbortSignal, so the executor call sees
+ * one aborting signal regardless of which fired first.
+ *
+ * Wave 5A #2: `{ once: true }` only auto-removes when the event fires. On the
+ * happy path (no cancel, multiple retry/refine iterations), listeners would
+ * accumulate on the long-lived cancel signal → MaxListenersExceededWarning.
+ * The composed signal therefore removes both listeners as soon as it settles
+ * (aborts). Shared by refine.ts and run-task/retry-loop.ts.
+ */
+export function composeAbortSignals(
+  timeoutSignal: AbortSignal,
+  cancelSignal?: AbortSignal,
+): AbortSignal {
+  const composed = new AbortController();
+  const onTimeoutAbort = (): void => composed.abort(timeoutSignal.reason);
+  const onCancelAbort = (): void => composed.abort(cancelSignal?.reason);
+  if (timeoutSignal.aborted) composed.abort(timeoutSignal.reason);
+  else timeoutSignal.addEventListener('abort', onTimeoutAbort, { once: true });
+  if (cancelSignal?.aborted) composed.abort(cancelSignal.reason);
+  else cancelSignal?.addEventListener('abort', onCancelAbort, { once: true });
+  composed.signal.addEventListener('abort', () => {
+    timeoutSignal.removeEventListener('abort', onTimeoutAbort);
+    cancelSignal?.removeEventListener('abort', onCancelAbort);
+  }, { once: true });
+  return composed.signal;
 }
 
 // Returns the delay in ms before the Nth retry (attempt=1 means first retry).

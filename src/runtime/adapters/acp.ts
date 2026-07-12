@@ -44,6 +44,7 @@ import {
   redactRuntimeValue,
   runtimeError,
   type RuntimeRunEvent,
+  type RuntimeStructuredError,
 } from '../events.js';
 
 // ---------------------------------------------------------------------------
@@ -60,13 +61,9 @@ export interface AcpJsonRpcMessage {
   error?: unknown;
 }
 
-export interface RuntimeAdapterStructuredError {
-  code: string;
-  origin: string;
-  message: string;
-  suggestedAction: string;
-  safeContext?: Record<string, unknown>;
-}
+// Same shape as the runtime-event structured error — kept as an alias so the
+// adapter, events, and probes layers share a single definition.
+export type RuntimeAdapterStructuredError = RuntimeStructuredError;
 
 export interface AcpParseResult {
   ok: boolean;
@@ -509,26 +506,27 @@ export class AcpStdioClient {
     }
   }
 
-  private handleClosed(_reason: 'end' | 'close'): void {
+  /**
+   * Shared close/error teardown: flip `closed`, reject every pending request
+   * (message built per request via `makeMessage`), detach all handlers.
+   */
+  private teardown(makeMessage: (method: string, id: number) => string): void {
     if (this.closed) return;
     this.closed = true;
     for (const [id, pend] of this.pending) {
       if (pend.timer) clearTimeout(pend.timer);
-      pend.reject(new Error(`AcpStdioClient: transport closed before response (method=${pend.method}, id=${id})`));
+      pend.reject(new Error(makeMessage(pend.method, id)));
     }
     this.pending.clear();
     this.notificationHandlers.clear();
   }
 
+  private handleClosed(_reason: 'end' | 'close'): void {
+    this.teardown((method, id) => `AcpStdioClient: transport closed before response (method=${method}, id=${id})`);
+  }
+
   private handleErrored(err: Error): void {
-    if (this.closed) return;
-    this.closed = true;
-    for (const [id, pend] of this.pending) {
-      if (pend.timer) clearTimeout(pend.timer);
-      pend.reject(new Error(`AcpStdioClient: transport error (method=${pend.method}, id=${id}): ${err.message}`));
-    }
-    this.pending.clear();
-    this.notificationHandlers.clear();
+    this.teardown((method, id) => `AcpStdioClient: transport error (method=${method}, id=${id}): ${err.message}`);
   }
 }
 
@@ -869,15 +867,7 @@ export class AcpAdapter {
       // so the workflow can distinguish "we cancelled" from "permission
       // denied" (the latter resolves normally).
       if (this.currentPromptCancelled) {
-        this.state = 'session_open';
-        const cancelledErr = acpStructuredError(
-          this.options.executorId,
-          ACP_ERROR_CODES.CANCELLED,
-          'session/prompt cancelled by caller.',
-          'No action required — cancellation was requested via AcpAdapter#cancel().',
-          { sessionId, stopReason: parsed.stopReason },
-        );
-        throw new AcpProtocolError(cancelledErr.message, cancelledErr);
+        this.throwCancelled(sessionId, parsed.stopReason);
       }
       // After a successful prompt the session is open for another turn.
       this.state = 'session_open';
@@ -890,15 +880,7 @@ export class AcpAdapter {
         throw err;
       }
       if (this.currentPromptCancelled) {
-        const cancelledErr = acpStructuredError(
-          this.options.executorId,
-          ACP_ERROR_CODES.CANCELLED,
-          'session/prompt cancelled by caller.',
-          'No action required — cancellation was requested via AcpAdapter#cancel().',
-          { sessionId },
-        );
-        this.state = 'session_open';
-        throw new AcpProtocolError(cancelledErr.message, cancelledErr);
+        this.throwCancelled(sessionId);
       }
       const structured = this.classifyPromptError(err);
       // Honor child-exit observation: a child that exited mid-prompt overrides
@@ -917,6 +899,23 @@ export class AcpAdapter {
       this.transitionToErrored();
       throw new AcpProtocolError(structured.message, structured);
     }
+  }
+
+  /**
+   * Caller-initiated cancel outcome for `prompt()` — keeps the session open
+   * for another turn and raises the CANCELLED protocol error. `stopReason` is
+   * attached only when the server resolved the prompt before we noticed.
+   */
+  private throwCancelled(sessionId: string, stopReason?: string): never {
+    this.state = 'session_open';
+    const cancelledErr = acpStructuredError(
+      this.options.executorId,
+      ACP_ERROR_CODES.CANCELLED,
+      'session/prompt cancelled by caller.',
+      'No action required — cancellation was requested via AcpAdapter#cancel().',
+      stopReason === undefined ? { sessionId } : { sessionId, stopReason },
+    );
+    throw new AcpProtocolError(cancelledErr.message, cancelledErr);
   }
 
   /**

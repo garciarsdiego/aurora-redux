@@ -32,6 +32,7 @@ import type { QualityReviewRow } from './types.js';
 import { saveQualityReview } from './store.js';
 import { loadArchitectureContractForWorkflow } from './final-evidence.js';
 import { isCanvasRegionCheckArray, isInteractionCheckArray } from './visual-check-guards.js';
+import { safeParseJson } from './internal-utils.js';
 import {
   runPlaywrightProductHarness,
   type CanvasRegionCheck,
@@ -56,18 +57,6 @@ export interface AttemptTaskVisualGateInput {
   harnessRunner?: TaskVisualHarnessRunner;
 }
 
-function safeParseInputJson(raw: string | null | undefined): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
 /**
  * Reads reviewer_profile + the two check arrays off the task, preferring
  * the in-memory Task field (materialised at DAG->Task time in
@@ -80,7 +69,7 @@ function readTaskVisualConfig(task: Task): {
   canvasRegionChecks: CanvasRegionCheck[];
   interactionChecks: InteractionCheck[];
 } {
-  const input = safeParseInputJson(task.input_json);
+  const input = safeParseJson(task.input_json);
   const reviewerProfile = task.reviewer_profile ?? (typeof input['reviewer_profile'] === 'string' ? input['reviewer_profile'] : undefined);
 
   const canvasCandidate = input['canvasRegionChecks'];

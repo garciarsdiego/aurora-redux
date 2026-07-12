@@ -28,6 +28,141 @@ import { runStateSchemaCheck, loadReviewerStateSchemaViolations } from './state-
 import { runQualityGate } from './quality-gate.js';
 import { endTaskTraceSpan } from './trace-span.js';
 
+// llm_call ledger — persists token counts / model_used onto the task row,
+// records the call in the llm-ledger and registers the benchmark run.
+// Extracted from finalizeSuccess (pure move). Fail-safe: any error is folded
+// into a model_call_record_error / benchmark_record_error audit event.
+async function recordLlmCallLedger(
+  db: Database.Database,
+  task: Task,
+  wfId: string,
+  output: string,
+): Promise<void> {
+  if (
+    task.kind !== 'llm_call' ||
+    !(task.model_used || task.input_tokens !== undefined || task.output_tokens !== undefined || task.llm_call_cost_usd !== undefined)
+  ) {
+    return;
+  }
+  const model = task.model_used ?? task.model ?? 'unknown';
+  try {
+    db.prepare(
+      `UPDATE tasks
+          SET input_tokens = COALESCE(?, input_tokens),
+              output_tokens = COALESCE(?, output_tokens),
+              model_used = COALESCE(?, model_used)
+        WHERE id = ?`,
+    ).run(
+      task.input_tokens ?? null,
+      task.output_tokens ?? null,
+      task.model_used ?? null,
+      task.id,
+    );
+    recordModelCall(db, {
+      workflowId: wfId,
+      taskId: task.id,
+      model,
+      provider: providerFromModel(model) ?? undefined,
+      inputTokens: task.input_tokens ?? undefined,
+      outputTokens: task.output_tokens ?? undefined,
+      costUsd: task.llm_call_cost_usd ?? undefined,
+      latencyMs: task.llm_call_latency_ms ?? undefined,
+      source: 'executor',
+      // W5-backend: surfaced on the synthetic cost_delta SSE event so
+      // the dashboard can attribute cost movement back to llm_call
+      // tasks (separates from cli_spawn / pal_call / tool_call buckets).
+      kind: 'llm_call',
+    });
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: task.id,
+      type: 'model_call_recorded',
+      payload: {
+        model,
+        input_tokens: task.input_tokens ?? null,
+        output_tokens: task.output_tokens ?? null,
+        cost_usd: task.llm_call_cost_usd ?? null,
+      },
+    });
+
+    // Orchestration integration: record benchmark for llm_call tasks
+    if (task.model_used && task.llm_call_cost_usd !== undefined) {
+      try {
+        const benchmarkStore = getBenchmarkStore();
+        const provider = providerFromModel(model) ?? 'omniroute';
+        const useCase = task.acceptance_criteria ? 'code' : 'general'; // Simple heuristic
+
+        await benchmarkStore.recordRun({
+          id: `run-${wfId}-${task.id}-${Date.now()}`,
+          provider,
+          model: task.model_used,
+          use_case: useCase,
+          input: task.input_json || '',
+          output: output,
+          quality_score: 0.8, // Default quality, could be improved with reviewer score
+          cost_usd: Number(task.llm_call_cost_usd || 0),
+          latency_ms: Number(task.llm_call_latency_ms || 0),
+          success: true,
+          timestamp: Date.now()
+        });
+      } catch (benchmarkErr) {
+        // Don't fail the task if benchmark recording fails
+        insertEvent(db, {
+          workflow_id: wfId,
+          task_id: task.id,
+          type: 'benchmark_record_error',
+          payload: { error: (benchmarkErr as Error).message },
+        });
+      }
+    }
+  } catch (err) {
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: task.id,
+      type: 'model_call_record_error',
+      payload: { error: (err as Error).message },
+    });
+  }
+}
+
+type ArchitectureContract = import('../../../workflow-modes/existing-code-feature.js').ArchitectureContract;
+
+// Wave 1.1 (F1-2) + Wave 1.4 follow-up (F1-15 H1 / sec H-1): pull the
+// architecture contract recorded by the architecture-scout task (if any)
+// so the reviewer can apply the existing-code judgment overlay. Dynamic
+// import avoids a circular edge between brain/executor and quality/.
+//
+// Defensive guards:
+//   * If the dynamic import OR the DB query throws, we MUST NOT let the
+//     exception bubble — the outer post-completion try/catch would flip
+//     the task to failed even though the worker succeeded. Always emit an
+//     event on failure so silent failures show up in the audit log.
+//   * Redact any secrets the contract might carry before forwarding it to
+//     the reviewer prompt — the contract is operator-derived but may
+//     include paths or tokens that flow into LLM context.
+async function loadArchitectureContractSafely(
+  db: Database.Database,
+  task: Task,
+  wfId: string,
+): Promise<ArchitectureContract | null> {
+  try {
+    const { loadArchitectureContractForWorkflow } = await import('../../../quality/final-evidence.js');
+    const raw = loadArchitectureContractForWorkflow(db, wfId);
+    if (raw) {
+      const { redactContextJson } = await import('../../../context/redaction.js');
+      return redactContextJson(raw) as ArchitectureContract;
+    }
+  } catch (err) {
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: task.id,
+      type: 'architecture_contract_load_error',
+      payload: { error: err instanceof Error ? err.message : String(err) },
+    });
+  }
+  return null;
+}
+
 // Success-finalize phase — invoked after the retry loop produced a non-null
 // `output` AND no terminal error. Persists the completion, runs the
 // state-schema check, records the model call, dispatches review-and-refine,
@@ -72,90 +207,8 @@ export async function finalizeSuccess(params: {
     // B9.2 — state_schema runtime validation (extracted helper).
     const stateSchemaViolations = await runStateSchemaCheck(db, task, wfId, output);
 
-    if (
-      task.kind === 'llm_call' &&
-      (task.model_used || task.input_tokens !== undefined || task.output_tokens !== undefined || task.llm_call_cost_usd !== undefined)
-    ) {
-      const model = task.model_used ?? task.model ?? 'unknown';
-      try {
-        db.prepare(
-          `UPDATE tasks
-              SET input_tokens = COALESCE(?, input_tokens),
-                  output_tokens = COALESCE(?, output_tokens),
-                  model_used = COALESCE(?, model_used)
-            WHERE id = ?`,
-        ).run(
-          task.input_tokens ?? null,
-          task.output_tokens ?? null,
-          task.model_used ?? null,
-          task.id,
-        );
-        recordModelCall(db, {
-          workflowId: wfId,
-          taskId: task.id,
-          model,
-          provider: providerFromModel(model) ?? undefined,
-          inputTokens: task.input_tokens ?? undefined,
-          outputTokens: task.output_tokens ?? undefined,
-          costUsd: task.llm_call_cost_usd ?? undefined,
-          latencyMs: task.llm_call_latency_ms ?? undefined,
-          source: 'executor',
-          // W5-backend: surfaced on the synthetic cost_delta SSE event so
-          // the dashboard can attribute cost movement back to llm_call
-          // tasks (separates from cli_spawn / pal_call / tool_call buckets).
-          kind: task.kind === 'llm_call' ? 'llm_call' : undefined,
-        });
-        insertEvent(db, {
-          workflow_id: wfId,
-          task_id: task.id,
-          type: 'model_call_recorded',
-          payload: {
-            model,
-            input_tokens: task.input_tokens ?? null,
-            output_tokens: task.output_tokens ?? null,
-            cost_usd: task.llm_call_cost_usd ?? null,
-          },
-        });
-
-        // Orchestration integration: record benchmark for llm_call tasks
-        if (task.kind === 'llm_call' && task.model_used && task.llm_call_cost_usd !== undefined) {
-          try {
-            const benchmarkStore = getBenchmarkStore();
-            const provider = providerFromModel(model) ?? 'omniroute';
-            const useCase = task.acceptance_criteria ? 'code' : 'general'; // Simple heuristic
-            
-            await benchmarkStore.recordRun({
-              id: `run-${wfId}-${task.id}-${Date.now()}`,
-              provider,
-              model: task.model_used,
-              use_case: useCase,
-              input: task.input_json || '',
-              output: output,
-              quality_score: 0.8, // Default quality, could be improved with reviewer score
-              cost_usd: Number(task.llm_call_cost_usd || 0),
-              latency_ms: Number(task.llm_call_latency_ms || 0),
-              success: true,
-              timestamp: Date.now()
-            });
-          } catch (benchmarkErr) {
-            // Don't fail the task if benchmark recording fails
-            insertEvent(db, {
-              workflow_id: wfId,
-              task_id: task.id,
-              type: 'benchmark_record_error',
-              payload: { error: (benchmarkErr as Error).message },
-            });
-          }
-        }
-      } catch (err) {
-        insertEvent(db, {
-          workflow_id: wfId,
-          task_id: task.id,
-          type: 'model_call_record_error',
-          payload: { error: (err as Error).message },
-        });
-      }
-    }
+    // llm_call ledger + benchmark (extracted helper; no-op for other kinds).
+    await recordLlmCallLedger(db, task, wfId, output);
 
     // Wave 2.C — fold any prior-cycle violations into the reviewer context
     // (extracted helper handles fresh + persisted merge).
@@ -167,36 +220,9 @@ export async function finalizeSuccess(params: {
 
     const reviewerWorkspaceDir = resolveReviewerWorkspaceDir(task, workspace, output, db, wfId);
 
-    // Wave 1.1 (F1-2) + Wave 1.4 follow-up (F1-15 H1 / sec H-1): pull the
-    // architecture contract recorded by the architecture-scout task (if any)
-    // so the reviewer can apply the existing-code judgment overlay. Dynamic
-    // import avoids a circular edge between brain/executor and quality/.
-    //
-    // Defensive guards:
-    //   * If the dynamic import OR the DB query throws, we MUST NOT let the
-    //     exception bubble — the outer post-completion try/catch would flip
-    //     the task to failed even though the worker succeeded. Always emit an
-    //     event on failure so silent failures show up in the audit log.
-    //   * Redact any secrets the contract might carry before forwarding it to
-    //     the reviewer prompt — the contract is operator-derived but may
-    //     include paths or tokens that flow into LLM context.
-    type ArchitectureContractType = import('../../../workflow-modes/existing-code-feature.js').ArchitectureContract;
-    let architectureContract: ArchitectureContractType | null = null;
-    try {
-      const { loadArchitectureContractForWorkflow } = await import('../../../quality/final-evidence.js');
-      const raw = loadArchitectureContractForWorkflow(db, wfId);
-      if (raw) {
-        const { redactContextJson } = await import('../../../context/redaction.js');
-        architectureContract = redactContextJson(raw) as ArchitectureContractType;
-      }
-    } catch (err) {
-      insertEvent(db, {
-        workflow_id: wfId,
-        task_id: task.id,
-        type: 'architecture_contract_load_error',
-        payload: { error: err instanceof Error ? err.message : String(err) },
-      });
-    }
+    // Architecture contract for the reviewer's existing-code judgment overlay
+    // (extracted helper; fail-safe, emits architecture_contract_load_error).
+    const architectureContract = await loadArchitectureContractSafely(db, task, wfId);
     const workflowMode = architectureContract ? 'existing_code_feature' as const : 'standard' as const;
 
     // Aurora-parity Wave 1 (WS2) — deterministic precommit self-review: scan the
@@ -251,8 +277,7 @@ export async function finalizeSuccess(params: {
     );
     checkAborted(taskCancelSignal, 'after_review_and_refine');
 
-    const qualityReviewResult = await runQualityGate(db, task, wfId);
-    void qualityReviewResult;
+    await runQualityGate(db, task, wfId);
     safeRecordTaskHandoff(db, {
       workspace,
       runId: wfId,
@@ -280,7 +305,7 @@ export async function finalizeSuccess(params: {
       metadata: {
         retry_count: task.retry_count,
         refine_count: task.refine_count,
-        output_chars: task.output_json?.length ?? output?.length ?? 0,
+        output_chars: task.output_json?.length ?? output.length,
       },
     });
     insertEvent(db, { workflow_id: wfId, task_id: task.id, type: 'task_completed' });

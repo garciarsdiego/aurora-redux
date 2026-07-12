@@ -124,10 +124,8 @@ function tokenize(input: string): string[] {
  * single-line form because tokens cannot span newlines in those modes.
  */
 export function parseInput(line: string): ParseResult {
-  // For multi-line text (possible objective), only trim outer whitespace.
-  const containsNewline = line.includes('\n');
-
-  // Compute a single-line trimmed view used to detect prefix and tokenize.
+  // Trimmed view used to detect prefix and tokenize. trim() only removes outer
+  // whitespace, so internal newlines survive for multi-line objectives.
   const trimmed = line.trim();
 
   if (trimmed.length === 0) {
@@ -156,10 +154,6 @@ export function parseInput(line: string): ParseResult {
     return { kind: 'bash', command };
   }
 
-  // Objective: if multi-line, preserve internal newlines (only trim outer
-  // whitespace) so pasted briefs survive intact.
-  if (containsNewline) {
-    return { kind: 'objective', text: line.replace(/^\s+|\s+$/g, '') };
-  }
+  // Objective: internal newlines are preserved so pasted briefs survive intact.
   return { kind: 'objective', text: trimmed };
 }

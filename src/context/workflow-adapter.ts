@@ -66,11 +66,35 @@ function truncateText(text: string): { text: string; truncated: boolean } {
   return { text: text.slice(0, MAX_CONTEXT_TEXT_CHARS), truncated: true };
 }
 
-function safeRenderedPrompt(packet: Record<string, unknown>, renderedPrompt?: string): string {
+function safeRenderedPrompt(
+  packet: Record<string, unknown>,
+  renderedPrompt?: string,
+): { text: string; truncated: boolean } {
   if (typeof renderedPrompt === 'string' && renderedPrompt.trim()) {
-    return truncateText(redactContextText(renderedPrompt)).text;
+    return truncateText(redactContextText(renderedPrompt));
   }
-  return truncateText(JSON.stringify(redactContextJson(packet))).text;
+  return truncateText(JSON.stringify(redactContextJson(packet)));
+}
+
+/**
+ * Resolve (or create) the run channel + task thread pair shared by every
+ * task-scoped record helper below.
+ */
+function ensureTaskThread(
+  db: Database.Database,
+  input: { workspace: string; runId: string; taskId: string; taskName: string },
+): ContextThreadRow {
+  const channel = ensureRunContextChannel(db, {
+    workspace: input.workspace,
+    runId: input.runId,
+    title: `Run ${input.runId}`,
+  });
+  return ensureTaskContextThread(db, {
+    channelId: channel.id,
+    runId: input.runId,
+    taskId: input.taskId,
+    title: input.taskName,
+  });
 }
 
 export function ensureWorkflowContext(
@@ -89,17 +113,7 @@ export function recordTaskThreadEvent(
   db: Database.Database,
   input: RecordTaskThreadEventInput,
 ): ContextThreadRow {
-  const channel = ensureRunContextChannel(db, {
-    workspace: input.workspace,
-    runId: input.runId,
-    title: `Run ${input.runId}`,
-  });
-  const thread = ensureTaskContextThread(db, {
-    channelId: channel.id,
-    runId: input.runId,
-    taskId: input.taskId,
-    title: input.taskName,
-  });
+  const thread = ensureTaskThread(db, input);
   createContextMessage(db, {
     threadId: thread.id,
     senderType: 'system',
@@ -115,17 +129,7 @@ export function recordTaskContextPacket(
   db: Database.Database,
   input: RecordTaskContextPacketInput,
 ): ContextPacketRow {
-  const channel = ensureRunContextChannel(db, {
-    workspace: input.workspace,
-    runId: input.runId,
-    title: `Run ${input.runId}`,
-  });
-  const thread = ensureTaskContextThread(db, {
-    channelId: channel.id,
-    runId: input.runId,
-    taskId: input.taskId,
-    title: input.taskName,
-  });
+  const thread = ensureTaskThread(db, input);
   const dependencyHandoffs = listDependencyHandoffs(db, input.runId, input.dependsOn ?? []);
   const rendered = safeRenderedPrompt(input.packet, input.renderedPrompt);
   const packet = saveContextPacket(db, {
@@ -134,15 +138,15 @@ export function recordTaskContextPacket(
     attempt: input.attempt,
     threadId: thread.id,
     packet: input.packet,
-    renderedPrompt: rendered,
+    renderedPrompt: rendered.text,
     includedHandoffs: dependencyHandoffs.map((handoff) => ({
       handoffId: handoff.id,
       taskId: handoff.task_id,
       chars: handoff.body.length,
     })),
     excludedItems: [],
-    tokenEstimate: estimateTokens(rendered),
-    truncated: rendered.length >= MAX_CONTEXT_TEXT_CHARS,
+    tokenEstimate: estimateTokens(rendered.text),
+    truncated: rendered.truncated,
   });
   createContextMessage(db, {
     threadId: thread.id,
@@ -164,17 +168,7 @@ export function recordTaskHandoff(
   db: Database.Database,
   input: RecordTaskHandoffInput,
 ): TaskHandoffRow {
-  const channel = ensureRunContextChannel(db, {
-    workspace: input.workspace,
-    runId: input.runId,
-    title: `Run ${input.runId}`,
-  });
-  const thread = ensureTaskContextThread(db, {
-    channelId: channel.id,
-    runId: input.runId,
-    taskId: input.taskId,
-    title: input.taskName,
-  });
+  const thread = ensureTaskThread(db, input);
   const body = truncateText(input.body);
   const handoff = saveTaskHandoff(db, {
     runId: input.runId,

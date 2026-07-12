@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { initDb } from '../../db/client.js';
 import { getDbPath } from '../../utils/config.js';
 import { insertEvent, insertTask, newTaskId } from '../../db/persist.js';
-import type { Task, TaskKind } from '../../types/index.js';
+import type { Task } from '../../types/index.js';
 import { redactContextJson } from '../../context/redaction.js';
 
 const CreateFixTaskSchema = z.object({
@@ -58,7 +58,7 @@ export async function createFixTaskTool(raw: unknown): Promise<string> {
       id: newTaskId(),
       workflow_id: input.workflow_id,
       name: input.title,
-      kind: input.kind as TaskKind,
+      kind: input.kind,
       input_json: JSON.stringify({
         objective: input.objective,
         workspace: workflow['workspace'],

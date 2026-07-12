@@ -18,7 +18,8 @@ import {
   shouldReviewTask,
 } from '../../utils/config.js';
 import { verifyAcceptanceArtifacts } from '../../v2/agents/validators/filesystem.js';
-import { withTimeout } from './internal-utils.js';
+import { withTimeout, composeAbortSignals } from './internal-utils.js';
+import { checkAborted } from './run-task/cancel.js';
 import { emitBasicReviewOutcome } from './upstream.js';
 
 export function emitRefineSoftFailure(
@@ -57,25 +58,6 @@ function cleanFilesystemEvidenceForReviewTimeout(
     fsCheck.summary.files_too_short.length === 0;
 
   return clean ? { verified: fsCheck.summary.files_verified } : null;
-}
-
-/**
- * Tier 0 Wave 3 (ITEM 0.2) — local cancel checkpoint used between refine
- * iterations. Mirrors the helper in run-task.ts so this module can stay
- * self-contained (avoids a circular import). Throws a typed AbortError so
- * the caller (executeTaskWithRetry) can distinguish cancel from real failure.
- */
-function checkRefineAborted(signal: AbortSignal | undefined, where: string): void {
-  if (signal?.aborted) {
-    const reason = signal.reason instanceof Error
-      ? signal.reason.message
-      : typeof signal.reason === 'string'
-        ? signal.reason
-        : 'no reason';
-    const err = new Error(`refine aborted at ${where}: ${reason}`);
-    (err as Error & { name: string }).name = 'AbortError';
-    throw err;
-  }
 }
 
 // Reviews output and, if the review fails, re-executes with feedback injected until
@@ -170,32 +152,22 @@ export async function reviewAndRefine(
   while (true) {
     // Tier 0 Wave 3 (ITEM 0.2) — yield to cancel at the top of each refine
     // iteration so a workflow cancel mid-refine surfaces immediately.
-    checkRefineAborted(cancelSignal, 'refine_iteration_top');
+    checkAborted(cancelSignal, 'refine_iteration_top');
     let review: ReviewResult;
     try {
       review = await withTimeout(
         (timeoutSignal) => {
-          // Bridge timeout + cancel so the reviewer call sees a single signal.
-          const composed = new AbortController();
-          const onTimeout = (): void => composed.abort(timeoutSignal.reason);
-          const onCancel = (): void => composed.abort(cancelSignal?.reason);
-          if (timeoutSignal.aborted) composed.abort(timeoutSignal.reason);
-          else timeoutSignal.addEventListener('abort', onTimeout, { once: true });
-          if (cancelSignal?.aborted) composed.abort(cancelSignal.reason);
-          else cancelSignal?.addEventListener('abort', onCancel, { once: true });
-          // Wave 5A #2: remove listeners when the iteration settles to avoid
-          // accumulating refs on cancelSignal across refine cycles (max_refine
-          // up to 10) — otherwise we hit MaxListenersExceededWarning.
-          composed.signal.addEventListener('abort', () => {
-            timeoutSignal.removeEventListener('abort', onTimeout);
-            cancelSignal?.removeEventListener('abort', onCancel);
-          }, { once: true });
+          // Bridge timeout + cancel (Wave 5A #2 — composeAbortSignals owns the
+          // listener cleanup). NOTE: doReview does not consume a signal yet;
+          // the composition is kept for listener-bookkeeping parity with the
+          // re-execute site below.
+          composeAbortSignals(timeoutSignal, cancelSignal);
           return doReview(task, currentOutput, reviewContext);
         },
         maxReviewTimeMs,
         `review_${task.name}`,
       );
-      checkRefineAborted(cancelSignal, 'refine_after_review');
+      checkAborted(cancelSignal, 'refine_after_review');
     } catch (err) {
       // Cancel surfaces as AbortError; bubble up so the caller marks the
       // task cancelled instead of failing it through the reviewer path.
@@ -366,31 +338,17 @@ export async function reviewAndRefine(
       payload: { refine_count: task.refine_count, feedback: review.feedback },
     });
 
-    checkRefineAborted(cancelSignal, 'refine_before_reexecute');
+    checkAborted(cancelSignal, 'refine_before_reexecute');
     try {
       currentOutput = await withTimeout(
-        (timeoutSignal) => {
-          // Bridge timeout signal with workflow cancel signal so the worker
-          // is interrupted by either path.
-          const composed = new AbortController();
-          const onTimeout = (): void => composed.abort(timeoutSignal.reason);
-          const onCancel = (): void => composed.abort(cancelSignal?.reason);
-          if (timeoutSignal.aborted) composed.abort(timeoutSignal.reason);
-          else timeoutSignal.addEventListener('abort', onTimeout, { once: true });
-          if (cancelSignal?.aborted) composed.abort(cancelSignal.reason);
-          else cancelSignal?.addEventListener('abort', onCancel, { once: true });
-          // Wave 5A #2: clean up listeners on iteration end (see review-call
-          // helper above for rationale).
-          composed.signal.addEventListener('abort', () => {
-            timeoutSignal.removeEventListener('abort', onTimeout);
-            cancelSignal?.removeEventListener('abort', onCancel);
-          }, { once: true });
-          return doExecute(task, composed.signal);
-        },
+        // Bridge timeout signal with workflow cancel signal so the worker
+        // is interrupted by either path (Wave 5A #2 — composeAbortSignals
+        // owns the listener cleanup).
+        (timeoutSignal) => doExecute(task, composeAbortSignals(timeoutSignal, cancelSignal)),
         task.timeout_seconds * 1000,
         task.name,
       );
-      checkRefineAborted(cancelSignal, 'refine_after_reexecute');
+      checkAborted(cancelSignal, 'refine_after_reexecute');
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') throw err;
       const classified = classifyError(err);

@@ -9,15 +9,20 @@ import type {
   RateLimitConfig,
   RateLimitDecision,
   RateLimitRegistryEntry,
-  RateLimiterOptions,
-  SlidingWindowOptions,
-  AdaptiveLimiterOptions,
 } from './types.js';
-import { createTokenBucketLimiter } from './token-bucket.js';
-import { createSlidingWindowLimiter } from './sliding-window.js';
-import { createAdaptiveLimiter } from './adaptive-limiter.js';
+import { createTokenBucketLimiter, type TokenBucketLimiter } from './token-bucket.js';
+import { createSlidingWindowLimiter, type SlidingWindowLimiter } from './sliding-window.js';
+import { createAdaptiveLimiter, AdaptiveLimiter } from './adaptive-limiter.js';
 import { getGlobalConfigSync } from './config-sync.js';
 import { getGlobalMetricsCollector } from './metrics.js';
+
+/**
+ * Check function with the underlying limiter attached for advanced usage.
+ * Mirrors the `__limiter__` convention used by the limiter factories.
+ */
+type LimiterCheckFn = ((key: string) => RateLimitDecision) & {
+  __limiter__?: TokenBucketLimiter | SlidingWindowLimiter | AdaptiveLimiter;
+};
 
 export class RateLimitRegistry {
   private readonly limiters: Map<string, RateLimitRegistryEntry>;
@@ -59,9 +64,9 @@ export class RateLimitRegistry {
 
     // If adaptive, register with config sync
     if (config.type === 'adaptive' && config.syncWithOmniRoute) {
-      const adaptiveLimiter = (limiter as unknown as { __limiter__?: { updateOmniRouteLimit: (info: any) => void } }).__limiter__;
-      if (adaptiveLimiter && 'updateOmniRouteLimit' in adaptiveLimiter) {
-        this.configSync.registerLimiter(adaptiveLimiter as any);
+      const adaptiveLimiter = (limiter as LimiterCheckFn).__limiter__;
+      if (adaptiveLimiter instanceof AdaptiveLimiter) {
+        this.configSync.registerLimiter(adaptiveLimiter);
       }
     }
   }
@@ -77,8 +82,8 @@ export class RateLimitRegistry {
 
     // Unregister from config sync if adaptive
     if (entry.config.type === 'adaptive' && entry.config.syncWithOmniRoute) {
-      const adaptiveLimiter = (entry.limiter as unknown as { __limiter__?: any }).__limiter__;
-      if (adaptiveLimiter) {
+      const adaptiveLimiter = (entry.limiter as LimiterCheckFn).__limiter__;
+      if (adaptiveLimiter instanceof AdaptiveLimiter) {
         this.configSync.unregisterLimiter(adaptiveLimiter);
       }
     }
@@ -172,25 +177,26 @@ export class RateLimitRegistry {
         return createTokenBucketLimiter({
           rpm: config.rpm ?? 60,
           burst: config.burst,
-        } as RateLimiterOptions);
+        });
 
       case 'sliding-window':
         return createSlidingWindowLimiter({
           maxRequests: config.maxRequests ?? 60,
           windowMs: config.windowMs ?? 60_000,
-        } as SlidingWindowOptions);
+        });
 
-      case 'adaptive':
+      case 'adaptive': {
         const adaptiveLimiter = createAdaptiveLimiter({
           baseRpm: config.rpm ?? 60,
           burstMultiplier: config.burst ? config.burst / (config.rpm ?? 60) : 1,
-        } as AdaptiveLimiterOptions);
+        });
 
         // Attach limiter instance for config sync
-        const checkWrapper = (key: string) => adaptiveLimiter.check(key);
-        (checkWrapper as { __limiter__?: any }).__limiter__ = adaptiveLimiter;
+        const checkWrapper: LimiterCheckFn = (key: string) => adaptiveLimiter.check(key);
+        checkWrapper.__limiter__ = adaptiveLimiter;
 
         return checkWrapper;
+      }
 
       default:
         throw new Error(`Unknown limiter type: ${(config as { type: string }).type}`);

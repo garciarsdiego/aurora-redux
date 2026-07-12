@@ -18,7 +18,7 @@ import { auditWorkflowDebugLog } from '../../workflow-log-audit.js';
 import { getArchitectureContractTool } from '../../tools/get_architecture_contract.js';
 import { inspectWorkflowDiffTool } from '../../tools/inspect_workflow_diff.js';
 import type { Router } from '../types.js';
-import { badRequest, jsonOk, notFound, readJsonBody } from '../_shared.js';
+import { badRequest, jsonOk, notFound, readBodyOr400 } from '../_shared.js';
 import { parseRecordJson, respondWithCollaborationTool } from './shared.js';
 
 export interface DashboardWorkflowFolderTarget {
@@ -214,8 +214,8 @@ export const diffRouter: Router = async (req, url, res) => {
   }
   const wfLogAuditMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/log-audit$/);
   if (req.method === 'POST' && wfLogAuditMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardWorkflowLogAudit(decodeURIComponent(wfLogAuditMatch[1] ?? ''), body, res);
     return true;
   }

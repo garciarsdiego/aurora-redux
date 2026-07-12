@@ -10,7 +10,7 @@ import type {
   CredentialSyncStatus,
   DecryptedCredential,
 } from './types.js';
-import { getOmnirouteUrl, getOmnirouteApiKey } from '../../utils/config.js';
+import { getOmnirouteUrl } from '../../utils/config.js';
 
 /**
  * OmniRoute credential sync manager
@@ -78,44 +78,46 @@ export class OmniRouteCredentialSync {
   }
 
   /**
+   * Build a sync status, record it for the credential, and return it
+   */
+  private makeStatus(
+    credentialId: string,
+    status: CredentialSyncStatus['status'],
+    error?: string,
+  ): CredentialSyncStatus {
+    const syncStatus: CredentialSyncStatus = {
+      service: 'omniroute',
+      lastSync: new Date().toISOString(),
+      status,
+      error,
+    };
+    this.syncStatuses.set(credentialId, syncStatus);
+    return syncStatus;
+  }
+
+  /**
    * Sync a specific credential to OmniRoute
    */
   async syncCredential(credentialId: string): Promise<CredentialSyncStatus> {
     const credential = await this.provider.getCredential(credentialId);
 
     if (!credential) {
-      const status: CredentialSyncStatus = {
-        service: 'omniroute',
-        lastSync: new Date().toISOString(),
-        status: 'failed',
-        error: 'Credential not found',
-      };
-      this.syncStatuses.set(credentialId, status);
-      return status;
+      return this.makeStatus(credentialId, 'failed', 'Credential not found');
     }
 
     try {
       // For OmniRoute, we validate the credential by making a test request
       const isValid = await this.validateOmnirouteCredential(credential.value);
 
-      const status: CredentialSyncStatus = {
-        service: 'omniroute',
-        lastSync: new Date().toISOString(),
-        status: isValid ? 'synced' : 'failed',
-        error: isValid ? undefined : 'Credential validation failed',
-      };
-
-      this.syncStatuses.set(credentialId, status);
-      return status;
+      return isValid
+        ? this.makeStatus(credentialId, 'synced')
+        : this.makeStatus(credentialId, 'failed', 'Credential validation failed');
     } catch (error) {
-      const status: CredentialSyncStatus = {
-        service: 'omniroute',
-        lastSync: new Date().toISOString(),
-        status: 'failed',
-        error: error instanceof Error ? error.message : String(error),
-      };
-      this.syncStatuses.set(credentialId, status);
-      return status;
+      return this.makeStatus(
+        credentialId,
+        'failed',
+        error instanceof Error ? error.message : String(error),
+      );
     }
   }
 

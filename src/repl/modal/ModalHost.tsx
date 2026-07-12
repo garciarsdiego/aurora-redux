@@ -22,7 +22,7 @@ import { useReplStore } from '../state/store.js';
 import { HitlModal } from './HitlModal.js';
 import { ConfirmModal, type ConfirmModalProps } from './ConfirmModal.js';
 import { HelpModal } from './HelpModal.js';
-import { ModelPickerModal } from './ModelPickerModal.js';
+import { ModelPickerModal, type ModelTarget } from './ModelPickerModal.js';
 import { GatesQueueOverlay } from '../components/GatesQueueOverlay.js';
 import { appendOutput } from '../state/outputBuffer.js';
 
@@ -56,12 +56,18 @@ export function ModalHost(): React.ReactElement | null {
   }
 
   // Model picker (cascade: target → provider → model). Volatile per session.
+  // `/model <target>` pushes { target } as props so the picker opens
+  // pre-targeted at the provider step.
   if (top === 'model-picker') {
+    const pickerProps = modalProps['model-picker'] as
+      | { readonly target?: Exclude<ModelTarget, 'RESET'> }
+      | undefined;
     return (
       <Box flexDirection="column">
         <ModelPickerModal
           onClose={popModal}
           onAppliedNotify={(msg) => appendOutput(`[model] ${msg}`, 'output')}
+          {...(pickerProps?.target ? { initialTarget: pickerProps.target } : {})}
         />
       </Box>
     );

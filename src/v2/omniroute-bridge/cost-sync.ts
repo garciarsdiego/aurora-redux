@@ -67,6 +67,27 @@ const DEFAULT_CONFIG: CostSyncConfig = {
   maxQueueSize: 100,
 };
 
+/**
+ * Fetch the local (ledger) and remote (OmniRoute) cost for a workflow.
+ * Shared by the sync loop and the compatibility functions below.
+ */
+async function fetchCostPair(
+  db: Database.Database,
+  workflowId: string,
+): Promise<{ localCost: number; remoteCost: number; error: string | null; report: CostReportResult | null }> {
+  // Get local cost from ledger
+  const localCost = sumModelCallCostForWorkflow(db, workflowId);
+
+  // Get remote cost from OmniRoute
+  const remoteResult = await costReport(workflowId);
+
+  if (!remoteResult.ok || !remoteResult.data) {
+    return { localCost, remoteCost: 0, error: remoteResult.error ?? 'Unknown error', report: null };
+  }
+
+  return { localCost, remoteCost: remoteResult.data.total_usd, error: null, report: remoteResult.data };
+}
+
 class CostSync {
   private config: CostSyncConfig;
   private db: Database.Database | null = null;
@@ -231,25 +252,16 @@ class CostSync {
     if (!this.db) return;
 
     try {
-      // Get local cost from ledger
-      const localCost = sumModelCallCostForWorkflow(this.db, workflowId);
+      const { localCost, remoteCost, error: syncError, report } = await fetchCostPair(this.db, workflowId);
 
-      // Get remote cost from OmniRoute
-      const remoteResult = await costReport(workflowId);
-      let remoteCost = 0;
-      let syncError: string | null = null;
-
-      if (remoteResult.ok && remoteResult.data) {
-        remoteCost = remoteResult.data.total_usd;
-
+      if (!syncError) {
         // Update local ledger with remote cost data if available
-        if (remoteResult.data.by_task && remoteResult.data.by_task.length > 0) {
-          await this.mergeRemoteCostData(workflowId, remoteResult.data.by_task);
+        if (report?.by_task && report.by_task.length > 0) {
+          await this.mergeRemoteCostData(workflowId, report.by_task);
         }
 
         this.successfulSyncs++;
       } else {
-        syncError = remoteResult.error ?? 'Unknown error';
         this.failedSyncs++;
 
         if (this.config.verboseLogging) {
@@ -487,13 +499,9 @@ export async function syncWorkflowCostsToOmniRoute(
   workflowId: string,
 ): Promise<CostSyncResponse> {
   try {
-    // Get local cost
-    const localCost = sumModelCallCostForWorkflow(db, workflowId);
+    const { localCost, remoteCost, error } = await fetchCostPair(db, workflowId);
 
-    // Get remote cost from OmniRoute
-    const remoteResult = await costReport(workflowId);
-    
-    if (!remoteResult.ok) {
+    if (error) {
       return {
         sync_status: 'error',
         workflow_id: workflowId,
@@ -501,11 +509,10 @@ export async function syncWorkflowCostsToOmniRoute(
         omniroute_cost_usd: 0,
         discrepancy_usd: localCost,
         synced_at: null,
-        error_message: remoteResult.error ?? 'Unknown error',
+        error_message: error,
       };
     }
 
-    const remoteCost = remoteResult.data?.total_usd ?? 0;
     const discrepancy = Math.abs(localCost - remoteCost);
 
     return {
@@ -593,11 +600,8 @@ export async function compareCosts(
   discrepancy_usd: number;
   discrepancy_pct: number;
 }> {
-  const localCost = sumModelCallCostForWorkflow(db, workflowId);
-  
-  const remoteResult = await costReport(workflowId);
-  const remoteCost = remoteResult.ok && remoteResult.data ? remoteResult.data.total_usd : 0;
-  
+  const { localCost, remoteCost } = await fetchCostPair(db, workflowId);
+
   const discrepancy = Math.abs(localCost - remoteCost);
   const discrepancyPct = remoteCost > 0 ? (discrepancy / remoteCost) * 100 : 0;
 

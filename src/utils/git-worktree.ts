@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
-import { dirname, join, relative, resolve as pathResolve, sep as pathSep } from 'node:path';
+import { dirname, join, relative, resolve as pathResolve } from 'node:path';
 import type { TaskExecutionContext } from './execution-context.js';
+import { isPathInsideRoot } from './workspace.js';
 
 export interface ProvisionedWorktree {
   executionContext: TaskExecutionContext;
@@ -38,10 +39,6 @@ function runGit(
     ok: false,
     stderr: [result.stderr, result.stdout].filter(Boolean).join('\n').trim() || `git ${args.join(' ')} failed`,
   };
-}
-
-function isInsideRoot(candidate: string, root: string): boolean {
-  return candidate === root || candidate.startsWith(`${root}${pathSep}`);
 }
 
 export type WorktreeStatus = 'changed' | 'clean' | 'unavailable';
@@ -248,7 +245,7 @@ export function ensureGitWorktree(
   // worktree.
   const repoRoot = canonicalPath(topLevel.stdout.trim());
   const sourceMatchesToplevel = repoRoot === sourceProjectRoot;
-  const sourceInsideToplevel = isInsideRoot(sourceProjectRoot, repoRoot);
+  const sourceInsideToplevel = isPathInsideRoot(sourceProjectRoot, repoRoot);
 
   if (!sourceMatchesToplevel && !sourceInsideToplevel) {
     return {
@@ -262,10 +259,10 @@ export function ensureGitWorktree(
   // the canonical source — `git worktree add` only works from a real toplevel.
   const effectiveSourceRoot = sourceMatchesToplevel ? sourceProjectRoot : repoRoot;
   const effectiveSourceCwd = sourceMatchesToplevel ? sourceCwd : (
-    isInsideRoot(sourceCwd, repoRoot) ? sourceCwd : repoRoot
+    isPathInsideRoot(sourceCwd, repoRoot) ? sourceCwd : repoRoot
   );
 
-  if (!isInsideRoot(effectiveSourceCwd, effectiveSourceRoot)) {
+  if (!isPathInsideRoot(effectiveSourceCwd, effectiveSourceRoot)) {
     throw new Error(`source_cwd must stay inside source_project_root: ${effectiveSourceCwd}`);
   }
 

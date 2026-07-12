@@ -53,11 +53,36 @@ export class CostRouterBudgetExceededError extends BudgetExceededError {
   }
 }
 
-export function getWorkflowBudgetUsd(): number | null {
-  const raw = process.env.OMNIFORGE_WORKFLOW_BUDGET_USD;
+function parseBudgetEnv(raw: string | undefined): number | null {
   if (!raw) return null;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+export function getWorkflowBudgetUsd(): number | null {
+  return parseBudgetEnv(process.env.OMNIFORGE_WORKFLOW_BUDGET_USD);
+}
+
+/**
+ * True if any row returned by `sql` (a SELECT of events.payload_json) has a
+ * JSON payload matching `predicate`. Malformed payloads are skipped.
+ */
+function anyEventPayloadMatches(
+  db: Database.Database,
+  sql: string,
+  params: ReadonlyArray<string | number>,
+  predicate: (payload: unknown) => boolean,
+): boolean {
+  const rows = db.prepare(sql).all(...params) as Array<{ payload_json: string | null }>;
+  for (const row of rows) {
+    if (!row.payload_json) continue;
+    try {
+      if (predicate(JSON.parse(row.payload_json))) return true;
+    } catch {
+      // ignore malformed payload
+    }
+  }
+  return false;
 }
 
 export function getWorkflowModelSpendUsd(
@@ -75,23 +100,14 @@ function wasThresholdAlreadyEmitted(
   workflowId: string,
   thresholdPct: number,
 ): boolean {
-  const rows = db
-    .prepare(
-      `SELECT payload_json FROM events
-       WHERE workflow_id = ? AND type = 'budget_threshold_crossed'
-       ORDER BY timestamp DESC`,
-    )
-    .all(workflowId) as Array<{ payload_json: string | null }>;
-  for (const row of rows) {
-    if (!row.payload_json) continue;
-    try {
-      const payload = JSON.parse(row.payload_json) as BudgetThresholdEvent;
-      if (payload.threshold_pct === thresholdPct) return true;
-    } catch {
-      // ignore malformed payload
-    }
-  }
-  return false;
+  return anyEventPayloadMatches(
+    db,
+    `SELECT payload_json FROM events
+     WHERE workflow_id = ? AND type = 'budget_threshold_crossed'
+     ORDER BY timestamp DESC`,
+    [workflowId],
+    (payload) => (payload as BudgetThresholdEvent).threshold_pct === thresholdPct,
+  );
 }
 
 const THRESHOLDS = [50, 75, 90, 100] as const;
@@ -164,12 +180,6 @@ export function assertWorkflowBudgetAllowsModelCall(
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-function parseBudgetEnv(raw: string | undefined): number | null {
-  if (!raw) return null;
-  const value = Number(raw);
-  return Number.isFinite(value) && value >= 0 ? value : null;
-}
-
 /** Rolling-24h spend ceiling across ALL workflows. */
 export function getDailyBudgetUsd(): number | null {
   return parseBudgetEnv(process.env.OMNIFORGE_DAILY_BUDGET_USD);
@@ -223,23 +233,14 @@ function wasGlobalBudgetEventEmitted(
   scope: GlobalBudgetScope,
   sinceMs: number,
 ): boolean {
-  const rows = db
-    .prepare(
-      `SELECT payload_json FROM events
-       WHERE type = 'global_budget_exceeded' AND timestamp >= ?
-       ORDER BY timestamp DESC`,
-    )
-    .all(sinceMs) as Array<{ payload_json: string | null }>;
-  for (const row of rows) {
-    if (!row.payload_json) continue;
-    try {
-      const payload = JSON.parse(row.payload_json) as { scope?: string };
-      if (payload.scope === scope) return true;
-    } catch {
-      // ignore malformed payload
-    }
-  }
-  return false;
+  return anyEventPayloadMatches(
+    db,
+    `SELECT payload_json FROM events
+     WHERE type = 'global_budget_exceeded' AND timestamp >= ?
+     ORDER BY timestamp DESC`,
+    [sinceMs],
+    (payload) => (payload as { scope?: string }).scope === scope,
+  );
 }
 
 function breachGlobalBudget(

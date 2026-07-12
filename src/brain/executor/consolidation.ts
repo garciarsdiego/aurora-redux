@@ -126,6 +126,41 @@ function applyMapSummariesToTasks(tasks: Task[], summaries: Map<string, string>)
 }
 
 /**
+ * Parse a workflow.metadata JSON blob with a `{}` fallback. Malformed metadata
+ * emits a low-noise `consolidation_metadata_parse_failed` event (tagged with
+ * the calling `site`) so the failure is enumerable (F-D1-2) — observability
+ * itself is guarded and can never break the caller.
+ */
+function parseWorkflowMetadataSafely(
+  db: Database.Database,
+  workflowId: string,
+  raw: string | null,
+  site: string,
+): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch (err) {
+    try {
+      insertEvent(db, {
+        workflow_id: workflowId,
+        type: 'consolidation_metadata_parse_failed',
+        payload: {
+          error: (err as Error).message ?? String(err),
+          site,
+        },
+      });
+    } catch {
+      /* observability failure must not break the caller */
+    }
+    return {};
+  }
+}
+
+/**
  * Tier 0 Wave 4 (0.10) — Safely merge a new metadata fragment into the
  * existing workflow.metadata JSON blob. Callers that previously called
  * `setWorkflowMetadata(db, id, JSON.stringify({ key: value }))` clobbered
@@ -143,38 +178,24 @@ function mergeWorkflowMetadata(
 ): Record<string, unknown> {
   const current = loadWorkflowById(db, workflow.id);
   const sourceMetadata: string | null = current?.metadata ?? workflow.metadata;
-  const existing = (() => {
-    if (!sourceMetadata) return {};
-    try {
-      const parsed = JSON.parse(sourceMetadata) as unknown;
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : {};
-    } catch (err) {
-      // Malformed metadata — start fresh. Emit a low-noise event so this
-      // failure is enumerable (F-D1-2). Never let observability break the
-      // metadata merge.
-      try {
-        insertEvent(db, {
-          workflow_id: workflow.id,
-          type: 'consolidation_metadata_parse_failed',
-          payload: {
-            error: (err as Error).message ?? String(err),
-            site: 'validation_metadata_merge',
-          },
-        });
-      } catch {
-        /* observability failure must not break metadata merge */
-      }
-      return {};
-    }
-  })();
+  const existing = parseWorkflowMetadataSafely(
+    db,
+    workflow.id,
+    sourceMetadata,
+    'validation_metadata_merge',
+  );
   const merged = { ...existing, ...patch };
   const mergedJson = JSON.stringify(merged);
   setWorkflowMetadata(db, workflow.id, mergedJson);
   // Best-effort: keep the caller-supplied workflow object roughly in sync.
   (workflow as { metadata: string | null }).metadata = mergedJson;
   return merged;
+}
+
+/** Completed task with a non-empty output — the only kind that feeds the
+ *  validators (assembleCompletedTaskOutputs) and the map-reduce MAP step. */
+function hasCompletedOutput(t: Task): boolean {
+  return t.status === 'completed' && typeof t.output_json === 'string' && t.output_json.length > 0;
 }
 
 /**
@@ -184,7 +205,7 @@ function mergeWorkflowMetadata(
  */
 function assembleCompletedTaskOutputs(tasks: Task[]): string {
   return tasks
-    .filter((t) => t.status === 'completed' && typeof t.output_json === 'string' && t.output_json.length > 0)
+    .filter(hasCompletedOutput)
     .map((t) => t.output_json!)
     .join('\n\n');
 }
@@ -206,12 +227,11 @@ export async function runConsolidation(
   // consolidator, summarize each in parallel via a cheap model FIRST, then
   // hand the slimmed task list to the original consolidator. Single-stage
   // path preserved for low-fan-in workflows (no extra cost / latency).
-  const completedWithOutput = tasks.filter(
-    (t) => t.status === 'completed' && typeof t.output_json === 'string' && t.output_json.length > 0,
-  );
+  const completedWithOutput = tasks.filter(hasCompletedOutput);
+  const useMapReduce = completedWithOutput.length > MAP_REDUCE_THRESHOLD;
 
   let effectiveTasks: Task[] = tasks;
-  if (completedWithOutput.length > MAP_REDUCE_THRESHOLD) {
+  if (useMapReduce) {
     const mapModel = getMapModel();
     insertEvent(db, {
       workflow_id: workflow.id,
@@ -309,7 +329,7 @@ export async function runConsolidation(
   }
 
   // OPP-C1 — emit reduce_completed only when the map-reduce branch ran.
-  if (completedWithOutput.length > MAP_REDUCE_THRESHOLD) {
+  if (useMapReduce) {
     insertEvent(db, {
       workflow_id: workflow.id,
       type: 'consolidation_reduce_completed',

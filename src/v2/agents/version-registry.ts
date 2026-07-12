@@ -79,7 +79,7 @@ export function snapshotPersona<I, O>(
     ambiguityProtocol: persona.ambiguityProtocol.map((r) => ({
       condition: r.condition,
       resolution: r.resolution,
-      escalate: r.escalate ?? false,
+      escalate: r.escalate,
     })),
     tools: [...persona.tools],
     defaultModel: persona.defaultModel,
@@ -160,7 +160,7 @@ export function buildAmendedPersona<I, O>(
     // the live permissions map: prompts referencing a tool that the live
     // permissions don't allow would just emit deny, which is the correct
     // safety contract.
-    tools: snapshot.tools as readonly AgentPersona<I, O>['tools'][number][],
+    tools: snapshot.tools as AgentPersona<I, O>['tools'],
     defaultModel: snapshot.defaultModel,
     systemPromptTemplate: snapshot.systemPromptTemplate,
   };

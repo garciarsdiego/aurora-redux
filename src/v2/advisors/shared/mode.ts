@@ -7,8 +7,9 @@ export function isAdvisorMode(value: unknown): value is AdvisorMode {
 }
 
 export function getAdvisorMode(ctx: AdvisorContext, args: unknown): AdvisorMode {
-  if (typeof args === 'object' && args !== null && isAdvisorMode((args as { mode?: unknown }).mode)) {
-    return (args as { mode: AdvisorMode }).mode;
+  if (typeof args === 'object' && args !== null) {
+    const mode = (args as { mode?: unknown }).mode;
+    if (isAdvisorMode(mode)) return mode;
   }
   return ctx.mode ?? 'auto';
 }

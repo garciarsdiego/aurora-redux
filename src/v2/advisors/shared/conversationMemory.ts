@@ -11,8 +11,6 @@
 // (e.g. dataset replay). Entries are also dropped explicitly on
 // completeConversation() so the DB cleanup path frees in-process state too.
 
-import { randomBytes } from 'node:crypto';
-
 export interface StepHistory {
   step: number;
   output: string;
@@ -52,22 +50,6 @@ function evictIfNeeded(): void {
     if (oldestKey === undefined) return;
     store.delete(oldestKey);
   }
-}
-
-/**
- * Creates a new conversation and returns its unique ID.
- * @param advisorName  Name of the advisor (e.g. "consensus", "codereview")
- * @param workspaceId  Omniforge workspace identifier
- * @param taskId       Optional task ID to associate with the conversation
- */
-export function createConversation(
-  advisorName: string,
-  workspaceId: string,
-  taskId?: string,
-): string {
-  const conversationId = randomBytes(8).toString('hex');
-  ensureConversation(conversationId, advisorName, workspaceId, taskId);
-  return conversationId;
 }
 
 /** Seeds in-memory history for an executor-supplied conversation id (e.g. SQLite `advisor_conversations.id`). */

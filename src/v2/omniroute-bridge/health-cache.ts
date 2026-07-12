@@ -5,10 +5,9 @@
  * Provides cached health data for failover decisions and dashboard visualization.
  */
 
-import { checkDetailedHealth, type DetailedHealthResult, type HealthCheckResult } from './client.js';
+import { checkDetailedHealth, detailedHealthFallback, type DetailedHealthResult, type HealthCheckResult } from './client.js';
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const CACHE_KEY = 'omniroute_health_status';
 
 interface CacheEntry {
   data: DetailedHealthResult;
@@ -93,12 +92,7 @@ export async function refreshHealthStatus(): Promise<HealthCheckResult> {
         _cache.fetchSuccess = false;
       } else {
         _cache = {
-          data: result.data || {
-            status: 'error',
-            timestamp: new Date().toISOString(),
-            providers: {},
-            rate_limits: {},
-          },
+          data: result.data || detailedHealthFallback(),
           timestamp: now,
           lastFetchAttempt: now,
           fetchSuccess: false,

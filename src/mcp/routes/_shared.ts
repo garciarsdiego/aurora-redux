@@ -170,6 +170,21 @@ export async function readLargeJsonBody(req: IncomingMessage): Promise<unknown> 
   });
 }
 
+/**
+ * Reads the JSON body and answers 400 (badRequest) when it is invalid or too
+ * large. Returns `undefined` once the 400 response has been written — the
+ * sentinel is unambiguous because readJsonBody can never resolve `undefined`
+ * (JSON.parse cannot produce it; an empty body resolves to `{}`).
+ */
+export async function readBodyOr400(req: IncomingMessage, res: ServerResponse): Promise<unknown> {
+  try {
+    return await readJsonBody(req);
+  } catch (err) {
+    badRequest(res, err instanceof Error ? err.message : String(err));
+    return undefined;
+  }
+}
+
 export async function readRawBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let buf = '';
@@ -217,6 +232,36 @@ export function sendSseEvent(
 export function sendSseHeartbeat(res: ServerResponse): void {
   if (res.writableEnded) return;
   res.write(`: ping ${Date.now()}\n\n`);
+}
+
+/**
+ * Wires the SSE lifecycle boilerplate shared by every SSE endpoint: the
+ * heartbeat interval (unref'd so it never keeps the process alive), plus the
+ * `close`/`error` listeners on both req and res. `onCleanup` runs exactly
+ * once — the returned cleanup is idempotent so callers can also invoke it
+ * from their own finally blocks.
+ */
+export function wireSseLifecycle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  onCleanup?: () => void,
+): () => void {
+  const heartbeat = setInterval(() => sendSseHeartbeat(res), SSE_HEARTBEAT_MS);
+  if (typeof (heartbeat as unknown as { unref?: () => void }).unref === 'function') {
+    (heartbeat as unknown as { unref: () => void }).unref();
+  }
+  let closed = false;
+  const cleanup = (): void => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    if (onCleanup) onCleanup();
+  };
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+  res.on('close', cleanup);
+  res.on('error', cleanup);
+  return cleanup;
 }
 
 // Sprint 3.7 (D-H2.066, F-REL-6): log SSE cleanup errors instead of silencing.

@@ -43,32 +43,44 @@ export function registerExport(program: Command): void {
         format = resolveFormat(options.format, options.output);
       } catch (err) {
         console.error(`Error: ${(err as Error).message}`);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
 
+      // exitCode (not process.exit) + finally db.close(): same rationale as
+      // run.ts — process.exit() with a better-sqlite3 handle mid-close hits a
+      // libuv assertion on Windows.
       const db = initDb(getDbPath());
-      const pattern = getPatternByName(db, options.workspace, name);
-      if (!pattern) {
-        console.error(`Error: pattern '${name}' not found in workspace '${options.workspace}'`);
-        process.exit(1);
-      }
-
-      let dag: unknown;
+      let content: string;
       try {
-        dag = JSON.parse(pattern.dag_json);
-      } catch {
-        console.error(`Error: pattern '${name}' has corrupt dag_json`);
-        process.exit(1);
-      }
+        const pattern = getPatternByName(db, options.workspace, name);
+        if (!pattern) {
+          console.error(`Error: pattern '${name}' not found in workspace '${options.workspace}'`);
+          process.exitCode = 1;
+          return;
+        }
 
-      const content = serialize(dag, format);
+        let dag: unknown;
+        try {
+          dag = JSON.parse(pattern.dag_json);
+        } catch {
+          console.error(`Error: pattern '${name}' has corrupt dag_json`);
+          process.exitCode = 1;
+          return;
+        }
+
+        content = serialize(dag, format);
+      } finally {
+        db.close();
+      }
 
       if (options.output) {
         try {
           await writeFile(options.output, content, 'utf-8');
         } catch (err) {
           console.error(`Error: failed to write ${options.output}: ${(err as Error).message}`);
-          process.exit(1);
+          process.exitCode = 1;
+          return;
         }
         console.log(`Exported pattern '${name}' to ${options.output} (${format})`);
         return;

@@ -18,7 +18,7 @@ import {
   type DagDraftStatus,
 } from '../../../db/dag-drafts.js';
 import type { Router } from '../types.js';
-import { badRequest, jsonOk, notFound, readJsonBody, readLargeJsonBody } from '../_shared.js';
+import { badRequest, jsonOk, notFound, readBodyOr400, readLargeJsonBody } from '../_shared.js';
 import {
   dashboardCliPermissionMode,
   dashboardWorkflowMode,
@@ -195,20 +195,20 @@ function handleDashboardDagDraftDelete(id: string, res: ServerResponse): void {
 
 export const dagsRouter: Router = async (req, url, res) => {
   if (req.method === 'POST' && url.pathname === '/api/dashboard/dags/validate') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardDagValidate(body, res);
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/dags/import') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardDagImport(body, res);
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/dags/run') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardDagRun(body, res);
     return true;
   }
@@ -223,8 +223,8 @@ export const dagsRouter: Router = async (req, url, res) => {
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/dag-drafts') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardDagDraftCreate(body, res);
     return true;
   }
@@ -240,8 +240,8 @@ export const dagsRouter: Router = async (req, url, res) => {
       return true;
     }
     if (req.method === 'PATCH') {
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+      const body = await readBodyOr400(req, res);
+      if (body === undefined) return true;
       handleDashboardDagDraftPatch(id, body, res);
       return true;
     }

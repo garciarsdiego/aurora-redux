@@ -24,15 +24,13 @@
 
 import type { Advisor, AdvisorContext, AdvisorResult } from '../types.js';
 import { getAdvisorMode } from '../shared/mode.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
+import { callAdvisorLlm } from '../shared/llm.js';
 import { ChatInputSchema, type ChatInput } from './schema.js';
 import { CHAT_SYSTEM_PROMPT } from './prompt.js';
 
 const DESCRIPTION =
   'Generic single-shot LLM call for quick questions, brainstorming, or thinking-partner conversations. ' +
   'Falls back to TASK_MODEL when no model is supplied. Use codereview / refactor / debug for file-bearing tasks.';
-
-const DEFAULT_MODEL = 'cc/claude-sonnet-4-6';
 
 function buildUserPrompt(parsed: ChatInput): string {
   const lines: string[] = [];
@@ -55,11 +53,12 @@ export const chatAdvisor: Advisor = {
     const parsed = ChatInputSchema.parse(args);
     void getAdvisorMode(ctx, args);
     const userPrompt = buildUserPrompt(parsed);
-    const text = await callOmniroute({
+    const text = await callAdvisorLlm(ctx, {
       systemPrompt: CHAT_SYSTEM_PROMPT,
       userPrompt,
-      model: parsed.model ?? DEFAULT_MODEL,
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      // DESCRIPTION and the schema promise a TASK_MODEL fallback when `model`
+      // is omitted; callAdvisorLlm covers the final default when neither is set.
+      model: parsed.model ?? process.env['TASK_MODEL'],
     });
     return { output: text };
   },

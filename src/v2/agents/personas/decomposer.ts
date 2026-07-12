@@ -96,6 +96,17 @@ const CONCRETE_ACCEPTANCE_RE = /\b(file |exists?|exit 0|line|import|export|funct
 // Agora: Apenas indicadores de sequência temporal real
 const COMBINED_NAME_RE = /\b(then|after that|subsequently|followed by|next)\b/i;
 
+// Predicados compartilhados entre o detect declarativo (FAILURE_MODES) e o
+// gate imperativo do postHook — um threshold ajustado num lado nunca diverge
+// do outro.
+function isCombinedTaskName(name: string): boolean {
+  return COMBINED_NAME_RE.test(name) && name.split(COMBINED_NAME_RE).length > 2;
+}
+
+function isVagueAcceptance(criteria: string): boolean {
+  return !CONCRETE_ACCEPTANCE_RE.test(criteria);
+}
+
 export function hasCycle(tasks: readonly z.infer<typeof DagTaskSchema>[]): boolean {
   const indeg = new Map<string, number>();
   const adj = new Map<string, string[]>();
@@ -140,7 +151,7 @@ export function pickAlternativeModel(
 const FAILURE_MODES: readonly FailureMode<DecomposerOutput>[] = [
   {
     id: 'decomposer.invalid_model',
-    detect: (output) => false, // resolved synchronously inside postHook
+    detect: () => false, // resolved synchronously inside postHook
     remediation: 'retry_with_stronger_prompt',
     description: 'A picked model is not in the available_models catalog.',
   },
@@ -149,7 +160,7 @@ const FAILURE_MODES: readonly FailureMode<DecomposerOutput>[] = [
     detect: (output) => {
       // OTIMIZAÇÃO 1: Adicionar threshold para evitar over-decomposition
       // Só rejeitar se: (1) tem keywords de sequência temporal E (2) dividiria em >3 tasks E (3) total tasks < 5
-      const hasCombinedNames = output.tasks.some((t) => COMBINED_NAME_RE.test(t.name) && t.name.split(COMBINED_NAME_RE).length > 2);
+      const hasCombinedNames = output.tasks.some((t) => isCombinedTaskName(t.name));
       const wouldCreateTooManyTasks = output.tasks.length >= 5; // Se já tem 5+ tasks, aceitar
       return hasCombinedNames && !wouldCreateTooManyTasks;
     },
@@ -159,7 +170,7 @@ const FAILURE_MODES: readonly FailureMode<DecomposerOutput>[] = [
   {
     id: 'decomposer.vague_acceptance',
     detect: (output) =>
-      output.tasks.some((t) => !!t.acceptance_criteria && !CONCRETE_ACCEPTANCE_RE.test(t.acceptance_criteria)),
+      output.tasks.some((t) => !!t.acceptance_criteria && isVagueAcceptance(t.acceptance_criteria)),
     remediation: 'retry_with_stronger_prompt',
     retryPromptAddition:
       'Acceptance must reference a file path, exit code, line count, or specific export. "should be implemented correctly" is rejected.',
@@ -469,7 +480,7 @@ export const DECOMPOSER_PERSONA: AgentPersona<DecomposerInput, DecomposerOutput>
 
     // 3. No combined "Implement X and Y" task names
     for (const task of output.tasks) {
-      if (COMBINED_NAME_RE.test(task.name) && task.name.split(COMBINED_NAME_RE).length > 2) {
+      if (isCombinedTaskName(task.name)) {
         return {
           rejectWithReason: `decomposer.combined_task_names: task ${task.id} name "${task.name}" combines multiple concerns. Split into separate tasks.`,
           mode: 'decomposer.combined_task_names',
@@ -479,7 +490,7 @@ export const DECOMPOSER_PERSONA: AgentPersona<DecomposerInput, DecomposerOutput>
 
     // 4. Acceptance criteria must be concrete
     for (const task of output.tasks) {
-      if (task.acceptance_criteria && !CONCRETE_ACCEPTANCE_RE.test(task.acceptance_criteria)) {
+      if (task.acceptance_criteria && isVagueAcceptance(task.acceptance_criteria)) {
         return {
           rejectWithReason: `decomposer.vague_acceptance: task ${task.id} acceptance "${task.acceptance_criteria}" lacks concrete keywords (file/exists/exit 0/line/import/export/function/class/matches/outputs/returns).`,
           mode: 'decomposer.vague_acceptance',

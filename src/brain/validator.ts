@@ -177,7 +177,7 @@ function withTimeoutSignal<T>(
       },
       (err: unknown) => {
         clearTimeout(timer);
-        reject(err as Error);
+        reject(err);
       },
     );
   });
@@ -192,14 +192,15 @@ export async function runFinalValidation(
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const perAttemptTimeoutMs =
     opts.perAttemptTimeoutMs ?? DEFAULT_PER_ATTEMPT_TIMEOUT_MS;
+  const emitEvent = (type: string, payload: unknown): void =>
+    insertEvent(db, { workflow_id: workflow.id, type, payload });
 
   const command = getValidationCommand(project.type);
   if (!command) {
     // 'other' project type — nothing to validate. Not an error.
-    insertEvent(db, {
-      workflow_id: workflow.id,
-      type: 'workflow_validation_skipped',
-      payload: { reason: 'project_type_unsupported', project_type: project.type },
+    emitEvent('workflow_validation_skipped', {
+      reason: 'project_type_unsupported',
+      project_type: project.type,
     });
     return {
       passed: true,
@@ -209,17 +210,16 @@ export async function runFinalValidation(
     };
   }
 
-  insertEvent(db, {
-    workflow_id: workflow.id,
-    type: 'workflow_validation_started',
-    payload: { project_type: project.type, root_dir: project.rootDir, command },
+  emitEvent('workflow_validation_started', {
+    project_type: project.type,
+    root_dir: project.rootDir,
+    command,
   });
 
   let previousFailureSummary: string | null = null;
   let lastOutput = '';
-  let attempt = 0;
 
-  for (attempt = 1; attempt <= maxAttempts; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const prompt = buildValidationPrompt(project, command, previousFailureSummary);
     const syntheticTask = buildSyntheticTask(workflow, prompt);
 
@@ -232,11 +232,7 @@ export async function runFinalValidation(
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      insertEvent(db, {
-        workflow_id: workflow.id,
-        type: 'workflow_validation_error',
-        payload: { attempt, error: msg },
-      });
+      emitEvent('workflow_validation_error', { attempt, error: msg });
       previousFailureSummary = `cli invocation errored: ${msg}`;
       lastOutput = msg;
       continue;
@@ -246,11 +242,7 @@ export async function runFinalValidation(
     const parsed = parseValidationOutput(cliOutput);
 
     if (parsed.passed) {
-      insertEvent(db, {
-        workflow_id: workflow.id,
-        type: 'workflow_validation_passed',
-        payload: { attempt },
-      });
+      emitEvent('workflow_validation_passed', { attempt });
       return {
         passed: true,
         summary: parsed.summary,
@@ -260,19 +252,14 @@ export async function runFinalValidation(
     }
 
     // Failed — log and prepare next attempt
-    insertEvent(db, {
-      workflow_id: workflow.id,
-      type: 'workflow_validation_failed',
-      payload: { attempt, summary: parsed.summary },
-    });
+    emitEvent('workflow_validation_failed', { attempt, summary: parsed.summary });
     previousFailureSummary = parsed.summary;
   }
 
   // All attempts exhausted
-  insertEvent(db, {
-    workflow_id: workflow.id,
-    type: 'workflow_validation_exhausted',
-    payload: { attempts: maxAttempts, final_summary: previousFailureSummary },
+  emitEvent('workflow_validation_exhausted', {
+    attempts: maxAttempts,
+    final_summary: previousFailureSummary,
   });
 
   return {
@@ -325,21 +312,16 @@ export async function runTestValidation(
   project: DetectedProject,
   opts: ValidationOptions = {},
 ): Promise<TestValidationResult> {
+  const emitEvent = (type: string, payload: unknown): void =>
+    insertEvent(db, { workflow_id: workflow.id, type, payload });
+
   const command = detectTestCommand(project.rootDir);
   if (!command) {
-    insertEvent(db, {
-      workflow_id: workflow.id,
-      type: 'workflow_test_validation_skipped',
-      payload: { reason: 'no_test_command', root_dir: project.rootDir },
-    });
+    emitEvent('workflow_test_validation_skipped', { reason: 'no_test_command', root_dir: project.rootDir });
     return { passed: true, summary: 'skipped — no test command detected', attempts: 0, lastOutput: '', ran: false, command: null };
   }
   if (process.env['DISABLE_TEST_VALIDATION'] === 'true') {
-    insertEvent(db, {
-      workflow_id: workflow.id,
-      type: 'workflow_test_validation_skipped',
-      payload: { reason: 'disabled_by_env', command },
-    });
+    emitEvent('workflow_test_validation_skipped', { reason: 'disabled_by_env', command });
     return { passed: true, summary: 'skipped — DISABLE_TEST_VALIDATION=true', attempts: 0, lastOutput: '', ran: false, command };
   }
 
@@ -347,11 +329,7 @@ export async function runTestValidation(
   const perAttemptTimeoutMs = opts.perAttemptTimeoutMs ?? DEFAULT_PER_ATTEMPT_TIMEOUT_MS;
   const profile: ConstrainedProfile = { timeoutMs: perAttemptTimeoutMs, networkOff: opts.networkOff ?? true };
 
-  insertEvent(db, {
-    workflow_id: workflow.id,
-    type: 'workflow_test_validation_started',
-    payload: { command, root_dir: project.rootDir, max_attempts: maxAttempts },
-  });
+  emitEvent('workflow_test_validation_started', { command, root_dir: project.rootDir, max_attempts: maxAttempts });
 
   let lastOutput = '';
   let lastSummary = '';
@@ -360,20 +338,12 @@ export async function runTestValidation(
     lastOutput = result.output.slice(-2000);
 
     if (result.passed) {
-      insertEvent(db, {
-        workflow_id: workflow.id,
-        type: 'workflow_test_validation_passed',
-        payload: { attempt, command },
-      });
+      emitEvent('workflow_test_validation_passed', { attempt, command });
       return { passed: true, summary: 'tests passed', attempts: attempt, lastOutput, ran: true, command };
     }
 
     lastSummary = result.failureSummary;
-    insertEvent(db, {
-      workflow_id: workflow.id,
-      type: 'workflow_test_validation_failed',
-      payload: { attempt, command, timed_out: result.timedOut, exit_code: result.exitCode, summary: lastSummary },
-    });
+    emitEvent('workflow_test_validation_failed', { attempt, command, timed_out: result.timedOut, exit_code: result.exitCode, summary: lastSummary });
 
     // No point spawning a fix on the final attempt — we wouldn't re-verify it.
     if (attempt >= maxAttempts) break;
@@ -395,18 +365,10 @@ export async function runTestValidation(
     } catch (err) {
       // The fix invocation errored/timed out — record it but still re-run the
       // tests next iteration (a partial fix may have helped).
-      insertEvent(db, {
-        workflow_id: workflow.id,
-        type: 'workflow_test_validation_error',
-        payload: { attempt, error: err instanceof Error ? err.message : String(err) },
-      });
+      emitEvent('workflow_test_validation_error', { attempt, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
-  insertEvent(db, {
-    workflow_id: workflow.id,
-    type: 'workflow_test_validation_exhausted',
-    payload: { attempts: maxAttempts, command, final_summary: lastSummary },
-  });
+  emitEvent('workflow_test_validation_exhausted', { attempts: maxAttempts, command, final_summary: lastSummary });
   return { passed: false, summary: lastSummary || 'tests failed', attempts: maxAttempts, lastOutput, ran: true, command };
 }

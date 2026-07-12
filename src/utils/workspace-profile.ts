@@ -1,8 +1,10 @@
 import { existsSync, statSync } from 'node:fs';
-import { isAbsolute, resolve as pathResolve, sep as pathSep } from 'node:path';
+import { isAbsolute, resolve as pathResolve } from 'node:path';
 import { z } from 'zod';
 import { initDb } from '../db/client.js';
 import { getDbPath } from './config.js';
+import { safeJsonObject } from './safe-parse-json.js';
+import { isPathInsideRoot } from './workspace.js';
 
 const WorkspaceSoftwareTargetInputSchema = z.object({
   project_root: z.string().trim().min(1).max(4096),
@@ -34,10 +36,6 @@ function assertExistingDirectory(targetPath: string, label: string): void {
   }
 }
 
-function isWithinRoot(candidate: string, root: string): boolean {
-  return candidate === root || candidate.startsWith(`${root}${pathSep}`);
-}
-
 export function normalizeWorkspaceSoftwareTarget(raw: unknown): WorkspaceSoftwareTarget {
   const parsed = WorkspaceSoftwareTargetInputSchema.parse(raw);
   if (!isAbsolute(parsed.project_root)) {
@@ -52,7 +50,7 @@ export function normalizeWorkspaceSoftwareTarget(raw: unknown): WorkspaceSoftwar
       ? pathResolve(parsed.cwd)
       : pathResolve(projectRoot, parsed.cwd))
     : projectRoot;
-  if (!isWithinRoot(cwd, projectRoot)) {
+  if (!isPathInsideRoot(cwd, projectRoot)) {
     throw new Error(`software_target.cwd must stay inside project_root: ${cwd}`);
   }
   assertExistingDirectory(cwd, 'software_target.cwd');
@@ -78,23 +76,11 @@ export function validateWorkspaceProfilePatch(raw: unknown): {
   };
 }
 
-function safeJsonObject(raw: string | null | undefined): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
 export function workspaceProfileFromRow(row: {
   workspace: string;
   metadata_json: string | null;
 }): WorkspaceProfile {
-  const metadata = safeJsonObject(row.metadata_json);
+  const metadata = safeJsonObject(row.metadata_json, { where: 'workspace_profile.metadata_json' });
   try {
     return {
       workspace: row.workspace,

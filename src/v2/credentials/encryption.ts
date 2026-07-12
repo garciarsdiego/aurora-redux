@@ -38,6 +38,15 @@ export function deriveKey(
 }
 
 /**
+ * Resolve the salt from config, generating a fresh one when absent.
+ * Single point of truth: encryptCredentialObject relies on the resolved
+ * salt matching the one stored alongside the ciphertext.
+ */
+function resolveSalt(config: EncryptionConfig): string {
+  return config.salt || generateSalt();
+}
+
+/**
  * Encrypt a credential value using AES-256-GCM
  */
 export function encryptCredential(
@@ -49,8 +58,7 @@ export function encryptCredential(
     throw new Error(`Unsupported algorithm: ${config.algorithm}`);
   }
 
-  const salt = config.salt || generateSalt();
-  const key = deriveKey(masterKey, salt, config.iterations);
+  const key = deriveKey(masterKey, resolveSalt(config), config.iterations);
   const iv = crypto.randomBytes(IV_LENGTH);
 
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -105,7 +113,7 @@ export function encryptCredentialObject(
   masterKey: string,
   config: EncryptionConfig,
 ): EncryptedCredential {
-  const salt = config.salt || generateSalt();
+  const salt = resolveSalt(config);
   const { ciphertext, iv, authTag } = encryptCredential(
     credential.value,
     masterKey,

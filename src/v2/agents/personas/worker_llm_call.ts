@@ -68,6 +68,11 @@ function asString(output: WorkerLlmCallOutput['output']): string {
   return typeof output === 'string' ? output : JSON.stringify(output);
 }
 
+/** Shared by the failure-mode detector and the postHook gate — never diverge. */
+function emittedWrongKind(output: WorkerLlmCallOutput): boolean {
+  return WRONG_KIND_RE.test(asString(output.output));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Failure modes
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +80,7 @@ function asString(output: WorkerLlmCallOutput['output']): string {
 const FAILURE_MODES: readonly FailureMode<WorkerLlmCallOutput>[] = [
   {
     id: 'worker_llm.wrong_kind_attempted',
-    detect: (output) => WRONG_KIND_RE.test(asString(output.output)),
+    detect: (output) => emittedWrongKind(output),
     remediation: 'escalate_to_operator',
     description: 'Decomposer picked llm_call but the prompt requires filesystem access.',
   },
@@ -190,10 +195,9 @@ export const WORKER_LLM_CALL_PERSONA: AgentPersona<WorkerLlmCallInput, WorkerLlm
 
   postHook: async (input, output, ctx) => {
     // Wrong-kind sentinel — escalate.
-    const text = asString(output.output);
-    if (WRONG_KIND_RE.test(text)) {
+    if (emittedWrongKind(output)) {
       return {
-        rejectWithReason: `worker_llm.wrong_kind_attempted: model emitted <WRONG_KIND>. The Decomposer picked llm_call but the prompt requires filesystem access. Switch task kind to cli_spawn or tool_call.`,
+        rejectWithReason: 'worker_llm.wrong_kind_attempted: model emitted <WRONG_KIND>. The Decomposer picked llm_call but the prompt requires filesystem access. Switch task kind to cli_spawn or tool_call.',
         mode: 'worker_llm.wrong_kind_attempted',
       };
     }

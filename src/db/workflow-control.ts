@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import { insertEvent, loadWorkflowById, setWorkflowMetadata } from './persist.js';
+import { safeJsonObject } from './safe-json.js';
 import { broadcastCancelToWorkflow } from '../v2/subagent/control.js';
 import { redactSecrets } from '../v2/security/redact.js';
 
@@ -53,6 +54,28 @@ function normalizeReason(reason: string | null | undefined, workspace: string, d
   const trimmed = reason.trim();
   if (!trimmed) return null;
   return redactSecrets(trimmed.slice(0, 500), workspace, db);
+}
+
+function buildControlResult(
+  workflowId: string,
+  action: WorkflowControlAction,
+  auditEvent: string,
+  row: WorkflowControlRow,
+  requestedBy: string,
+  reason: string | null,
+  extra: Partial<WorkflowControlResult> = {},
+): WorkflowControlResult {
+  return {
+    workflow_id: workflowId,
+    action,
+    state: row.state,
+    daemon_acknowledged: true,
+    audit_event: auditEvent,
+    requested_by: requestedBy,
+    reason,
+    updated_at: row.updated_at,
+    ...extra,
+  };
 }
 
 function upsertWorkflowControlState(
@@ -123,16 +146,7 @@ export function requestWorkflowControl(
       type: 'workflow_pause_requested',
       payload: { requested_by: requestedBy, reason },
     });
-    return {
-      workflow_id: workflowId,
-      action: 'pause',
-      state: row.state,
-      daemon_acknowledged: true,
-      audit_event: 'workflow_pause_requested',
-      requested_by: requestedBy,
-      reason,
-      updated_at: row.updated_at,
-    };
+    return buildControlResult(workflowId, 'pause', 'workflow_pause_requested', row, requestedBy, reason);
   }
 
   if (request.action === 'resume') {
@@ -147,16 +161,7 @@ export function requestWorkflowControl(
       type: 'workflow_resume_requested',
       payload: { requested_by: requestedBy, reason },
     });
-    return {
-      workflow_id: workflowId,
-      action: 'resume',
-      state: row.state,
-      daemon_acknowledged: true,
-      audit_event: 'workflow_resume_requested',
-      requested_by: requestedBy,
-      reason,
-      updated_at: row.updated_at,
-    };
+    return buildControlResult(workflowId, 'resume', 'workflow_resume_requested', row, requestedBy, reason);
   }
 
   const requestRow = upsertWorkflowControlState(db, workflowId, 'cancel_requested', requestedBy, reason, now);
@@ -167,23 +172,18 @@ export function requestWorkflowControl(
   });
 
   if (TERMINAL_WORKFLOW_STATUSES.has(workflow.status)) {
-    return {
-      workflow_id: workflowId,
-      action: 'cancel',
-      state: requestRow.state,
-      daemon_acknowledged: true,
-      audit_event: 'workflow_cancel_requested',
-      requested_by: requestedBy,
-      reason,
-      updated_at: requestRow.updated_at,
-    };
+    return buildControlResult(workflowId, 'cancel', 'workflow_cancel_requested', requestRow, requestedBy, reason);
   }
 
   const broadcast = broadcastCancelToWorkflow(db, workflowId, reason);
   const cancelledAt = Date.now();
   db.prepare(`UPDATE workflows SET status = 'cancelled', completed_at = ? WHERE id = ?`)
     .run(cancelledAt, workflowId);
-  const existingMeta = workflow.metadata ? JSON.parse(workflow.metadata) as Record<string, unknown> : {};
+  // Tolerant parse (same contract as workflow-mode.ts / workflow-cli-permission.ts):
+  // corrupted metadata must NOT abort the cancel halfway — throwing here would
+  // leave status='cancelled' with control state stuck in 'cancel_requested'
+  // and no workflow_canceled audit event.
+  const existingMeta = safeJsonObject(workflow.metadata);
   setWorkflowMetadata(db, workflowId, JSON.stringify({
     ...existingMeta,
     cancelled_reason: reason,
@@ -203,19 +203,11 @@ export function requestWorkflowControl(
       messages_cancelled: broadcast.messages_cancelled,
     },
   });
-  return {
-    workflow_id: workflowId,
-    action: 'cancel',
-    state: row.state,
-    daemon_acknowledged: true,
-    audit_event: 'workflow_canceled',
-    requested_by: requestedBy,
-    reason,
-    updated_at: row.updated_at,
+  return buildControlResult(workflowId, 'cancel', 'workflow_canceled', row, requestedBy, reason, {
     tasks_cancelled: broadcast.tasks_cancelled,
     controllers_aborted: broadcast.controllers_aborted,
     messages_cancelled: broadcast.messages_cancelled,
-  };
+  });
 }
 
 export interface WorkflowControlCheckpointOptions {

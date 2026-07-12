@@ -13,6 +13,7 @@ import {
 } from '../db/persist.js';
 import { normalizeCliExecutorHintForModel } from '../utils/cli-routing.js';
 import { VALID_WORKSPACE_RE } from '../utils/workspace.js';
+import { safeJsonObject } from './_json-utils.js';
 
 export const ImportDashboardDagSchema = z.object({
   workspace: z.string().regex(VALID_WORKSPACE_RE),
@@ -166,18 +167,6 @@ export function loadDashboardDagByPatternId(db: Database.Database, patternId: st
   const pattern = loadPatternById(db, patternId);
   if (!pattern) throw new Error(`Pattern not found: ${patternId}`);
   return patternToLibraryItem(pattern);
-}
-
-function safeJsonObject(raw: string | null): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
 }
 
 function reconstructDagTask(task: Task, index: number, idByTaskId: Map<string, string>): DagTask {

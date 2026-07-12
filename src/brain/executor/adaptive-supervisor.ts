@@ -401,7 +401,6 @@ interface IterationContext {
   db: Database.Database;
   opts: AdaptiveSupervisorOpts;
   doExecute: ExecuteAdaptiveTurnFn;
-  doSleep: (ms: number) => Promise<void>;
 }
 
 /**
@@ -579,7 +578,7 @@ export const runAdaptiveSupervisor: RunAdaptiveSupervisor = async (
   // ── Phase 1 ─────────────────────────────────────────────────────────────
   const { alive, outcomes } = await runSpawnPhase(db, adaptiveTasks, opts);
 
-  const ctx: IterationContext = { db, opts, doExecute, doSleep };
+  const ctx: IterationContext = { db, opts, doExecute };
 
   // R-MED-6 fix: build a Map for O(1) task lookup inside the loop
   // (was O(N) Array.find per iteration per task → O(N²) per iteration).

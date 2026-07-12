@@ -10,6 +10,14 @@ function fmtTime(epochMs: number): string {
   return new Date(epochMs).toISOString().replace('T', ' ').slice(0, 19);
 }
 
+type WorkflowRow = {
+  id: string;
+  workspace: string;
+  status: string;
+  objective: string;
+  created_at: number;
+};
+
 export function registerList(program: Command): void {
   program
     .command('list')
@@ -21,29 +29,16 @@ export function registerList(program: Command): void {
       try {
         const limit = parseInt(options.limit, 10) || 10;
 
-        const rows = options.workspace
-          ? (db
-              .prepare(
-                `SELECT id, workspace, status, objective, created_at FROM workflows WHERE id != '_daemon' AND workspace = ? ORDER BY created_at DESC LIMIT ?`,
-              )
-              .all(options.workspace, limit) as {
-              id: string;
-              workspace: string;
-              status: string;
-              objective: string;
-              created_at: number;
-            }[])
-          : (db
-              .prepare(
-                `SELECT id, workspace, status, objective, created_at FROM workflows WHERE id != '_daemon' ORDER BY created_at DESC LIMIT ?`,
-              )
-              .all(limit) as {
-              id: string;
-              workspace: string;
-              status: string;
-              objective: string;
-              created_at: number;
-            }[]);
+        const params: (string | number)[] = [];
+        let sql = `SELECT id, workspace, status, objective, created_at FROM workflows WHERE id != '_daemon'`;
+        if (options.workspace) {
+          sql += ' AND workspace = ?';
+          params.push(options.workspace);
+        }
+        sql += ' ORDER BY created_at DESC LIMIT ?';
+        params.push(limit);
+
+        const rows = db.prepare(sql).all(...params) as WorkflowRow[];
 
         if (rows.length === 0) {
           console.log('Nenhum workflow encontrado.');

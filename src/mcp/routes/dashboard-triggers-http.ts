@@ -22,7 +22,7 @@ import {
   verifyDashboardWebhookRequest,
 } from '../dashboard-triggers.js';
 import type { Router } from './types.js';
-import { badRequest, jsonOk, readJsonBody, readRawBody, unauthorized } from './_shared.js';
+import { badRequest, jsonOk, readBodyOr400, readRawBody, unauthorized } from './_shared.js';
 import { runDashboardTriggerTarget } from './_dashboard-dag-helpers.js';
 import { runDashboardScheduleTickOnce } from './_schedule-tick.js';
 import {
@@ -272,8 +272,8 @@ export const dashboardTriggersHttpRouter: Router = async (req, url, res, ctx) =>
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/triggers/schedules') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardScheduleCreate(body, res);
     return true;
   }
@@ -283,14 +283,14 @@ export const dashboardTriggersHttpRouter: Router = async (req, url, res, ctx) =>
   }
   const schedMatch = url.pathname.match(/^\/api\/dashboard\/triggers\/schedules\/([^/]+)$/);
   if (req.method === 'PATCH' && schedMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardSchedulePatch(decodeURIComponent(schedMatch[1] ?? ''), body, res);
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/api/dashboard/triggers/webhooks') {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWebhookCreate(body, ctx.token, res);
     return true;
   }
@@ -301,8 +301,8 @@ export const dashboardTriggersHttpRouter: Router = async (req, url, res, ctx) =>
   }
   const whMatch = url.pathname.match(/^\/api\/dashboard\/triggers\/webhooks\/([^/]+)$/);
   if (req.method === 'PATCH' && whMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardWebhookPatch(decodeURIComponent(whMatch[1] ?? ''), body, res);
     return true;
   }

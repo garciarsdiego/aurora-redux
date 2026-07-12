@@ -13,19 +13,18 @@ import { callOmnirouteStream } from '../../utils/omniroute-stream.js';
 import type { Router } from './types.js';
 import {
   badRequest,
+  readBodyOr400,
   safeEndSse,
   safeJsonParse,
   sendSseEvent,
-  sendSseHeartbeat,
   setSseHeaders,
-  SSE_HEARTBEAT_MS,
+  wireSseLifecycle,
 } from './_shared.js';
 import {
   llmStreamsByActor,
   requireActorToken,
   type ActorAuth,
 } from './_actor-registry.js';
-import { readJsonBody } from './_shared.js';
 
 interface BackfillRow { id: number; type: string; task_id: string | null; payload_json: string | null; timestamp: number; }
 
@@ -71,20 +70,10 @@ function handleWorkflowEventsSse(wfId: string, url: URL, req: IncomingMessage, r
     sendSseEvent(res, 'workflow_event', data);
   });
 
-  const heartbeat = setInterval(() => sendSseHeartbeat(res), SSE_HEARTBEAT_MS);
-  if (typeof (heartbeat as unknown as { unref?: () => void }).unref === 'function') {
-    (heartbeat as unknown as { unref: () => void }).unref();
-  }
-
-  const cleanup = (): void => {
-    clearInterval(heartbeat);
+  wireSseLifecycle(req, res, () => {
     unsubscribe();
     safeEndSse(res);
-  };
-  req.on('close', cleanup);
-  req.on('error', cleanup);
-  res.on('close', cleanup);
-  res.on('error', cleanup);
+  });
 }
 
 function handleGateEventsSse(url: URL, req: IncomingMessage, res: ServerResponse): void {
@@ -102,20 +91,10 @@ function handleGateEventsSse(url: URL, req: IncomingMessage, res: ServerResponse
     });
   });
 
-  const heartbeat = setInterval(() => sendSseHeartbeat(res), SSE_HEARTBEAT_MS);
-  if (typeof (heartbeat as unknown as { unref?: () => void }).unref === 'function') {
-    (heartbeat as unknown as { unref: () => void }).unref();
-  }
-
-  const cleanup = (): void => {
-    clearInterval(heartbeat);
+  wireSseLifecycle(req, res, () => {
     unsubscribe();
     safeEndSse(res);
-  };
-  req.on('close', cleanup);
-  req.on('error', cleanup);
-  res.on('close', cleanup);
-  res.on('error', cleanup);
+  });
 }
 
 function handleNotificationEventsSse(url: URL, req: IncomingMessage, res: ServerResponse): void {
@@ -175,20 +154,10 @@ function handleNotificationEventsSse(url: URL, req: IncomingMessage, res: Server
     sendSseEvent(res, 'notification', ev);
   });
 
-  const heartbeat = setInterval(() => sendSseHeartbeat(res), SSE_HEARTBEAT_MS);
-  if (typeof (heartbeat as unknown as { unref?: () => void }).unref === 'function') {
-    (heartbeat as unknown as { unref: () => void }).unref();
-  }
-
-  const cleanup = (): void => {
-    clearInterval(heartbeat);
+  wireSseLifecycle(req, res, () => {
     unsubscribe();
     safeEndSse(res);
-  };
-  req.on('close', cleanup);
-  req.on('error', cleanup);
-  res.on('close', cleanup);
-  res.on('error', cleanup);
+  });
 }
 
 interface StreamLlmBody {
@@ -289,10 +258,9 @@ export const sseRouter: Router = async (req, url, res, _ctx) => {
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/stream/llm') {
-    let body: StreamLlmBody;
-    try { body = (await readJsonBody(req)) as StreamLlmBody; }
-    catch (err) { badRequest(res, (err as Error).message); return true; }
-    await handleStreamLlm(body, req, res);
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
+    await handleStreamLlm(body as StreamLlmBody, req, res);
     return true;
   }
   return false;

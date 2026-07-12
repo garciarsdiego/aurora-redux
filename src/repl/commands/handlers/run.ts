@@ -10,6 +10,7 @@
 import type { SlashCommand, SlashResult, ReplCtx } from '../types.js';
 import { runWorkflow } from '../../services/runner.js';
 import { appendOutput } from '../../state/outputBuffer.js';
+import { errorMessage } from '../../utils/errors.js';
 
 interface RunArgs {
   objective: string;
@@ -68,8 +69,7 @@ export const runCommand: SlashCommand<RunArgs> = {
 
     // Fire and forget; the runner streams its own progress into outputBuffer.
     void runWorkflow(opts).catch((err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      appendOutput(`runner error (caught at handler): ${msg}`, 'error');
+      appendOutput(`runner error (caught at handler): ${errorMessage(err)}`, 'error');
     });
 
     return {

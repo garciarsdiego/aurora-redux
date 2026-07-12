@@ -1,18 +1,7 @@
 import type Database from 'better-sqlite3';
+import { safeJsonObject } from './safe-json.js';
 
 export type WorkflowMode = 'standard' | 'existing_code_feature';
-
-function safeJsonObject(input: unknown): Record<string, unknown> {
-  if (typeof input !== 'string' || !input.trim()) return {};
-  try {
-    const parsed = JSON.parse(input);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
-}
 
 /**
  * Read the workflow_mode tag persisted on a workflow's metadata column.
@@ -23,8 +12,8 @@ function safeJsonObject(input: unknown): Record<string, unknown> {
  * planned/run with workflow_mode === 'existing_code_feature' because that is
  * the path the architect-scout + reviewer overlay already understands.
  *
- * The metadata column is JSON-encoded; mirror the parsing strategy used in
- * src/db/workflow-cli-permission.ts to avoid pulling in a heavier serializer.
+ * The metadata column is JSON-encoded; the tolerant parse is shared with
+ * src/db/workflow-cli-permission.ts via ./safe-json.ts.
  *
  * Defensive design:
  *   * Returns 'standard' on missing workflow row, malformed JSON, or any DB

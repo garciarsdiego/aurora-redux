@@ -19,13 +19,14 @@ export function registerStatus(program: Command): void {
     .action((workflowId?: string) => {
       const db = initDb(getDbPath());
       try {
+        type WfRow = { id: string; status: string; objective: string };
         const wf = workflowId
           ? (db
-              .prepare('SELECT * FROM workflows WHERE id = ?')
-              .get(workflowId) as Record<string, unknown> | undefined)
+              .prepare('SELECT id, status, objective FROM workflows WHERE id = ?')
+              .get(workflowId) as WfRow | undefined)
           : (db
-              .prepare(`SELECT * FROM workflows WHERE id != '_daemon' ORDER BY created_at DESC LIMIT 1`)
-              .get() as Record<string, unknown> | undefined);
+              .prepare(`SELECT id, status, objective FROM workflows WHERE id != '_daemon' ORDER BY created_at DESC LIMIT 1`)
+              .get() as WfRow | undefined);
 
         if (!wf) {
           console.log('Nenhum workflow encontrado.');
@@ -36,7 +37,7 @@ export function registerStatus(program: Command): void {
           .prepare(
             'SELECT id, name, status FROM tasks WHERE workflow_id = ? ORDER BY created_at',
           )
-          .all(wf['id'] as string) as { id: string; name: string; status: string }[];
+          .all(wf.id) as { id: string; name: string; status: string }[];
 
         const events = db
           .prepare(
@@ -46,18 +47,18 @@ export function registerStatus(program: Command): void {
              WHERE e.workflow_id = ?
              ORDER BY e.id DESC LIMIT 8`,
           )
-          .all(wf['id'] as string) as { type: string; task_name: string | null }[];
+          .all(wf.id) as { type: string; task_name: string | null }[];
 
         console.log('');
-        console.log(`Workflow: ${wf['id']}`);
-        console.log(`Status:   ${wf['status']}`);
-        console.log(`Objetivo: ${wf['objective']}`);
+        console.log(`Workflow: ${wf.id}`);
+        console.log(`Status:   ${wf.status}`);
+        console.log(`Objetivo: ${wf.objective}`);
         console.log(`Tasks (${tasks.length}):`);
         for (const t of tasks) {
           const icon = STATUS_ICON[t.status] ?? '?';
           console.log(`  [${icon}] ${t.id.slice(0, 8)}…  ${t.name}  ${t.status}`);
         }
-        console.log(`Últimos events (${Math.min(events.length, 8)}):`);
+        console.log(`Últimos events (${events.length}):`);
         for (const e of [...events].reverse()) {
           const suffix = e.task_name ? `  → ${e.task_name}` : '';
           console.log(`  ${e.type}${suffix}`);

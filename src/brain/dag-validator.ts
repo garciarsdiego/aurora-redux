@@ -38,7 +38,7 @@ const ALLOWED_TASK_KINDS = new Set<string>([
 
 function checkTaskKindWhitelist(dag: Dag, issues: ValidationIssue[]): void {
   for (const task of dag.tasks) {
-    if (!ALLOWED_TASK_KINDS.has(task.kind as string)) {
+    if (!ALLOWED_TASK_KINDS.has(task.kind)) {
       issues.push({
         rule: 'task-kind',
         message: `Task '${task.id}' has invalid kind '${task.kind}'. Allowed: ${[...ALLOWED_TASK_KINDS].sort().join(', ')}.`,
@@ -179,12 +179,13 @@ function checkMaxChainLength(dag: Dag, issues: ValidationIssue[]): void {
   // Compute longest path (in edges + 1) to each node via memoized DFS.
   // dp[id] = length of longest chain ending at that task (single task = 1).
   const dp = new Map<string, number>();
+  const byId = new Map(dag.tasks.map((task) => [task.id, task]));
 
   function longestTo(id: string): number {
     if (dp.has(id)) return dp.get(id)!;
     // Avoid infinite loops on cycles (checkGraphIntegrity reports real cycles separately)
     dp.set(id, 0);
-    const task = dag.tasks.find(t => t.id === id);
+    const task = byId.get(id);
     if (!task) return 0;
     const parentLengths = task.depends_on.map(longestTo);
     const length = parentLengths.length === 0 ? 1 : 1 + Math.max(...parentLengths);
@@ -365,22 +366,31 @@ const DETERMINISTIC_KIND_REQUIRED_ARGS: Record<string, readonly string[]> = {
   evaluator: ['evaluator_route_map'],
 };
 
+/** Defensive extraction of a task's `args` object; null when absent or not a plain object. */
+function getArgsRecord(task: Dag['tasks'][number]): Record<string, unknown> | null {
+  const args = (task as { args?: unknown }).args;
+  return args && typeof args === 'object' && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : null;
+}
+
+/** Required keys whose value is missing (undefined/null/empty string) in `record`. */
+function missingKeys(record: Record<string, unknown>, required: readonly string[]): string[] {
+  return required.filter((key) => {
+    const value = record[key];
+    return value == null || value === '';
+  });
+}
+
 function checkDeterministicKindArgs(dag: Dag, issues: ValidationIssue[]): void {
   for (const task of dag.tasks) {
-    const required = DETERMINISTIC_KIND_REQUIRED_ARGS[task.kind as string];
+    const required = DETERMINISTIC_KIND_REQUIRED_ARGS[task.kind];
     if (!required) continue;
     // Required args may live either on `task.args` (the canonical shape) or
     // directly on the task (legacy). Accept both so we don't false-positive
     // on workflows produced by older decomposer prompts.
-    const args = (task as { args?: unknown }).args;
-    const argsRecord =
-      args && typeof args === 'object' && !Array.isArray(args)
-        ? (args as Record<string, unknown>)
-        : (task as unknown as Record<string, unknown>);
-    const missing = required.filter((key) => {
-      const value = argsRecord[key];
-      return value === undefined || value === null || value === '';
-    });
+    const argsRecord = getArgsRecord(task) ?? (task as unknown as Record<string, unknown>);
+    const missing = missingKeys(argsRecord, required);
     if (missing.length > 0) {
       issues.push({
         rule: 'deterministic-kind-args',
@@ -410,11 +420,7 @@ function checkToolCallArgs(dag: Dag, issues: ValidationIssue[]): void {
       continue;
     }
 
-    const args = (task as { args?: unknown }).args;
-    const argsRecord =
-      args && typeof args === 'object' && !Array.isArray(args)
-        ? (args as Record<string, unknown>)
-        : null;
+    const argsRecord = getArgsRecord(task);
 
     if (!argsRecord) {
       issues.push({
@@ -432,10 +438,7 @@ function checkToolCallArgs(dag: Dag, issues: ValidationIssue[]): void {
     const required = TOOL_REQUIRED_ARGS[toolName];
     if (!required) continue; // tool not in our minimum-required list — let runtime schema decide
 
-    const missing = required.filter((key) => {
-      const value = argsRecord[key];
-      return value == null || value === '';
-    });
+    const missing = missingKeys(argsRecord, required);
     if (missing.length > 0) {
       issues.push({
         rule: 'tool-call-args',

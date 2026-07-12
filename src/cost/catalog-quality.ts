@@ -71,6 +71,30 @@ export function getCatalogQuality(model: string): number {
   return DEFAULT_CATALOG_QUALITY;
 }
 
+/**
+ * Use-case multiplier applied on top of the catalog quality. This is a
+ * deliberate routing heuristic (not a quality measurement), shared by
+ * CostAwareRouter and CostOptimizer so the two estimates can never diverge.
+ */
+const USE_CASE_MULTIPLIER: Record<string, number> = {
+  'code': 1.0,
+  'debug': 0.95,
+  'planning': 1.05,
+  'review': 1.0,
+  'chat': 0.9
+};
+
+/**
+ * Estimate quality for a model (0-1) adjusted for a use case.
+ *
+ * De-mock (OPS-08): base quality is sourced from the live provider matrix
+ * (capability registry) instead of a stale hardcoded map.
+ */
+export function estimateUseCaseQuality(model: string, use_case: string): number {
+  const baseQuality = getCatalogQuality(model);
+  return Math.min(1.0, baseQuality * (USE_CASE_MULTIPLIER[use_case] || 1.0));
+}
+
 /** Test/maintenance hook — clears the in-process catalog cache. */
 export function resetCatalogQualityCache(): void {
   cachedCatalog = null;

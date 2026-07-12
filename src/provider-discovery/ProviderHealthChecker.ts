@@ -3,6 +3,8 @@
  * Tests individual models for availability by making minimal requests
  */
 
+import { providerOf } from './internal.js';
+
 export interface ProviderHealthStatus {
   provider: string;
   model: string;
@@ -25,74 +27,68 @@ export class ProviderHealthChecker {
   
   async checkSingleModel(model: string): Promise<ProviderHealthStatus> {
     const startTime = Date.now();
-    const provider = model.split('/')[0];
-    
+    const provider = providerOf(model);
+
+    const makeStatus = (
+      status: ProviderHealthStatus['status'],
+      extra: Partial<ProviderHealthStatus> = {}
+    ): ProviderHealthStatus => ({
+      provider,
+      model,
+      status,
+      last_checked: Date.now(),
+      ...extra
+    });
+
     try {
       // Test request simples e barata
       const response = await this.makeMinimalRequest(model);
       const latency = Date.now() - startTime;
-      
+
       // Analisar resposta
       if (response.status === 401) {
-        return {
-          provider,
-          model,
-          status: 'no_credentials',
+        return makeStatus('no_credentials', {
           error_message: 'Authentication failed',
-          error_code: '401',
-          last_checked: Date.now()
-        };
+          error_code: '401'
+        });
       }
-      
+
       if (response.status === 429) {
-        return {
-          provider,
-          model,
-          status: 'no_credits',
+        return makeStatus('no_credits', {
           latency_ms: latency,
           error_message: 'Rate limit or no credits',
-          error_code: '429',
-          last_checked: Date.now()
-        };
+          error_code: '429'
+        });
       }
-      
+
       if (!response.ok) {
         const errorText = await response.text();
-        return {
-          provider,
-          model,
-          status: 'error',
+        return makeStatus('error', {
           latency_ms: latency,
           error_message: errorText.substring(0, 200),
-          error_code: response.status.toString(),
-          last_checked: Date.now()
-        };
+          error_code: response.status.toString()
+        });
       }
-      
+
       // Se chegou aqui, está disponível
       const data = await response.json();
       const cost = this.estimateCost(data);
-      
-      return {
-        provider,
-        model,
-        status: 'available',
+
+      return makeStatus('available', {
         latency_ms: latency,
-        test_cost_usd: cost,
-        last_checked: Date.now()
-      };
-      
-    } catch (error: any) {
+        test_cost_usd: cost
+      });
+
+    } catch (error: unknown) {
       const latency = Date.now() - startTime;
-      return {
-        provider,
-        model,
-        status: error.code === 'ETIMEDOUT' || error.code === 'ECONNREFUSED' ? 'timeout' : 'error',
+      const code = (error as { code?: unknown } | null)?.code;
+      const errorCode = typeof code === 'string' ? code : undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      return makeStatus(errorCode === 'ETIMEDOUT' || errorCode === 'ECONNREFUSED' ? 'timeout' : 'error', {
         latency_ms: latency,
-        error_message: error.message.substring(0, 200),
-        error_code: error.code,
-        last_checked: Date.now()
-      };
+        error_message: message.substring(0, 200),
+        error_code: errorCode
+      });
     }
   }
   
@@ -128,9 +124,5 @@ export class ProviderHealthChecker {
     }
     // Estimativa padrão para request mínimo
     return 0.00001; // $0.00001 por teste
-  }
-  
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }

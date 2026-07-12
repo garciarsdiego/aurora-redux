@@ -42,5 +42,3 @@ export function classifyKey(input: string, key: Key): Intent | null {
   if ('f1' in key && (key as Key & { f1?: boolean }).f1) return 'help';
   return null;
 }
-
-export const KEYMAP_PLACEHOLDER = false;

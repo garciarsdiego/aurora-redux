@@ -12,8 +12,13 @@ import type {
 } from './types.js';
 import { reviewArchitectureIntegration } from './architecture-reviewer.js';
 import type { ArchitectureContract } from '../workflow-modes/existing-code-feature.js';
-import type { CanvasRegionCheck, InteractionCheck } from './playwright-product-harness.js';
+import type {
+  CanvasRegionCheck,
+  InteractionCheck,
+  PlaywrightHarnessResult,
+} from './playwright-product-harness.js';
 import { isCanvasRegionCheckArray, isInteractionCheckArray } from './visual-check-guards.js';
+import { safeParseJson, tableExists } from './internal-utils.js';
 
 interface TaskRow {
   id: string;
@@ -25,25 +30,6 @@ interface TaskRow {
   input_json: string | null;
   output_json: string | null;
   acceptance_criteria: string | null;
-}
-
-function safeParseJson(raw: string | null | undefined): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function tableExists(db: Database.Database, table: string): boolean {
-  const row = db
-    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
-    .get(table) as { name: string } | undefined;
-  return row?.name === table;
 }
 
 function asArchitectureContract(value: unknown): ArchitectureContract | null {
@@ -211,6 +197,10 @@ function readFileMap(files: string[]): Map<string, string> {
   return map;
 }
 
+// Hoisted out of the per-line filter callback — a regex literal inside the
+// callback would allocate a fresh RegExp object for every inspected line.
+const KEY_HANDLING_RE = /\b(keydown|keyup|KeyboardEvent|event\.key|event\.code|e\.key|e\.code|case\s+['"]|Key[A-Z]|Arrow)\b/i;
+
 function readCorpus(filesContent: Map<string, string>): { visible: string; implementation: string } {
   const visibleParts: string[] = [];
   const implementationParts: string[] = [];
@@ -218,7 +208,7 @@ function readCorpus(filesContent: Map<string, string>): { visible: string; imple
     visibleParts.push(content.slice(0, 80_000));
     const implementationLines = content
       .split(/\r?\n/)
-      .filter((line) => /\b(keydown|keyup|KeyboardEvent|event\.key|event\.code|e\.key|e\.code|case\s+['"]|Key[A-Z]|Arrow)\b/i.test(line));
+      .filter((line) => KEY_HANDLING_RE.test(line));
     implementationParts.push(implementationLines.join('\n').slice(0, 40_000));
   }
   return {
@@ -257,8 +247,19 @@ function extractSurfaceText(filesContent: Map<string, string>): string {
   return redactContextText(joined);
 }
 
+// Per-name RegExp cache: the names come from fixed lists in
+// detectControlCopyMismatches, so each pattern is compiled at most once.
+const KEY_NAME_RE_CACHE = new Map<string, RegExp>();
+
 function hasKey(implementation: string, names: string[]): boolean {
-  return names.some((name) => new RegExp(`['"\`]${name}['"\`]|\\b${name}\\b`, 'i').test(implementation));
+  return names.some((name) => {
+    let re = KEY_NAME_RE_CACHE.get(name);
+    if (!re) {
+      re = new RegExp(`['"\`]${name}['"\`]|\\b${name}\\b`, 'i');
+      KEY_NAME_RE_CACHE.set(name, re);
+    }
+    return re.test(implementation);
+  });
 }
 
 function pushIssue(
@@ -471,24 +472,10 @@ export function isWebAppProject(projectRoot: string): boolean {
  * content). Mismatch text is passed through `redactContextJson` because the
  * `actualText` field may carry user-rendered DOM content.
  */
-export function buildPlaywrightHarnessEvidence(input: {
-  status: 'passed' | 'failed' | 'skipped';
-  reason?: string;
-  mismatches: Array<{
-    kind: 'selector_missing' | 'text_mismatch';
-    selector: string;
-    expectedText?: string;
-    actualText?: string;
-  }>;
-  screenshotPaths: string[];
-  appUrl?: string;
-}): PlaywrightHarnessEvidence {
-  const redactedMismatches = redactContextJson(input.mismatches) as Array<{
-    kind: 'selector_missing' | 'text_mismatch';
-    selector: string;
-    expectedText?: string;
-    actualText?: string;
-  }>;
+export function buildPlaywrightHarnessEvidence(
+  input: Pick<PlaywrightHarnessResult, 'status' | 'reason' | 'mismatches' | 'screenshotPaths' | 'appUrl'>,
+): PlaywrightHarnessEvidence {
+  const redactedMismatches = redactContextJson(input.mismatches) as PlaywrightHarnessEvidence['mismatches'];
   return {
     status: input.status,
     reason: input.reason,

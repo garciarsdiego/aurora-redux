@@ -77,28 +77,20 @@ export async function getValidCookie(): Promise<string> {
 
 export async function adminFetch(path: string, options: AdminFetchOptions = {}): Promise<unknown> {
   const { baseUrl } = getAdminConfig();
-  let cookieToUse = options.cookie || await getValidCookie();
-  
-  let response = await fetch(`${baseUrl}${path}`, {
+  const doFetch = (cookie: string) => fetch(`${baseUrl}${path}`, {
     method: options.method || "GET",
     headers: {
-      ...(cookieToUse ? { Cookie: cookieToUse } : {}),
+      ...(cookie ? { Cookie: cookie } : {}),
       ...(options.body ? { "Content-Type": "application/json" } : {})
     },
     body: options.body ? JSON.stringify(options.body) : undefined
   });
 
+  let response = await doFetch(options.cookie || await getValidCookie());
+
   if (response.status === 401 && !options.cookie) {
     cachedCookie = null;
-    cookieToUse = await getValidCookie();
-    response = await fetch(`${baseUrl}${path}`, {
-      method: options.method || "GET",
-      headers: {
-        ...(cookieToUse ? { Cookie: cookieToUse } : {}),
-        ...(options.body ? { "Content-Type": "application/json" } : {})
-      },
-      body: options.body ? JSON.stringify(options.body) : undefined
-    });
+    response = await doFetch(await getValidCookie());
   }
 
   if (!response.ok) {

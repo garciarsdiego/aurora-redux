@@ -6,14 +6,15 @@ import type {
   Advisor,
   AdvisorContext,
   AdvisorResult,
-  StepwiseAdvisorContext,
   StepwiseAdvisorResult,
 } from '../types.js';
-import { appendStep, ensureConversation, getHistory } from '../shared/conversationMemory.js';
 import { shouldUseStepwiseMemory } from '../shared/mode.js';
-import { extractContinueFocus, formatStepHistoryBlock } from '../shared/stepwisePrompt.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
-import { CodereviewInputSchema } from './schema.js';
+import {
+  formatIssueLine,
+  runStepwiseAdvisor,
+  type StepwisePromptExtras,
+} from '../shared/stepwisePrompt.js';
+import { CodereviewInputSchema, type CodereviewInput } from './schema.js';
 import { CODEREVIEW_SYSTEM_PROMPT } from './prompt.js';
 
 const DESCRIPTION =
@@ -21,14 +22,7 @@ const DESCRIPTION =
   'Use for comprehensive analysis covering quality, security, performance, and architecture. ' +
   'Guides through structured investigation to ensure thoroughness.';
 
-interface CodereviewPromptExtras {
-  priorOutputsBlock?: string;
-}
-
-function buildUserPrompt(
-  parsed: ReturnType<typeof CodereviewInputSchema.parse>,
-  extras?: CodereviewPromptExtras,
-): string {
+function buildUserPrompt(parsed: CodereviewInput, extras?: StepwisePromptExtras): string {
   const lines: string[] = [];
 
   if (extras?.priorOutputsBlock) {
@@ -71,11 +65,7 @@ function buildUserPrompt(
   if (parsed.issues_found.length > 0) {
     lines.push('');
     lines.push('=== ISSUES IDENTIFIED ===');
-    parsed.issues_found.forEach((issue) => {
-      const severity = (issue['severity'] as string | undefined) ?? 'unknown';
-      const description = (issue['description'] as string | undefined) ?? 'No description';
-      lines.push(`[${severity.toUpperCase()}] ${description}`);
-    });
+    parsed.issues_found.forEach((issue) => lines.push(formatIssueLine(issue)));
   }
 
   if (parsed.images && parsed.images.length > 0) {
@@ -96,42 +86,11 @@ export const codereviewAdvisor: Advisor = {
   isStepwise: true,
   async run(ctx: AdvisorContext, args: unknown): Promise<AdvisorResult | StepwiseAdvisorResult> {
     const parsed = CodereviewInputSchema.parse(args);
-    const stepCtx = ctx as StepwiseAdvisorContext;
-    const useStepwiseMemory = shouldUseStepwiseMemory(ctx, args);
-
-    let extras: CodereviewPromptExtras | undefined;
-    if (useStepwiseMemory && stepCtx.step != null) {
-      ensureConversation(stepCtx.step.conversationId, 'codereview', ctx.workspace);
-      extras = {
-        priorOutputsBlock: formatStepHistoryBlock(getHistory(stepCtx.step.conversationId)),
-      };
-    }
-
-    const userPrompt = buildUserPrompt(parsed, extras);
-    const text = await callOmniroute({
+    return runStepwiseAdvisor(ctx, {
+      advisorName: 'codereview',
       systemPrompt: CODEREVIEW_SYSTEM_PROMPT,
-      userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      useStepwiseMemory: shouldUseStepwiseMemory(ctx, args),
+      buildUserPrompt: (extras) => buildUserPrompt(parsed, extras),
     });
-
-    if (useStepwiseMemory && stepCtx.step != null) {
-      appendStep(stepCtx.step.conversationId, stepCtx.step.stepNumber, text);
-    }
-
-    const focus = extractContinueFocus(text);
-    if (
-      useStepwiseMemory &&
-      stepCtx.step != null &&
-      stepCtx.step.stepNumber < stepCtx.step.totalSteps &&
-      focus
-    ) {
-      return {
-        output: text,
-        nextStep: { stepNumber: stepCtx.step.stepNumber + 1, request: focus },
-      };
-    }
-
-    return { output: text };
   },
 };

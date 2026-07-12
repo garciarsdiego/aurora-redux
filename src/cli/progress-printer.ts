@@ -36,6 +36,13 @@ function fmtCounter(completed: number, total: number): string {
   return `[${String(completed).padStart(w)}/${total}]`;
 }
 
+// Payload chega do executor como Record<string, unknown>; estes acessores
+// concentram a fronteira unsafe (casts) num único lugar.
+type Payload = WorkflowProgressEvent['payload'];
+const num = (p: Payload, key: string): number => p[key] as number;
+const str = (p: Payload, key: string): string => p[key] as string;
+const counterOf = (p: Payload): string => fmtCounter(num(p, 'completed'), num(p, 'total'));
+
 /**
  * Produce a single terminal line for one progress event. Returns null when
  * the event has no human-meaningful representation (e.g. duplicate batch
@@ -45,7 +52,7 @@ export function formatProgressLine(ev: WorkflowProgressEvent): string | null {
   const p = ev.payload;
   switch (ev.type) {
     case 'workflow_started': {
-      const total = p['total'] as number;
+      const total = num(p, 'total');
       return `${SYM.start} Workflow iniciado — ${total} task${total === 1 ? '' : 's'}`;
     }
     case 'batch_started': {
@@ -53,44 +60,30 @@ export function formatProgressLine(ev: WorkflowProgressEvent): string | null {
       // banner unless the batch has many parallel tasks (>1 → useful summary).
       const tasks = p['tasks'] as string[] | undefined;
       if (!tasks || tasks.length <= 1) return null;
-      const completed = p['completed'] as number;
-      const total = p['total'] as number;
-      return `\n──── batch paralelo: ${tasks.length} tasks (${completed}/${total} já concluídas) ────`;
+      return `\n──── batch paralelo: ${tasks.length} tasks (${num(p, 'completed')}/${num(p, 'total')} já concluídas) ────`;
     }
     case 'task_started': {
-      const name = p['task_name'] as string;
-      const kind = p['kind'] as string;
       const model = shortModel(p['model'] as string | null | undefined);
-      const completed = p['completed'] as number;
-      const total = p['total'] as number;
-      return `${fmtCounter(completed, total)} ${SYM.start} ${name}  (${kind}, ${model})`;
+      return `${counterOf(p)} ${SYM.start} ${str(p, 'task_name')}  (${str(p, 'kind')}, ${model})`;
     }
     case 'task_completed': {
-      const name = p['task_name'] as string;
-      const dur = formatMs(p['duration_ms'] as number);
-      const completed = p['completed'] as number;
-      const total = p['total'] as number;
-      return `${fmtCounter(completed, total)} ${SYM.done} ${name}  (${dur})`;
+      const dur = formatMs(num(p, 'duration_ms'));
+      return `${counterOf(p)} ${SYM.done} ${str(p, 'task_name')}  (${dur})`;
     }
     case 'task_failed': {
-      const name = p['task_name'] as string;
-      const err = p['error'] as string;
-      const dur = formatMs(p['duration_ms'] as number);
-      const completed = p['completed'] as number;
-      const total = p['total'] as number;
-      return `${fmtCounter(completed, total)} ${SYM.fail} ${name}  (${dur}) — ${err.slice(0, 100)}${err.length > 100 ? '…' : ''}`;
+      const err = str(p, 'error');
+      const dur = formatMs(num(p, 'duration_ms'));
+      return `${counterOf(p)} ${SYM.fail} ${str(p, 'task_name')}  (${dur}) — ${err.slice(0, 100)}${err.length > 100 ? '…' : ''}`;
     }
     case 'batch_completed': {
-      const remaining = p['remaining'] as number;
+      const remaining = num(p, 'remaining');
       // Skip the batch summary unless it brings new info — the per-task
       // completed lines already showed each finish.
       if (remaining === 0) return null;
       return `   ${remaining} task${remaining === 1 ? '' : 's'} restante${remaining === 1 ? '' : 's'}`;
     }
-    case 'workflow_completed': {
-      const total = p['total'] as number;
-      return `\n${SYM.trophy} Workflow concluído — ${total} tasks executadas`;
-    }
+    case 'workflow_completed':
+      return `\n${SYM.trophy} Workflow concluído — ${num(p, 'total')} tasks executadas`;
     case 'workflow_pause_requested':
       return '⏸ Pause solicitado — o workflow vai parar antes da próxima task';
     case 'workflow_paused':

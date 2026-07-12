@@ -12,13 +12,13 @@ import { z } from 'zod';
 import { initDb } from '../../db/client.js';
 import { getDbPath } from '../../utils/config.js';
 import { DagSchema } from '../../types/schemas.js';
-import { callOmnirouteWithUsage } from '../../utils/omniroute-call.js';
-import { runAgent, createInMemoryContext, type AgentInvoker } from '../../v2/agents/runner.js';
+import { runAgent, createInMemoryContext } from '../../v2/agents/runner.js';
 import { BUILDER_CONVERSATIONAL_PERSONA } from '../../v2/agents/personas/builder_conversational.js';
 import { createVersionedDefinition } from '../../v2/governance/versioned-registry.js';
+import { omnirouteInvoker } from './omniroute-invoker.js';
 import {
   upsertDashboardPlannerSession,
-  listDashboardPlannerSessions,
+  PlannerMessageSchema,
   type DashboardPlannerMessage,
 } from '../dashboard-planner-sessions.js';
 
@@ -34,19 +34,6 @@ export const BuilderChatSchema = z.object({
 export type BuilderChatInput = z.infer<typeof BuilderChatSchema>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Omniroute invoker (same pattern as decomposer.ts)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const omnirouteInvoker: AgentInvoker = async (args) => {
-  const result = await callOmnirouteWithUsage({
-    model: args.model,
-    systemPrompt: args.systemPrompt,
-    userPrompt: args.userPrompt ?? 'Respond per the system contract above.',
-  });
-  return result.content;
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Tool handler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,12 +42,24 @@ export async function omniforge_builder_chat(raw: unknown): Promise<string> {
   const db = initDb(getDbPath());
 
   try {
-    // 1. Load existing session (or start fresh)
-    const sessions = listDashboardPlannerSessions(db, {
-      workspace: input.workspace,
-      limit: 100,
-    });
-    const existing = sessions.find((s) => s.id === input.session_id);
+    // 1. Load existing session (or start fresh). Direct lookup by id — the
+    // previous list(limit)+find approach silently dropped the conversation
+    // history once the workspace accumulated more sessions than one page.
+    const row = db.prepare(
+      `SELECT title, objective, messages_json, dag_json
+         FROM dashboard_planner_sessions
+        WHERE id = ? AND workspace = ?`,
+    ).get(input.session_id, input.workspace) as
+      | { title: string; objective: string; messages_json: string; dag_json: string | null }
+      | undefined;
+    const existing = row
+      ? {
+        title: row.title,
+        objective: row.objective,
+        messages: z.array(PlannerMessageSchema).parse(JSON.parse(row.messages_json) as unknown),
+        dag: row.dag_json ? DagSchema.parse(JSON.parse(row.dag_json) as unknown) : null,
+      }
+      : undefined;
 
     const priorMessages: DashboardPlannerMessage[] = existing?.messages ?? [];
 
@@ -121,7 +120,6 @@ export async function omniforge_builder_chat(raw: unknown): Promise<string> {
     // 6. Handle create_orchestration — materialize via registerVersionedDefinition
     let materializedId: string | undefined;
     if (output.action === 'create_orchestration' && output.dag != null) {
-      const defId = `builder_${input.session_id}_${Date.now()}`;
       const def = createVersionedDefinition(db, {
         workspace: input.workspace,
         kind: 'agent',
@@ -133,8 +131,6 @@ export async function omniforge_builder_chat(raw: unknown): Promise<string> {
         notes: `Materialized from builder chat session ${input.session_id}`,
       });
       materializedId = def.id;
-      // Patch the assistant message with the materialised id
-      assistantMsg.text = output.reply;
     }
 
     // 7. Persist session

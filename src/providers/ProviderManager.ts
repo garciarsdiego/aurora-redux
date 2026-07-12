@@ -2,7 +2,7 @@ import { getProviderRegistry } from './ProviderRegistry.js';
 import { OpenAIAdapter } from './adapters/OpenAIAdapter.js';
 import { AnthropicAdapter } from './adapters/AnthropicAdapter.js';
 import { callOmnirouteWithUsage } from '../utils/omniroute-call.js';
-import type { ProviderAdapter, LLMRequest, LLMResponse, ProviderCallOptions } from './types.js';
+import type { ProviderAdapter, ProviderConfig, LLMRequest, LLMResponse, ProviderCallOptions } from './types.js';
 
 export class ProviderManager {
   private registry = getProviderRegistry();
@@ -33,6 +33,36 @@ export class ProviderManager {
   }
 
   /**
+   * Resolve the provider and adapter for a model, honoring an explicit
+   * provider choice and the fallbackToOmniroute rule. Returns undefined
+   * when the request should go through Omniroute instead.
+   */
+  private resolveAdapter(
+    model: string,
+    options?: ProviderCallOptions
+  ): { provider: ProviderConfig; adapter: ProviderAdapter } | undefined {
+    const provider = options?.provider
+      ? this.registry.get(options.provider)
+      : this.registry.getBestForModel(model);
+
+    if (!provider) {
+      // Fall back to Omniroute
+      return undefined;
+    }
+
+    // Check if we have an adapter for this provider
+    const adapter = this.adapters.get(provider.type);
+    if (!adapter) {
+      if (options?.fallbackToOmniroute !== false) {
+        return undefined;
+      }
+      throw new Error(`No adapter available for provider: ${provider.name}`);
+    }
+
+    return { provider, adapter };
+  }
+
+  /**
    * Make a call using the best available provider
    */
   async call(
@@ -40,30 +70,17 @@ export class ProviderManager {
     request: LLMRequest,
     options?: ProviderCallOptions
   ): Promise<LLMResponse> {
-    const provider = options?.provider 
-      ? this.registry.get(options.provider)
-      : this.registry.getBestForModel(model);
-
-    if (!provider) {
-      // Fall back to Omniroute
+    const resolved = this.resolveAdapter(model, options);
+    if (!resolved) {
       return this.callOmniroute(model, request);
     }
 
-    // Check if we have an adapter for this provider
-    const adapter = this.adapters.get(provider.type);
-    if (!adapter) {
-      if (options?.fallbackToOmniroute !== false) {
-        return this.callOmniroute(model, request);
-      }
-      throw new Error(`No adapter available for provider: ${provider.name}`);
-    }
-
     try {
-      return await adapter.call(request);
+      return await resolved.adapter.call(request);
     } catch (error) {
       // Fallback to Omniroute on error
       if (options?.fallbackToOmniroute !== false) {
-        console.error(`Provider ${provider.name} failed, falling back to Omniroute:`, error);
+        console.error(`Provider ${resolved.provider.name} failed, falling back to Omniroute:`, error);
         return this.callOmniroute(model, request);
       }
       throw error;
@@ -78,30 +95,23 @@ export class ProviderManager {
     request: LLMRequest,
     options?: ProviderCallOptions
   ): AsyncGenerator<string> {
-    const provider = options?.provider 
-      ? this.registry.get(options.provider)
-      : this.registry.getBestForModel(model);
-
-    if (!provider) {
-      // Fall back to Omniroute
+    const resolved = this.resolveAdapter(model, options);
+    if (!resolved) {
       yield* this.streamOmniroute(model, request);
       return;
     }
 
-    const adapter = this.adapters.get(provider.type);
-    if (!adapter) {
-      if (options?.fallbackToOmniroute !== false) {
-        yield* this.streamOmniroute(model, request);
-        return;
-      }
-      throw new Error(`No adapter available for provider: ${provider.name}`);
-    }
-
+    // Only fall back if nothing was emitted yet — otherwise the consumer
+    // would receive duplicated content.
+    let hasYielded = false;
     try {
-      yield* await adapter.stream(request);
+      for await (const chunk of resolved.adapter.stream(request)) {
+        hasYielded = true;
+        yield chunk;
+      }
     } catch (error) {
-      if (options?.fallbackToOmniroute !== false) {
-        console.error(`Provider ${provider.name} failed, falling back to Omniroute:`, error);
+      if (!hasYielded && options?.fallbackToOmniroute !== false) {
+        console.error(`Provider ${resolved.provider.name} failed, falling back to Omniroute:`, error);
         yield* this.streamOmniroute(model, request);
         return;
       }
@@ -150,18 +160,26 @@ export class ProviderManager {
   }
 
   /**
+   * Convert messages to Omniroute prompt format
+   */
+  private toOmniroutePrompts(request: LLMRequest): { systemPrompt: string; userPrompt: string } {
+    // Find system message if present
+    const systemMessage = request.messages.find(m => m.role === 'system');
+    const userMessages = request.messages.filter(m => m.role !== 'system');
+
+    return {
+      systemPrompt: systemMessage?.content || '',
+      userPrompt: userMessages.map(m => m.content).join('\n')
+    };
+  }
+
+  /**
    * Call Omniroute (fallback)
    */
   private async callOmniroute(model: string, request: LLMRequest): Promise<LLMResponse> {
     try {
-      // Find system message if present
-      const systemMessage = request.messages.find(m => m.role === 'system');
-      const userMessages = request.messages.filter(m => m.role !== 'system');
-      
-      // Convert to Omniroute format
-      const systemPrompt = systemMessage?.content || '';
-      const userPrompt = userMessages.map(m => m.content).join('\n');
-      
+      const { systemPrompt, userPrompt } = this.toOmniroutePrompts(request);
+
       const response = await callOmnirouteWithUsage({
         systemPrompt,
         userPrompt,
@@ -169,18 +187,21 @@ export class ProviderManager {
         temperature: 0.2
       });
 
+      const promptTokens = response.usage?.input_tokens || this.estimateTokens(request.messages);
+      const completionTokens = response.usage?.output_tokens || this.estimateTokens([{ role: 'assistant', content: response.content }]);
+
       return {
         content: response.content,
         model: response.model_used,
         usage: {
-          prompt_tokens: response.usage?.input_tokens || this.estimateTokens(request.messages),
-          completion_tokens: response.usage?.output_tokens || this.estimateTokens([{ role: 'assistant', content: response.content }]),
-          total_tokens: (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0)
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens
         },
         cost_usd: response.usage?.total_cost_usd
       };
     } catch (error) {
-      throw new Error(`Omniroute call failed: ${error}`);
+      throw new Error(`Omniroute call failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
   }
 
@@ -189,14 +210,8 @@ export class ProviderManager {
    */
   private async *streamOmniroute(model: string, request: LLMRequest): AsyncGenerator<string> {
     try {
-      // Find system message if present
-      const systemMessage = request.messages.find(m => m.role === 'system');
-      const userMessages = request.messages.filter(m => m.role !== 'system');
-      
-      // Convert to Omniroute format
-      const systemPrompt = systemMessage?.content || '';
-      const userPrompt = userMessages.map(m => m.content).join('\n');
-      
+      const { systemPrompt, userPrompt } = this.toOmniroutePrompts(request);
+
       const response = await callOmnirouteWithUsage({
         systemPrompt,
         userPrompt,
@@ -207,7 +222,7 @@ export class ProviderManager {
       // Yield the full response at once (non-streaming fallback)
       yield response.content;
     } catch (error) {
-      throw new Error(`Omniroute stream failed: ${error}`);
+      throw new Error(`Omniroute stream failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
   }
 

@@ -168,9 +168,15 @@ export async function maybeCompact(
       temperature: 0,
     });
     summarized = result.content;
-  } catch {
-    // Graceful fallback: use stage1 trim
-    summarized = trimmed;
+  } catch (err) {
+    // Graceful fallback: keep the stage1 trim, but surface the degradation on
+    // the same stderr channel as logCompactionEvent so the operator knows
+    // stage 2 fell back to the cheap trim.
+    process.stderr.write(
+      '[compaction] stage2 LLM summarization failed, falling back to stage1 trim: ' +
+        (err instanceof Error ? err.message : String(err)) +
+        '\n',
+    );
   }
 
   const stats: CompactionStats = {

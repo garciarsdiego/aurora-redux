@@ -3,6 +3,8 @@
 // at write time, so display is safe.
 import type { SlashCommand, SlashResult, ReplCtx } from '../types.js';
 import { loadHistoryEntries, type HistoryEntry } from '../../input/history.js';
+import { toError } from '../../utils/errors.js';
+import { clampInt } from '../../utils/text.js';
 
 interface HistoryArgs {
   limit?: number;
@@ -43,13 +45,13 @@ export const historyCommand: SlashCommand<HistoryArgs> = {
   mutates: false,
 
   async handler(args: HistoryArgs, ctx: ReplCtx): Promise<SlashResult> {
-    const n = Math.min(Math.max(args.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const n = clampInt(args.limit ?? DEFAULT_LIMIT, 1, MAX_LIMIT);
     try {
       const all = await loadHistoryEntries(ctx.workspace);
       const slice = all.slice(-n);
       return { output: formatEntries(slice) };
     } catch (err) {
-      return { error: err instanceof Error ? err : new Error(String(err)) };
+      return { error: toError(err) };
     }
   },
 };

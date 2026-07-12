@@ -16,7 +16,7 @@ import { createFixTaskTool } from '../../tools/create_fix_task.js';
 import { requestArchitectureReviewTool } from '../../tools/request_architecture_review.js';
 import { requestProductReviewTool } from '../../tools/request_product_review.js';
 import type { Router } from '../types.js';
-import { badRequest, jsonOk, notFound, readJsonBody } from '../_shared.js';
+import { badRequest, jsonOk, notFound, readBodyOr400 } from '../_shared.js';
 import { collaborationStructuredError, respondWithCollaborationTool } from './shared.js';
 
 /**
@@ -208,22 +208,22 @@ async function handleDashboardRequestProductReview(
 export const reviewsRouter: Router = async (req, url, res) => {
   const wfFixTasksMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/fix-tasks$/);
   if (req.method === 'POST' && wfFixTasksMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardCreateFixTask(decodeURIComponent(wfFixTasksMatch[1] ?? ''), body, res);
     return true;
   }
   const wfArchitectureReviewMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/reviews\/architecture$/);
   if (req.method === 'POST' && wfArchitectureReviewMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardRequestArchitectureReview(decodeURIComponent(wfArchitectureReviewMatch[1] ?? ''), body, res);
     return true;
   }
   const wfProductReviewMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/reviews\/product$/);
   if (req.method === 'POST' && wfProductReviewMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardRequestProductReview(decodeURIComponent(wfProductReviewMatch[1] ?? ''), body, res);
     return true;
   }
@@ -233,15 +233,15 @@ export const reviewsRouter: Router = async (req, url, res) => {
   // obvious to future readers.
   const wfCouncilLiveMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/council\/live$/);
   if (req.method === 'POST' && wfCouncilLiveMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardCouncilRunLive(decodeURIComponent(wfCouncilLiveMatch[1] ?? ''), body, res);
     return true;
   }
   const wfCouncilMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/council$/);
   if (req.method === 'POST' && wfCouncilMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardCouncilRun(decodeURIComponent(wfCouncilMatch[1] ?? ''), body, res);
     return true;
   }

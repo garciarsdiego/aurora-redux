@@ -13,6 +13,7 @@
 
 import { getBootResult } from './bootstrap.js';
 import { redact } from './utils/redaction.js';
+import { errorMessage } from './utils/errors.js';
 
 export type ShutdownReason = 'sigint' | 'sigterm' | 'sighup' | 'uncaught' | 'user-exit' | 'unhandled-rejection';
 
@@ -30,8 +31,7 @@ export async function gracefulShutdown(reason: ShutdownReason): Promise<void> {
     try {
       boot.db.close();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[repl] db.close warn: ${redact(msg)}\n`);
+      process.stderr.write(`[repl] db.close warn: ${redact(errorMessage(err))}\n`);
     }
   }
 

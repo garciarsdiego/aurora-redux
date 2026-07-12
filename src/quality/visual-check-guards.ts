@@ -11,19 +11,23 @@
  */
 import type { CanvasRegionCheck, InteractionCheck } from './playwright-product-harness.js';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 export function isCanvasRegionCheckArray(value: unknown): value is CanvasRegionCheck[] {
   return Array.isArray(value) && value.every((item) =>
-    item && typeof item === 'object'
-    && typeof (item as Record<string, unknown>)['selector'] === 'string'
-    && typeof (item as Record<string, unknown>)['label'] === 'string'
-    && 'region' in (item as Record<string, unknown>),
+    isRecord(item)
+    && typeof item['selector'] === 'string'
+    && typeof item['label'] === 'string'
+    && 'region' in item,
   );
 }
 
 export function isInteractionCheckArray(value: unknown): value is InteractionCheck[] {
   return Array.isArray(value) && value.every((item) =>
-    item && typeof item === 'object'
-    && typeof (item as Record<string, unknown>)['label'] === 'string'
-    && typeof (item as Record<string, unknown>)['waitMs'] === 'number',
+    isRecord(item)
+    && typeof item['label'] === 'string'
+    && typeof item['waitMs'] === 'number',
   );
 }

@@ -20,7 +20,8 @@ interface ReplOpts {
   readonly autoApprove?: boolean;
   readonly model?: string;
   readonly ephemeral?: boolean;
-  readonly noDaemon?: boolean;
+  /** Commander maps `--no-daemon` to `daemon = false` (default true). */
+  readonly daemon?: boolean;
   readonly requireDaemon?: boolean;
 }
 
@@ -49,7 +50,7 @@ export function registerRepl(program: Command): void {
       process.env['OMNIFORGE_REPL_AUTO_APPROVE'] = opts.autoApprove ? '1' : '0';
       if (opts.model) process.env['OMNIFORGE_REPL_MODEL'] = opts.model;
       process.env['OMNIFORGE_REPL_EPHEMERAL'] = opts.ephemeral ? '1' : '0';
-      process.env['OMNIFORGE_REPL_NO_DAEMON'] = opts.noDaemon ? '1' : '0';
+      process.env['OMNIFORGE_REPL_NO_DAEMON'] = opts.daemon === false ? '1' : '0';
       process.env['OMNIFORGE_REPL_REQUIRE_DAEMON'] = opts.requireDaemon ? '1' : '0';
 
       try {

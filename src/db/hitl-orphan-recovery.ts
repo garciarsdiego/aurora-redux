@@ -23,6 +23,7 @@
 
 import type Database from 'better-sqlite3';
 import { insertEvent } from './persist.js';
+import { safeJsonObject } from './safe-json.js';
 import { withSqliteRetrySync } from './sqlite-retry.js';
 
 const DEFAULT_ORPHAN_AGE_MS = 5 * 60_000;
@@ -68,21 +69,6 @@ function resolveWindowMs(opts?: HitlOrphanRecoveryOptions): number {
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ORPHAN_AGE_MS;
   return parsed;
-}
-
-function safeParseContext(raw: string | null): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // Corrupted JSON — fall back to empty, but DO NOT lose the original blob.
-    // We leave the bad blob in place and start over with a fresh wrapper
-    // since `recovery_attempted_at` itself must be persistable.
-  }
-  return {};
 }
 
 /**
@@ -134,7 +120,9 @@ export function recoverOrphanHitlGates(
   result.scanned = rows.length;
 
   for (const row of rows) {
-    const context = safeParseContext(row.context_json);
+    // Corrupted context_json collapses to {} so `recovery_attempted_at`
+    // itself is always persistable via a fresh wrapper.
+    const context = safeJsonObject(row.context_json);
     if (typeof context.recovery_attempted_at === 'number') {
       // Already surfaced on a prior sweep — keep silent.
       result.skipped += 1;

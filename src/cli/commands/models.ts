@@ -66,16 +66,20 @@ export function registerModels(program: Command): void {
     .option('--provider <name>', 'filter to a single provider by name')
     .option('--json', 'output raw JSON instead of a formatted table')
     .action(async (options: { provider?: string; json?: boolean }) => {
+      const provider = options.provider;
       const results = await listAllProviderModels();
+      // Filtra uma única vez — os formatters e a checagem de existência abaixo
+      // reutilizam o resultado em vez de refazer o match por provider.
+      const filtered = filterByProvider(results, provider);
       if (options.json) {
-        console.log(formatModelsJson(results, options.provider));
+        console.log(formatModelsJson(filtered));
       } else {
-        console.log(formatModelsTable(results, options.provider));
+        console.log(formatModelsTable(filtered));
       }
       // Fail loudly if a specific provider was requested but doesn't exist at all
       // (distinct from "exists but errored", which still prints its error line).
-      if (options.provider && !results.some((r) => r.provider.toLowerCase() === options.provider!.toLowerCase())) {
-        console.error(`Provedor desconhecido: ${options.provider}`);
+      if (provider && filtered.length === 0) {
+        console.error(`Provedor desconhecido: ${provider}`);
         process.exitCode = 1;
       }
     });

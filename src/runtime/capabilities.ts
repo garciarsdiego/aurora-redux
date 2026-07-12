@@ -409,8 +409,8 @@ export const RUNTIME_EXECUTOR_CAPABILITIES: RuntimeExecutorCapability[] = [
   },
 ];
 
-export function listRuntimeExecutorCapabilities(): RuntimeExecutorCapability[] {
-  return RUNTIME_EXECUTOR_CAPABILITIES.map((capability) => ({
+function cloneCapability(capability: RuntimeExecutorCapability): RuntimeExecutorCapability {
+  return {
     ...capability,
     protocols: capability.protocols.map((protocol) => ({ ...protocol, supports: { ...protocol.supports } })),
     profiles: {
@@ -421,11 +421,16 @@ export function listRuntimeExecutorCapabilities(): RuntimeExecutorCapability[] {
     },
     baseArgs: [...capability.baseArgs],
     providerPrefixes: [...capability.providerPrefixes],
-  }));
+  };
+}
+
+export function listRuntimeExecutorCapabilities(): RuntimeExecutorCapability[] {
+  return RUNTIME_EXECUTOR_CAPABILITIES.map(cloneCapability);
 }
 
 export function getRuntimeExecutorCapability(executorId: string): RuntimeExecutorCapability | undefined {
-  return listRuntimeExecutorCapabilities().find((capability) => capability.executorId === executorId);
+  const capability = RUNTIME_EXECUTOR_CAPABILITIES.find((item) => item.executorId === executorId);
+  return capability ? cloneCapability(capability) : undefined;
 }
 
 export function runtimeExecutorForModel(model: string | null | undefined): string | null {

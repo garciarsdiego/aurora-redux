@@ -871,6 +871,270 @@ export const TOOLS = [
   ...buildAdvisorToolDefinitions(),
 ];
 
+// ---------------------------------------------------------------------------
+// Tool dispatch — each handler resolves to the text payload of a single MCP
+// text content block; createOmniforgeServer wraps every call in one shared
+// try/catch that normalizes failures to `{ error }` + isError.
+// ---------------------------------------------------------------------------
+
+type ToolArgs = Record<string, unknown> | undefined;
+type ToolHandler = (args: ToolArgs) => string | Promise<string>;
+
+/** Adapts a handler that resolves to an object so its payload is JSON text. */
+const asJson =
+  (fn: (args: ToolArgs) => Promise<unknown>): ToolHandler =>
+  async (args) =>
+    JSON.stringify(await fn(args));
+
+async function costAnalyticsTool(args: ToolArgs): Promise<string> {
+  if (!args) {
+    throw new Error('Arguments are required');
+  }
+
+  const { getCostDatabase } = await import('../cost/index.js');
+  const costDb = getCostDatabase();
+
+  const model = args.model as string | undefined;
+  const workflowId = args.workflow_id as string | undefined;
+  const limit = (args.limit as number) || 100;
+
+  // De-mock (MCP-01/02/03): report REAL spend from the usage ledger
+  // (usage_costs + model_calls), not a sum of per-1k pricing rates.
+  // Both ledgers carry the provider-reported cost_usd per call.
+  const byModel = costDb.getRealSpendByModel({
+    model,
+    workflow_id: workflowId,
+    limit,
+  });
+  const totals = costDb.getTotalRealSpend({ model, workflow_id: workflowId });
+
+  // Derive blended effective cost-per-1k-tokens from real spend so
+  // operators still get a normalized rate — computed from actuals,
+  // never fabricated. Guard against divide-by-zero on a fresh ledger.
+  const totalTokens = totals.total_input_tokens + totals.total_output_tokens;
+  const effectiveCostPer1k =
+    totalTokens > 0 ? (totals.total_cost_usd / totalTokens) * 1000 : 0;
+  const avgCostPerCall =
+    totals.total_calls > 0 ? totals.total_cost_usd / totals.total_calls : 0;
+
+  return JSON.stringify({
+    source: 'usage_ledger', // real spend, not pricing rates
+    total_cost_usd: totals.total_cost_usd,
+    total_input_tokens: totals.total_input_tokens,
+    total_output_tokens: totals.total_output_tokens,
+    total_calls: totals.total_calls,
+    distinct_models: totals.distinct_models,
+    avg_cost_per_call_usd: avgCostPerCall,
+    effective_cost_per_1k_usd: effectiveCostPer1k,
+    by_model: byModel,
+    note:
+      totals.total_calls === 0
+        ? 'No usage recorded yet — ledger is empty. Run a workflow to populate real spend.'
+        : undefined,
+  }, null, 2);
+}
+
+async function costOptimizationTool(args: ToolArgs): Promise<string> {
+  if (!args) {
+    throw new Error('Arguments are required');
+  }
+
+  const { CostOptimizer, getCostDatabase } = await import('../cost/index.js');
+  const optimizer = new CostOptimizer();
+
+  const budgetUsd = (args.budget_usd as number) || 1.0;
+  const remainingTasks = (args.remaining_tasks as number) || 1;
+  const currentModel = args.current_model as string;
+  const workflowId = args.workflow_id as string | undefined;
+
+  if (!currentModel) {
+    throw new Error('current_model is required');
+  }
+
+  // De-mock (MCP-01/02/03): ground the optimizer in REAL spend instead
+  // of the hardcoded current_cost: 0. When a workflow_id is supplied we
+  // read its actual spend from the ledger; otherwise we use the spend
+  // recorded for the current model. Falls back to 0 on a fresh ledger.
+  const costDb = getCostDatabase();
+  const currentCost = workflowId
+    ? costDb.getTotalRealSpend({ workflow_id: workflowId }).total_cost_usd
+    : costDb.getTotalRealSpend({ model: currentModel }).total_cost_usd;
+
+  const recommendation = await optimizer.recommendAction({
+    current_cost: currentCost,
+    budget: budgetUsd,
+    remaining_tasks: remainingTasks,
+    current_model: currentModel,
+    task_kind: 'general',
+    use_case: 'general'
+  });
+
+  return JSON.stringify({
+    ...recommendation,
+    current_cost_usd: currentCost,
+    budget_usd: budgetUsd,
+    cost_source: workflowId ? 'workflow_ledger' : 'model_ledger',
+  }, null, 2);
+}
+
+async function benchmarkListTool(args: ToolArgs): Promise<string> {
+  if (!args) {
+    throw new Error('Arguments are required');
+  }
+
+  const { getBenchmarkStore } = await import('../benchmark/index.js');
+  const benchmarkStore = getBenchmarkStore();
+
+  const useCase = args.use_case as string | undefined;
+  const provider = args.provider as string | undefined;
+
+  let benchmarks = benchmarkStore.getAllBenchmarks();
+
+  if (useCase) {
+    benchmarks = benchmarks.filter(b => b.use_case === useCase);
+  }
+  if (provider) {
+    benchmarks = benchmarks.filter(b => b.provider === provider);
+  }
+
+  return JSON.stringify({
+    total_benchmarks: benchmarks.length,
+    benchmarks: benchmarks.slice(0, 20) // Return first 20 for preview
+  }, null, 2);
+}
+
+async function benchmarkRunTool(args: ToolArgs): Promise<string> {
+  if (!args) {
+    throw new Error('Arguments are required');
+  }
+
+  const { BenchmarkRunner } = await import('../benchmark/index.js');
+  const benchmarkRunner = new BenchmarkRunner();
+
+  const suiteName = args.suite_name as string;
+  const models = args.models as string[];
+  const provider = (args.provider as string) || 'omniroute';
+  const useCase = (args.use_case as string) || 'code';
+  const callerPrompts = Array.isArray(args.test_prompts)
+    ? (args.test_prompts as unknown[]).filter((p): p is string => typeof p === 'string')
+    : undefined;
+
+  if (!suiteName || !models || models.length === 0) {
+    throw new Error('suite_name and models are required');
+  }
+
+  // De-mock (MCP-06/OPS-10): the provider call, cost_usd and latency_ms
+  // produced below are REAL. quality_score is a heuristic placeholder
+  // (see BenchmarkRunner.evaluateQuality) — surfaced as such here so
+  // operators never read it as a measured benchmark.
+  const prompts = (callerPrompts && callerPrompts.length > 0)
+    ? callerPrompts
+    : ['Write a function that adds two numbers'];
+
+  const suite = {
+    name: suiteName,
+    use_cases: [useCase],
+    test_cases: prompts.map((input, i) => ({
+      id: `test-${i + 1}`,
+      input,
+      expected_quality: 0.8,
+    })),
+  };
+
+  // Run suite for each model
+  const allResults: import('../benchmark/index.js').BenchmarkRun[] = [];
+  for (const model of models) {
+    const results = await benchmarkRunner.runSuite(provider, model, suite);
+    allResults.push(...results);
+  }
+
+  const realRuns = allResults.filter(r => r.success);
+  const avgRealCost =
+    realRuns.length > 0
+      ? realRuns.reduce((s, r) => s + (r.cost_usd || 0), 0) / realRuns.length
+      : 0;
+  const avgLatency =
+    realRuns.length > 0
+      ? realRuns.reduce((s, r) => s + (r.latency_ms || 0), 0) / realRuns.length
+      : 0;
+
+  return JSON.stringify({
+    suite: suiteName,
+    use_case: useCase,
+    models,
+    total_runs: allResults.length,
+    successful_runs: realRuns.length,
+    // Real, measured aggregates from live provider calls.
+    avg_cost_usd: avgRealCost,
+    avg_latency_ms: avgLatency,
+    // Explicit honesty about the quality dimension.
+    quality_is_placeholder: true,
+    quality_note:
+      'quality_score is a heuristic placeholder (length/keyword checks), NOT a measured benchmark. ' +
+      'cost_usd and latency_ms are real.',
+    results: allResults.slice(0, 5), // Return first 5 results for preview
+  }, null, 2);
+}
+
+const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  omniforge_plan_workflow: planWorkflowTool,
+  omniforge_run_workflow: runWorkflowTool,
+  omniforge_get_workflow_status: getWorkflowStatusTool,
+  omniforge_get_model_calls: getModelCallsTool,
+  omniforge_get_context_bundle: getContextBundleTool,
+  omniforge_get_architecture_contract: getArchitectureContractTool,
+  omniforge_read_task_thread: readTaskThreadTool,
+  omniforge_post_task_handoff: postTaskHandoffTool,
+  omniforge_inspect_workflow_diff: inspectWorkflowDiffTool,
+  omniforge_create_fix_task: createFixTaskTool,
+  omniforge_request_architecture_review: requestArchitectureReviewTool,
+  omniforge_request_product_review: requestProductReviewTool,
+  omniforge_register_eval_case: registerEvalCaseTool,
+  omniforge_list_eval_cases: listEvalCasesTool,
+  omniforge_get_eval_run: getEvalRunTool,
+  omniforge_list_workflows: listWorkflowsTool,
+  omniforge_approve_gate: approveGateTool,
+  omniforge_list_patterns: listPatternsTool,
+  omniforge_save_pattern: savePatternTool,
+  omniforge_export_pattern: exportPatternTool,
+  omniforge_import_pattern: importPatternTool,
+  omniforge_list_models: listModelsTool,
+  omniforge_route_model: routeModelTool,
+  omniforge_opencode_sync_models: opencodeSyncModelsTool,
+  omniforge_set_hermes_model: setHermesModelTool,
+  omniforge_set_config: setConfigTool,
+  omniforge_read_file: readFileTool,
+  omniforge_vault_write,
+  omniforge_vault_read,
+  omniforge_vault_list,
+  omniforge_vault_delete,
+  omniforge_vault_merge,
+  omniforge_register_versioned_definition: registerVersionedDefinitionTool,
+  omniforge_list_versioned_definitions: listVersionedDefinitionsTool,
+  omniforge_replay_persona_version: replayPersonaVersionTool,
+  omniforge_run_meta_workflow: runMetaWorkflowTool,
+  omniforge_tail_cli: asJson(async (args) => tailCliTool(TailCliSchema.parse(args))),
+  omniforge_task_await: (args) => omniforgeTaskAwait(TaskAwaitSchema.parse(args)),
+  omniforge_task_cancel: (args) => omniforgeTaskCancel(TaskCancelSchema.parse(args)),
+  omniforge_pin_versioned_definition: pinVersionedDefinitionTool,
+  omniforge_builder_chat,
+  omniforge_credential_create: asJson(handleCredentialCreate),
+  omniforge_credential_get: asJson(handleCredentialGet),
+  omniforge_credential_get_by_service: asJson(handleCredentialGetByService),
+  omniforge_credential_list: asJson(handleCredentialList),
+  omniforge_credential_update: asJson(handleCredentialUpdate),
+  omniforge_credential_delete: asJson(handleCredentialDelete),
+  omniforge_credential_rotate: asJson(handleCredentialRotate),
+  omniforge_credential_sync: asJson(handleCredentialSync),
+  omniforge_credential_sync_status: asJson(handleCredentialSyncStatus),
+  omniforge_credential_audit_log: asJson(handleCredentialAuditLog),
+  omniforge_credential_validate_routing: asJson(handleCredentialValidateRouting),
+  omniforge_cost_analytics: costAnalyticsTool,
+  omniforge_cost_optimization: costOptimizationTool,
+  omniforge_benchmark_list: benchmarkListTool,
+  omniforge_benchmark_run: benchmarkRunTool,
+};
+
 export function createOmniforgeServer(): Server {
   const server = new Server(
     { name: 'omniforge', version: '0.1.0' },
@@ -882,886 +1146,26 @@ export function createOmniforgeServer(): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    switch (name) {
-      case 'omniforge_plan_workflow': {
-        try {
-          const text = await planWorkflowTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_run_workflow': {
-        try {
-          const text = await runWorkflowTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_get_workflow_status': {
-        try {
-          const text = await getWorkflowStatusTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_get_model_calls': {
-        try {
-          const text = await getModelCallsTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_get_context_bundle': {
-        try {
-          const text = await getContextBundleTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_get_architecture_contract': {
-        try {
-          const text = await getArchitectureContractTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_read_task_thread': {
-        try {
-          const text = await readTaskThreadTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_post_task_handoff': {
-        try {
-          const text = await postTaskHandoffTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_inspect_workflow_diff': {
-        try {
-          const text = await inspectWorkflowDiffTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_create_fix_task': {
-        try {
-          const text = await createFixTaskTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_request_architecture_review': {
-        try {
-          const text = await requestArchitectureReviewTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_request_product_review': {
-        try {
-          const text = await requestProductReviewTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_register_eval_case': {
-        try {
-          const text = await registerEvalCaseTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_list_eval_cases': {
-        try {
-          const text = await listEvalCasesTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_get_eval_run': {
-        try {
-          const text = await getEvalRunTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_list_workflows': {
-        try {
-          const text = await listWorkflowsTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_approve_gate': {
-        try {
-          const text = await approveGateTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_list_patterns': {
-        try {
-          const text = await listPatternsTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_save_pattern': {
-        try {
-          const text = await savePatternTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_export_pattern': {
-        try {
-          const text = await exportPatternTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_import_pattern': {
-        try {
-          const text = await importPatternTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_list_models': {
-        try {
-          const text = await listModelsTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_route_model': {
-        try {
-          const text = await routeModelTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_opencode_sync_models': {
-        try {
-          const text = await opencodeSyncModelsTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_set_hermes_model': {
-        try {
-          const text = await setHermesModelTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_set_config': {
-        try {
-          const text = await setConfigTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_read_file': {
-        try {
-          const text = readFileTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_vault_write': {
-        try {
-          const text = await omniforge_vault_write(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_vault_read': {
-        try {
-          const text = await omniforge_vault_read(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_vault_list': {
-        try {
-          const text = await omniforge_vault_list(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_vault_delete': {
-        try {
-          const text = await omniforge_vault_delete(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_vault_merge': {
-        try {
-          const text = await omniforge_vault_merge(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_register_versioned_definition': {
-        try {
-          const text = await registerVersionedDefinitionTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_list_versioned_definitions': {
-        try {
-          const text = await listVersionedDefinitionsTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_replay_persona_version': {
-        try {
-          const text = await replayPersonaVersionTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_run_meta_workflow': {
-        try {
-          const text = await runMetaWorkflowTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_tail_cli': {
-        try {
-          const result = await tailCliTool(TailCliSchema.parse(args));
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_task_await': {
-        try {
-          const text = await omniforgeTaskAwait(TaskAwaitSchema.parse(args));
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_task_cancel': {
-        try {
-          const text = await omniforgeTaskCancel(TaskCancelSchema.parse(args));
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_pin_versioned_definition': {
-        try {
-          const text = await pinVersionedDefinitionTool(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_builder_chat': {
-        try {
-          const text = await omniforge_builder_chat(args);
-          return { content: [{ type: 'text' as const, text }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_create': {
-        try {
-          const result = await handleCredentialCreate(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_get': {
-        try {
-          const result = await handleCredentialGet(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_get_by_service': {
-        try {
-          const result = await handleCredentialGetByService(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_cost_analytics': {
-        try {
-          if (!args) {
-            throw new Error('Arguments are required');
-          }
+    // Native advisor tools (omniforge_<advisor_name>) route through the
+    // advisor registry instead of PAL stdio.
+    const handler = Object.hasOwn(TOOL_HANDLERS, name)
+      ? TOOL_HANDLERS[name]
+      : isAdvisorToolName(name)
+        ? (a: ToolArgs) => runAdvisorTool(name, a)
+        : undefined;
+    if (!handler) {
+      throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+    }
 
-          const { getCostDatabase } = await import('../cost/index.js');
-          const costDb = getCostDatabase();
-
-          const model = args.model as string | undefined;
-          const workflowId = args.workflow_id as string | undefined;
-          const limit = (args.limit as number) || 100;
-
-          // De-mock (MCP-01/02/03): report REAL spend from the usage ledger
-          // (usage_costs + model_calls), not a sum of per-1k pricing rates.
-          // Both ledgers carry the provider-reported cost_usd per call.
-          const byModel = costDb.getRealSpendByModel({
-            model,
-            workflow_id: workflowId,
-            limit,
-          });
-          const totals = costDb.getTotalRealSpend({ model, workflow_id: workflowId });
-
-          // Derive blended effective cost-per-1k-tokens from real spend so
-          // operators still get a normalized rate — computed from actuals,
-          // never fabricated. Guard against divide-by-zero on a fresh ledger.
-          const totalTokens = totals.total_input_tokens + totals.total_output_tokens;
-          const effectiveCostPer1k =
-            totalTokens > 0 ? (totals.total_cost_usd / totalTokens) * 1000 : 0;
-          const avgCostPerCall =
-            totals.total_calls > 0 ? totals.total_cost_usd / totals.total_calls : 0;
-
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                source: 'usage_ledger', // real spend, not pricing rates
-                total_cost_usd: totals.total_cost_usd,
-                total_input_tokens: totals.total_input_tokens,
-                total_output_tokens: totals.total_output_tokens,
-                total_calls: totals.total_calls,
-                distinct_models: totals.distinct_models,
-                avg_cost_per_call_usd: avgCostPerCall,
-                effective_cost_per_1k_usd: effectiveCostPer1k,
-                by_model: byModel,
-                note:
-                  totals.total_calls === 0
-                    ? 'No usage recorded yet — ledger is empty. Run a workflow to populate real spend.'
-                    : undefined,
-              }, null, 2)
-            }]
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_cost_optimization': {
-        try {
-          if (!args) {
-            throw new Error('Arguments are required');
-          }
-          
-          const { CostOptimizer, getCostDatabase } = await import('../cost/index.js');
-          const optimizer = new CostOptimizer();
-
-          const budgetUsd = (args.budget_usd as number) || 1.0;
-          const remainingTasks = (args.remaining_tasks as number) || 1;
-          const currentModel = args.current_model as string;
-          const workflowId = args.workflow_id as string | undefined;
-
-          if (!currentModel) {
-            throw new Error('current_model is required');
-          }
-
-          // De-mock (MCP-01/02/03): ground the optimizer in REAL spend instead
-          // of the hardcoded current_cost: 0. When a workflow_id is supplied we
-          // read its actual spend from the ledger; otherwise we use the spend
-          // recorded for the current model. Falls back to 0 on a fresh ledger.
-          const costDb = getCostDatabase();
-          const currentCost = workflowId
-            ? costDb.getTotalRealSpend({ workflow_id: workflowId }).total_cost_usd
-            : costDb.getTotalRealSpend({ model: currentModel }).total_cost_usd;
-
-          const recommendation = await optimizer.recommendAction({
-            current_cost: currentCost,
-            budget: budgetUsd,
-            remaining_tasks: remainingTasks,
-            current_model: currentModel,
-            task_kind: 'general',
-            use_case: 'general'
-          });
-
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                ...recommendation,
-                current_cost_usd: currentCost,
-                budget_usd: budgetUsd,
-                cost_source: workflowId ? 'workflow_ledger' : 'model_ledger',
-              }, null, 2)
-            }]
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_benchmark_list': {
-        try {
-          if (!args) {
-            throw new Error('Arguments are required');
-          }
-          
-          const { getBenchmarkStore } = await import('../benchmark/index.js');
-          const benchmarkStore = getBenchmarkStore();
-          
-          const useCase = args.use_case as string | undefined;
-          const provider = args.provider as string | undefined;
-          
-          let benchmarks = benchmarkStore.getAllBenchmarks();
-          
-          if (useCase) {
-            benchmarks = benchmarks.filter(b => b.use_case === useCase);
-          }
-          if (provider) {
-            benchmarks = benchmarks.filter(b => b.provider === provider);
-          }
-          
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                total_benchmarks: benchmarks.length,
-                benchmarks: benchmarks.slice(0, 20) // Return first 20 for preview
-              }, null, 2)
-            }]
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_benchmark_run': {
-        try {
-          if (!args) {
-            throw new Error('Arguments are required');
-          }
-          
-          const { BenchmarkRunner } = await import('../benchmark/index.js');
-          const benchmarkRunner = new BenchmarkRunner();
-
-          const suiteName = args.suite_name as string;
-          const models = args.models as string[];
-          const provider = (args.provider as string) || 'omniroute';
-          const useCase = (args.use_case as string) || 'code';
-          const callerPrompts = Array.isArray(args.test_prompts)
-            ? (args.test_prompts as unknown[]).filter((p): p is string => typeof p === 'string')
-            : undefined;
-
-          if (!suiteName || !models || models.length === 0) {
-            throw new Error('suite_name and models are required');
-          }
-
-          // De-mock (MCP-06/OPS-10): the provider call, cost_usd and latency_ms
-          // produced below are REAL. quality_score is a heuristic placeholder
-          // (see BenchmarkRunner.evaluateQuality) — surfaced as such here so
-          // operators never read it as a measured benchmark.
-          const prompts = (callerPrompts && callerPrompts.length > 0)
-            ? callerPrompts
-            : ['Write a function that adds two numbers'];
-
-          const suite = {
-            name: suiteName,
-            use_cases: [useCase],
-            test_cases: prompts.map((input, i) => ({
-              id: `test-${i + 1}`,
-              input,
-              expected_quality: 0.8,
-            })),
-          };
-
-          // Run suite for each model
-          const allResults: any[] = [];
-          for (const model of models) {
-            const results = await benchmarkRunner.runSuite(provider, model, suite);
-            allResults.push(...results);
-          }
-
-          const realRuns = allResults.filter(r => r.success);
-          const avgRealCost =
-            realRuns.length > 0
-              ? realRuns.reduce((s, r) => s + (r.cost_usd || 0), 0) / realRuns.length
-              : 0;
-          const avgLatency =
-            realRuns.length > 0
-              ? realRuns.reduce((s, r) => s + (r.latency_ms || 0), 0) / realRuns.length
-              : 0;
-
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                suite: suiteName,
-                use_case: useCase,
-                models,
-                total_runs: allResults.length,
-                successful_runs: realRuns.length,
-                // Real, measured aggregates from live provider calls.
-                avg_cost_usd: avgRealCost,
-                avg_latency_ms: avgLatency,
-                // Explicit honesty about the quality dimension.
-                quality_is_placeholder: true,
-                quality_note:
-                  'quality_score is a heuristic placeholder (length/keyword checks), NOT a measured benchmark. ' +
-                  'cost_usd and latency_ms are real.',
-                results: allResults.slice(0, 5), // Return first 5 results for preview
-              }, null, 2)
-            }]
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_list': {
-        try {
-          const result = await handleCredentialList(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_update': {
-        try {
-          const result = await handleCredentialUpdate(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_delete': {
-        try {
-          const result = await handleCredentialDelete(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_rotate': {
-        try {
-          const result = await handleCredentialRotate(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_sync': {
-        try {
-          const result = await handleCredentialSync(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_sync_status': {
-        try {
-          const result = await handleCredentialSyncStatus(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_audit_log': {
-        try {
-          const result = await handleCredentialAuditLog(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      case 'omniforge_credential_validate_routing': {
-        try {
-          const result = await handleCredentialValidateRouting(args);
-          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-            isError: true,
-          };
-        }
-      }
-      default: {
-        // Native advisor tools (omniforge_<advisor_name>) route through the
-        // advisor registry instead of PAL stdio.
-        if (isAdvisorToolName(name)) {
-          try {
-            const text = await runAdvisorTool(name, args);
-            return { content: [{ type: 'text' as const, text }] };
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return {
-              content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
-              isError: true,
-            };
-          }
-        }
-        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
-      }
+    try {
+      const text = await handler(args);
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
+        isError: true,
+      };
     }
   });
 

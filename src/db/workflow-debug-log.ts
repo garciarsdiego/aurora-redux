@@ -50,6 +50,19 @@ function tableExists(db: Database.Database, table: string): boolean {
   return row?.name === table;
 }
 
+// Debug logs are built against DBs of any migration age, so every optional
+// table read degrades to [] when the table is missing.
+function selectIfTableExists(
+  db: Database.Database,
+  table: string,
+  sql: string,
+  params: unknown[],
+): Array<Record<string, unknown>> {
+  return tableExists(db, table)
+    ? db.prepare(sql).all(...params) as Array<Record<string, unknown>>
+    : [];
+}
+
 function redactString(value: string, workspace: string, db: Database.Database): string {
   let out = value;
   try {
@@ -328,72 +341,48 @@ export function buildWorkflowDebugLog(
       parseJsonColumns(row, workspace, db, ['payload_json']),
     );
 
-  const modelCalls = tableExists(db, 'model_calls')
-    ? db.prepare(`SELECT * FROM model_calls WHERE workflow_id = ? ORDER BY created_at ASC`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
+  const modelCalls = selectIfTableExists(db, 'model_calls',
+    `SELECT * FROM model_calls WHERE workflow_id = ? ORDER BY created_at ASC`, [workflowId]);
 
-  const subagentRuns = tableExists(db, 'subagent_runs')
-    ? db.prepare(`SELECT * FROM subagent_runs WHERE workflow_id = ? ORDER BY created_at ASC`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const qualityReviewRows = tableExists(db, 'quality_reviews')
-    ? (db.prepare(`SELECT * FROM quality_reviews WHERE workflow_id = ? ORDER BY created_at ASC, id ASC`)
-      .all(workflowId) as Array<Record<string, unknown>>).map((row) =>
-        parseJsonColumns(row, workspace, db, ['issues_json', 'evidence_json', 'fix_tasks_json']),
-      )
-    : [];
+  const subagentRuns = selectIfTableExists(db, 'subagent_runs',
+    `SELECT * FROM subagent_runs WHERE workflow_id = ? ORDER BY created_at ASC`, [workflowId]);
+  const qualityReviewRows = selectIfTableExists(db, 'quality_reviews',
+    `SELECT * FROM quality_reviews WHERE workflow_id = ? ORDER BY created_at ASC, id ASC`, [workflowId],
+  ).map((row) =>
+    parseJsonColumns(row, workspace, db, ['issues_json', 'evidence_json', 'fix_tasks_json']),
+  );
 
   const controlState = tableExists(db, 'workflow_control_state')
     ? db.prepare(`SELECT * FROM workflow_control_state WHERE workflow_id = ?`).get(workflowId) as Record<string, unknown> | undefined
     : undefined;
 
-  const contextChannels = tableExists(db, 'context_channels')
-    ? db.prepare(`SELECT * FROM context_channels WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 100`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const contextThreads = tableExists(db, 'context_threads')
-    ? db.prepare(`SELECT * FROM context_threads WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const contextMessages = tableExists(db, 'context_messages') && tableExists(db, 'context_threads')
-    ? db.prepare(
+  const contextChannels = selectIfTableExists(db, 'context_channels',
+    `SELECT * FROM context_channels WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 100`, [workflowId]);
+  const contextThreads = selectIfTableExists(db, 'context_threads',
+    `SELECT * FROM context_threads WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`, [workflowId]);
+  const contextMessages = tableExists(db, 'context_threads')
+    ? selectIfTableExists(db, 'context_messages',
       `SELECT m.*
          FROM context_messages m
          JOIN context_threads t ON t.id = m.thread_id
         WHERE t.run_id = ?
         ORDER BY m.created_at ASC, m.seq ASC
-        LIMIT 1000`,
-    ).all(workflowId) as Array<Record<string, unknown>>
+        LIMIT 1000`, [workflowId])
     : [];
-  const contextPackets = tableExists(db, 'context_packets')
-    ? db.prepare(`SELECT * FROM context_packets WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const taskHandoffs = tableExists(db, 'task_handoffs')
-    ? db.prepare(`SELECT * FROM task_handoffs WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const workItems = tableExists(db, 'work_items')
-    ? db.prepare(`SELECT * FROM work_items WHERE run_id = ? ORDER BY order_index ASC, created_at ASC, id ASC LIMIT 500`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const contextDecisions = tableExists(db, 'context_decisions')
-    ? db.prepare(`SELECT * FROM context_decisions WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const runtimeSessions = tableExists(db, 'runtime_sessions')
-    ? db.prepare(`SELECT * FROM runtime_sessions WHERE workflow_id = ? ORDER BY updated_at ASC, id ASC LIMIT 500`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const runtimeTurns = tableExists(db, 'runtime_turns')
-    ? db.prepare(`SELECT * FROM runtime_turns WHERE workflow_id = ? ORDER BY started_at ASC, id ASC LIMIT 500`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
-  const runtimeStreamEvents = tableExists(db, 'runtime_stream_events')
-    ? db.prepare(`SELECT * FROM runtime_stream_events WHERE workflow_id = ? ORDER BY created_at ASC, id ASC LIMIT 1000`)
-      .all(workflowId) as Array<Record<string, unknown>>
-    : [];
+  const contextPackets = selectIfTableExists(db, 'context_packets',
+    `SELECT * FROM context_packets WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`, [workflowId]);
+  const taskHandoffs = selectIfTableExists(db, 'task_handoffs',
+    `SELECT * FROM task_handoffs WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`, [workflowId]);
+  const workItems = selectIfTableExists(db, 'work_items',
+    `SELECT * FROM work_items WHERE run_id = ? ORDER BY order_index ASC, created_at ASC, id ASC LIMIT 500`, [workflowId]);
+  const contextDecisions = selectIfTableExists(db, 'context_decisions',
+    `SELECT * FROM context_decisions WHERE run_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`, [workflowId]);
+  const runtimeSessions = selectIfTableExists(db, 'runtime_sessions',
+    `SELECT * FROM runtime_sessions WHERE workflow_id = ? ORDER BY updated_at ASC, id ASC LIMIT 500`, [workflowId]);
+  const runtimeTurns = selectIfTableExists(db, 'runtime_turns',
+    `SELECT * FROM runtime_turns WHERE workflow_id = ? ORDER BY started_at ASC, id ASC LIMIT 500`, [workflowId]);
+  const runtimeStreamEvents = selectIfTableExists(db, 'runtime_stream_events',
+    `SELECT * FROM runtime_stream_events WHERE workflow_id = ? ORDER BY created_at ASC, id ASC LIMIT 1000`, [workflowId]);
   const runtimeSessionRows = runtimeSessions.map((row) =>
     parseJsonColumns(row, workspace, db, ['metadata_json']),
   );
@@ -427,12 +416,17 @@ export function buildWorkflowDebugLog(
     ? workflowMetadata['workflow_mode']
     : 'standard';
   workflowRow['workflow_mode'] = workflowMode;
-  const historicalErrors = allStructuredErrors.filter((err) =>
-    errorIsHistorical(err, taskStatusById, workflowStatus, latestTaskStartById),
-  );
-  const structuredErrors = allStructuredErrors.filter((err) =>
-    !errorIsHistorical(err, taskStatusById, workflowStatus, latestTaskStartById),
-  );
+  // Single-pass partition — errorIsHistorical re-runs regex matches + Map
+  // lookups per call, so evaluating it once per error halves the work and
+  // guarantees the two lists stay complementary.
+  const historicalErrors: WorkflowDebugStructuredError[] = [];
+  const structuredErrors: WorkflowDebugStructuredError[] = [];
+  for (const err of allStructuredErrors) {
+    const target = errorIsHistorical(err, taskStatusById, workflowStatus, latestTaskStartById)
+      ? historicalErrors
+      : structuredErrors;
+    target.push(err);
+  }
 
   const terminalLines = [
     `[${formatIso(workflow['created_at'])}] workflow ${workflowId} status=${workflowStatus} workspace=${workspace} mode=${workflowMode}`,

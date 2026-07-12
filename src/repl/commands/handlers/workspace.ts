@@ -3,6 +3,7 @@
 // updates the session store so other slices/handlers observe the change.
 import type { SlashCommand, SlashResult, ReplCtx } from '../types.js';
 import { VALID_WORKSPACE_RE, loadWorkspaceEnv } from '../../../utils/workspace.js';
+import { toError } from '../../utils/errors.js';
 
 interface WorkspaceArgs {
   name?: string;
@@ -50,7 +51,7 @@ export const workspaceCommand: SlashCommand<WorkspaceArgs> = {
       // loadWorkspaceEnv only throws when the name fails the same regex we just
       // checked — so this is a hard internal mismatch. Surface the error so
       // the user sees it instead of a silent half-switch.
-      return { error: err instanceof Error ? err : new Error(String(err)) };
+      return { error: toError(err) };
     }
 
     if (ctx.store) {

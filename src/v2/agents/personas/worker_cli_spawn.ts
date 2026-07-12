@@ -24,6 +24,7 @@ import { z } from 'zod';
 import { Vault } from '../../vault/store.js';
 
 import { backupFilesForRetry } from '../validators/workspace.js';
+import { verifyFile } from '../validators/filesystem.js';
 import {
   extractFilePathsFromAcceptance,
   hasWriteTool,
@@ -35,22 +36,6 @@ import {
   WORKER_CLI_SPAWN_PREFIX,
   WORKER_GEMINI_TEXT_PREFIX,
 } from '../prompts/prefixes.js';
-
-/**
- * N2 (post-2026-05-05): strip a single outer ```json``` / ```ts``` / etc.
- * fence wrapping. Idempotent — text without fences passes through unchanged.
- * Inner fences (e.g. inside markdown documentation that itself shows code
- * samples) are preserved by only matching outermost fences anchored to the
- * trimmed-text edges.
- */
-function stripMarkdownFences(text: string): string {
-  if (!text) return text;
-  const trimmed = text.trim();
-  // Match: optional language, content, closing fence — at the edges of the trimmed string.
-  const fenceMatch = trimmed.match(/^```[a-zA-Z0-9_+-]*\s*\n?([\s\S]*?)\n?```\s*$/);
-  if (fenceMatch) return fenceMatch[1].trim();
-  return text;
-}
 import { extractHandoffSections } from '../../handoff/extract.js';
 import type { ParsedHandoff } from '../../handoff/types.js';
 import { KNOWN_CLIS } from './decomposer.js';
@@ -112,6 +97,35 @@ export const WorkerCliSpawnOutputSchema = z.object({
 export type WorkerCliSpawnOutput = z.infer<typeof WorkerCliSpawnOutputSchema>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * N2 (post-2026-05-05): strip a single outer ```json``` / ```ts``` / etc.
+ * fence wrapping. Idempotent — text without fences passes through unchanged.
+ * Inner fences (e.g. inside markdown documentation that itself shows code
+ * samples) are preserved by only matching outermost fences anchored to the
+ * trimmed-text edges.
+ */
+function stripMarkdownFences(text: string): string {
+  if (!text) return text;
+  const trimmed = text.trim();
+  // Match: optional language, content, closing fence — at the edges of the trimmed string.
+  const fenceMatch = trimmed.match(/^```[a-zA-Z0-9_+-]*\s*\n?([\s\S]*?)\n?```\s*$/);
+  if (fenceMatch) return fenceMatch[1].trim();
+  return text;
+}
+
+/**
+ * D-H2.077 signature: clean exit, no tool calls, empty result text. Shared by
+ * the declarative failure-mode detector and the postHook gate so the two
+ * never drift apart.
+ */
+function isEmptyCleanExit(output: WorkerCliSpawnOutput): boolean {
+  return output.exit_code === 0 && output.tool_calls.length === 0 && output.result_text.trim().length === 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Failure modes
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -150,8 +164,7 @@ const FAILURE_MODES: readonly FailureMode<WorkerCliSpawnOutput>[] = [
   },
   {
     id: 'worker.opencode_empty_output',
-    detect: (output) =>
-      output.exit_code === 0 && output.tool_calls.length === 0 && output.result_text.trim().length === 0,
+    detect: (output) => isEmptyCleanExit(output),
     remediation: 'retry_with_different_model',
     description: 'opencode + unsupported provider returns clean exit with empty output (D-H2.077).',
   },
@@ -390,12 +403,7 @@ export const WORKER_CLI_SPAWN_PERSONA: AgentPersona<WorkerCliSpawnInput, WorkerC
     output.result_text = stripMarkdownFences(output.result_text);
 
     // 1. opencode-empty-output sentinel (D-H2.077)
-    if (
-      input.cli === 'cli:opencode' &&
-      output.exit_code === 0 &&
-      output.tool_calls.length === 0 &&
-      output.result_text.trim().length === 0
-    ) {
+    if (input.cli === 'cli:opencode' && isEmptyCleanExit(output)) {
       return {
         rejectWithReason:
           'worker.opencode_empty_output: opencode returned clean exit + empty output (likely unsupported provider). Switch to deepseek/anthropic/groq.',
@@ -445,11 +453,9 @@ export const WORKER_CLI_SPAWN_PERSONA: AgentPersona<WorkerCliSpawnInput, WorkerC
           mode: 'worker.file_empty',
         };
       }
-      // Markdown-in-code detection
-      const ext = path.extname(rel).toLowerCase();
-      const codeExt = ['.ts', '.tsx', '.js', '.jsx', '.rs', '.py', '.go', '.java', '.kt', '.swift'].includes(ext);
-      const firstLine = content.split('\n').find((l) => l.trim().length > 0)?.trim() ?? '';
-      if (codeExt && /^#\s+/.test(firstLine)) {
+      // Markdown-in-code detection — same gate the reviewer applies, via the
+      // shared SOURCE_EXTENSIONS list in validators/filesystem.ts.
+      if (verifyFile(abs).looksLikeMarkdownInCodeFile) {
         return {
           rejectWithReason: `worker.markdown_in_code_file: ${rel} starts with markdown header but extension is source code`,
           mode: 'worker.markdown_in_code_file',

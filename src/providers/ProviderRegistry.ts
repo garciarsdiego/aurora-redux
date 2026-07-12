@@ -65,9 +65,7 @@ export class ProviderRegistry extends EventEmitter {
    * Get the best provider for a specific model
    */
   getBestForModel(model: string): ProviderConfig | undefined {
-    const candidates = this.getAll().filter(p => 
-      p.enabled && p.models.includes(model)
-    );
+    const candidates = this.getProvidersForModel(model);
 
     if (candidates.length === 0) {
       return undefined;

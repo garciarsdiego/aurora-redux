@@ -32,7 +32,7 @@ import { initDb } from '../../db/client.js';
 import { getDbPath } from '../../utils/config.js';
 
 import type { Router } from './types.js';
-import { badRequest, jsonOk, readJsonBody } from './_shared.js';
+import { badRequest, jsonOk, readBodyOr400 } from './_shared.js';
 
 // ── Provider listing (catalog × disabled flag) ────────────────────────────
 
@@ -334,29 +334,29 @@ export const setupConfigRouter: Router = async (req, url, res, _ctx) => {
   if (req.method === 'POST') {
     const providerToggle = url.pathname.match(/^\/api\/setup\/providers\/([^/]+)\/toggle$/);
     if (providerToggle) {
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+      const body = await readBodyOr400(req, res);
+      if (body === undefined) return true;
       await handleProviderToggle(decodeURIComponent(providerToggle[1] ?? ''), body, res);
       return true;
     }
 
     if (url.pathname === '/api/setup/role-models') {
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+      const body = await readBodyOr400(req, res);
+      if (body === undefined) return true;
       handleRoleModelsPost(body, res);
       return true;
     }
 
     if (url.pathname === '/api/setup/fallback') {
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+      const body = await readBodyOr400(req, res);
+      if (body === undefined) return true;
       handleFallbackPost(body, res);
       return true;
     }
 
     if (url.pathname === '/api/setup/limits') {
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+      const body = await readBodyOr400(req, res);
+      if (body === undefined) return true;
       handleLimitsPost(body, res);
       return true;
     }
@@ -366,8 +366,8 @@ export const setupConfigRouter: Router = async (req, url, res, _ctx) => {
       /^\/api\/dashboard\/setup\/tools\/([^/]+)\/toggle$/,
     );
     if (toolToggle) {
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+      const body = await readBodyOr400(req, res);
+      if (body === undefined) return true;
       handleToolToggle(decodeURIComponent(toolToggle[1] ?? ''), body, res);
       return true;
     }

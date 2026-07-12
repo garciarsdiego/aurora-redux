@@ -64,17 +64,11 @@ export function createSessionSlice(set: SetFn): SessionSlice {
     },
 
     resetSession() {
+      // `...prev.session` keeps the methods; SESSION_DEFAULTS only overwrites
+      // the four data fields.
       set((prev) => ({
         ...prev,
-        session: {
-          ...prev.session,
-          ...SESSION_DEFAULTS,
-          setWorkspace: prev.session.setWorkspace,
-          setModel: prev.session.setModel,
-          cyclePermissionMode: prev.session.cyclePermissionMode,
-          addCost: prev.session.addCost,
-          resetSession: prev.session.resetSession,
-        },
+        session: { ...prev.session, ...SESSION_DEFAULTS },
       }));
     },
   };

@@ -12,6 +12,7 @@ import type { Dag, DagTask, Task } from '../types/index.js';
 import { loadWorkflowById, insertEvent } from '../db/persist.js';
 import { withSqliteRetrySync } from '../db/sqlite-retry.js';
 import { callOmnirouteWithUsage } from '../utils/omniroute-call.js';
+import { getUsePersonas } from '../utils/config.js';
 import { normalizeCliExecutorHintForModel } from '../utils/cli-routing.js';
 import { runAgent, type AgentInvoker } from '../v2/agents/runner.js';
 import {
@@ -199,8 +200,6 @@ export async function adjustDashboardTaskWithAi(
   let discardedTaskCount = 0;
   let diagnosisText: string | undefined;
   let refinerChangelog: string[] | undefined;
-
-  const getUsePersonas = () => process.env.OMNIFORGE_USE_PERSONAS !== 'false';
 
   if (getUsePersonas()) {
     try {

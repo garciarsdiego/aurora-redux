@@ -181,33 +181,16 @@ export function updateRuntimeSessionNativeId(
   );
 }
 
-export function updateRuntimeSessionMetadata(
+/**
+ * Shared skeleton for the metadata/status update paths: fetch → merge the
+ * metadata patch → UPDATE (optionally flipping status) → re-fetch. Internal
+ * only — callers go through updateRuntimeSessionMetadata/Status below.
+ */
+function patchRuntimeSession(
   db: Database.Database,
   id: string,
-  patch: Record<string, unknown>,
-): RuntimeSessionRow | null {
-  const existing = getRuntimeSession(db, id);
-  if (!existing) return null;
-  const metadata = {
-    ...parseMetadata(existing.metadata_json),
-    ...patch,
-  };
-  const now = Date.now();
-  withSqliteRetrySync(() =>
-    db.prepare(
-      `UPDATE runtime_sessions
-        SET metadata_json = ?, updated_at = ?, last_used_at = ?
-      WHERE id = ?`,
-    ).run(json(metadata), now, now, id),
-  );
-  return getRuntimeSession(db, id);
-}
-
-export function updateRuntimeSessionStatus(
-  db: Database.Database,
-  id: string,
-  status: RuntimeSessionStatus,
-  metadataPatch: Record<string, unknown> = {},
+  metadataPatch: Record<string, unknown>,
+  status?: RuntimeSessionStatus,
 ): RuntimeSessionRow | null {
   const existing = getRuntimeSession(db, id);
   if (!existing) return null;
@@ -217,13 +200,36 @@ export function updateRuntimeSessionStatus(
   };
   const now = Date.now();
   withSqliteRetrySync(() =>
-    db.prepare(
-      `UPDATE runtime_sessions
-        SET status = ?, metadata_json = ?, updated_at = ?, last_used_at = ?
-      WHERE id = ?`,
-    ).run(status, json(metadata), now, now, id),
+    status
+      ? db.prepare(
+          `UPDATE runtime_sessions
+            SET status = ?, metadata_json = ?, updated_at = ?, last_used_at = ?
+          WHERE id = ?`,
+        ).run(status, json(metadata), now, now, id)
+      : db.prepare(
+          `UPDATE runtime_sessions
+            SET metadata_json = ?, updated_at = ?, last_used_at = ?
+          WHERE id = ?`,
+        ).run(json(metadata), now, now, id),
   );
   return getRuntimeSession(db, id);
+}
+
+export function updateRuntimeSessionMetadata(
+  db: Database.Database,
+  id: string,
+  patch: Record<string, unknown>,
+): RuntimeSessionRow | null {
+  return patchRuntimeSession(db, id, patch);
+}
+
+export function updateRuntimeSessionStatus(
+  db: Database.Database,
+  id: string,
+  status: RuntimeSessionStatus,
+  metadataPatch: Record<string, unknown> = {},
+): RuntimeSessionRow | null {
+  return patchRuntimeSession(db, id, metadataPatch, status);
 }
 
 export function heartbeatRuntimeSession(
@@ -371,11 +377,15 @@ export function appendRuntimeStreamEvent(
     event: RuntimeRunEvent;
   },
 ): RuntimeStreamEventRow {
-  const row = db
-    .prepare(`SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM runtime_stream_events WHERE turn_id = ?`)
-    .get(input.turnId) as { seq: number };
-  const seq = row.seq;
-  withSqliteRetrySync(() =>
+  // SELECT MAX(seq) + INSERT + re-fetch share one transaction so concurrent
+  // writers (daemon + dashboard) cannot compute the same seq for a turn; a
+  // busy retry re-runs the whole unit and recomputes seq instead of retrying
+  // the INSERT forever with a stale value.
+  const tx = db.transaction((): RuntimeStreamEventRow => {
+    const row = db
+      .prepare(`SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM runtime_stream_events WHERE turn_id = ?`)
+      .get(input.turnId) as { seq: number };
+    const seq = row.seq;
     db.prepare(
       `INSERT INTO runtime_stream_events
       (session_id, turn_id, workflow_id, task_id, seq, type, event_json, created_at)
@@ -389,11 +399,12 @@ export function appendRuntimeStreamEvent(
       input.event.type,
       json(input.event),
       Date.now(),
-    ),
-  );
-  return db
-    .prepare(`SELECT * FROM runtime_stream_events WHERE turn_id = ? AND seq = ?`)
-    .get(input.turnId, seq) as RuntimeStreamEventRow;
+    );
+    return db
+      .prepare(`SELECT * FROM runtime_stream_events WHERE turn_id = ? AND seq = ?`)
+      .get(input.turnId, seq) as RuntimeStreamEventRow;
+  });
+  return withSqliteRetrySync(() => tx());
 }
 
 export function completeRuntimeTurn(

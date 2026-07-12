@@ -92,6 +92,11 @@ export type BuilderConversationalOutput = z.infer<typeof BuilderConversationalOu
 const FAILURE_MODES: readonly FailureMode<BuilderConversationalOutput>[] = [
   {
     id: 'builder.no_clarification',
+    // CAUTION: this declarative detector is over-broad — it also fires for the
+    // normal confirmed-materialization case (create_orchestration legitimately
+    // has empty clarification_questions after the user approves the plan).
+    // It is not consumed by the runner today (the postHook enforces the hard
+    // rules); restrict it before wiring it into any failover path.
     detect: (output) =>
       output.action === 'create_orchestration' &&
       (output.clarification_questions == null || output.clarification_questions.length === 0),

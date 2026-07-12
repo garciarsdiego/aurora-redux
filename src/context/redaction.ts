@@ -41,7 +41,7 @@ const SECRET_TEXT_PATTERNS: Array<[RegExp, string]> = [
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{6,}\b/gi, 'Bearer ***'],
   [/\bAuthorization:\s*Basic\s+[A-Za-z0-9+/=-]+/gi, 'Authorization: Basic ***'],
   [/\bCookie:\s*[^\r\n]+/gi, 'Cookie: ***'],
-  [/\bDATABASE_URL\s*=\s*["']?[^"'\s]+/gi, 'DATABASE_URL=***'],
+  // Covers bare DATABASE_URL too — the optional prefix matches the empty string.
   [/\b[A-Z0-9_]*DATABASE_URL\s*=\s*["']?[^"'\s]+/gi, 'DATABASE_URL=***'],
   [/\b(postgres(?:ql)?:\/\/)[^\s"'@]+:[^\s"'@]+@/gi, '$1***:***@'],
   [/\b(password|passwd|pwd)\s*[:=]\s*["']?[^"'\r\n]+/gi, '$1=***'],

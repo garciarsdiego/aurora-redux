@@ -28,6 +28,9 @@ interface ModelArgs {
 const TARGETS = ['DECOMPOSER', 'TASK', 'REVIEWER', 'CONSOLIDATOR', 'ALL'] as const;
 type Target = typeof TARGETS[number];
 
+// The four role slots that map to env vars — TARGETS minus the ALL sentinel.
+const ROLE_TARGETS = TARGETS.filter((t): t is Exclude<Target, 'ALL'> => t !== 'ALL');
+
 const ENV_KEY: Readonly<Record<Exclude<Target, 'ALL'>, string>> = {
   DECOMPOSER: 'DECOMPOSER_MODEL',
   TASK: 'TASK_MODEL',
@@ -74,16 +77,14 @@ function applyOne(target: Exclude<Target, 'ALL'>, id: string): 'model' | 'execut
 
 function applyAll(id: string): 'model' | 'executor' {
   let lane: 'model' | 'executor' = 'model';
-  for (const t of TARGETS) {
-    if (t === 'ALL') continue;
+  for (const t of ROLE_TARGETS) {
     lane = applyOne(t, id);
   }
   return lane;
 }
 
 function resetAll(): void {
-  for (const t of TARGETS) {
-    if (t === 'ALL') continue;
+  for (const t of ROLE_TARGETS) {
     process.env[ENV_KEY[t]] = DEFAULT_MODEL[t];
     delete process.env[EXEC_ENV_KEY[t]];
   }
@@ -91,8 +92,7 @@ function resetAll(): void {
 
 function readCurrent(): string {
   const lines: string[] = ['Current configuration (this session):'];
-  for (const t of TARGETS) {
-    if (t === 'ALL') continue;
+  for (const t of ROLE_TARGETS) {
     const model = process.env[ENV_KEY[t]] ?? DEFAULT_MODEL[t];
     const exec = process.env[EXEC_ENV_KEY[t]];
     const execFrag = exec ? `  ▸ exec=${exec}` : '';
@@ -169,10 +169,12 @@ export const modelCommand: SlashCommand<ModelArgs> = {
       };
     }
 
-    // /model <target>  → open picker pre-targeted (uses modelProps to seed step)
+    // /model <target>  → open picker pre-targeted. The target rides along as
+    // modal props; ModalHost reads them and seeds the picker at the provider
+    // step for this role (skipping step 1).
     if (!args.model_id) {
       if (ctx.store) {
-        ctx.store.ui.pushModal('model-picker');
+        ctx.store.ui.pushModal('model-picker', { target });
         return { output: '' };
       }
       return { output: readCurrent() };

@@ -52,10 +52,7 @@ export function readFileTool(raw: unknown): string {
 
   // 1. Validação sintática preliminar para evitar vazamentos de existência fora do sandbox
   const roots = allowedRoots();
-  const isSyntacticallySafe = roots.some((root) => {
-    const rel = path.relative(root, filePath);
-    return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
-  });
+  const isSyntacticallySafe = roots.some((root) => isInside(filePath, root));
   if (!isSyntacticallySafe) {
     return JSON.stringify({
       error: `Access denied: file is outside allowed roots. Configure OMNIFORGE_READ_FILE_ALLOWLIST to permit additional directories.`,
@@ -108,6 +105,6 @@ export function readFileTool(raw: unknown): string {
     size_bytes: size,
     truncated,
     ...(truncated && { max_bytes }),
-      content,
+    content,
   });
 }

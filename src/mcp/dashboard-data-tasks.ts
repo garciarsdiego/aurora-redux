@@ -8,6 +8,7 @@
  */
 
 import type Database from 'better-sqlite3';
+import { durationMs, previewValue, safeJsonObject, taskMapKey } from './_json-utils.js';
 
 export type TaskStatus =
   | 'pending'
@@ -228,11 +229,6 @@ function emptyTaskColumns(): Record<TaskStatus, DashboardTaskCard[]> {
   }, {} as Record<TaskStatus, DashboardTaskCard[]>);
 }
 
-function durationMs(startedAt: number | null, completedAt: number | null, now: number): number | null {
-  if (!startedAt) return null;
-  return (completedAt ?? now) - startedAt;
-}
-
 function toolNameFromInput(raw: string | null, fallback: string | null): string | null {
   if (fallback) return fallback;
   if (!raw) return null;
@@ -248,29 +244,6 @@ function toolNameFromInput(raw: string | null, fallback: string | null): string 
   return null;
 }
 
-function parseJsonObject(raw: string | null): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function previewValue(raw: string | null, max = 1_000): string | null {
-  if (!raw) return null;
-  let text = raw;
-  try {
-    text = JSON.stringify(JSON.parse(raw) as unknown, null, 2);
-  } catch {
-    text = raw;
-  }
-  return text.length > max ? `${text.slice(0, max)}...` : text;
-}
-
 function parseDependsOn(raw: string | null): string[] {
   if (!raw) return [];
   try {
@@ -281,12 +254,8 @@ function parseDependsOn(raw: string | null): string[] {
   }
 }
 
-function taskMapKey(workflowId: string, taskId: string | null): string | null {
-  return taskId ? `${workflowId}::${taskId}` : null;
-}
-
 function taskCard(row: TaskRow, now: number): DashboardTaskCard {
-  const input = parseJsonObject(row.input_json);
+  const input = safeJsonObject(row.input_json);
   const executionContext = input['execution_context'];
   return {
     id: row.id,
@@ -357,6 +326,31 @@ export function queryTasks(
 }
 
 /**
+ * Shared skeleton for the queryAndAttach* helpers below: SELECT detail rows
+ * for the given workflow IDs, look the owning task card up in tasksById and
+ * push the mapped row into one of the card's detail arrays.
+ */
+function attachRowsToTasks<Row extends { workflow_id: string; task_id: string | null }, Item>(
+  db: Database.Database,
+  buildSql: (placeholders: string) => string,
+  workflowIds: string[],
+  tasksById: Map<string, DashboardTaskCard>,
+  getTarget: (task: DashboardTaskCard) => Item[],
+  mapRow: (row: Row) => Item,
+): void {
+  if (workflowIds.length === 0) return;
+  const placeholders = workflowIds.map(() => '?').join(',');
+  const rows = db.prepare(buildSql(placeholders)).all(...workflowIds) as Row[];
+  for (const row of rows) {
+    const key = taskMapKey(row.workflow_id, row.task_id);
+    if (!key) continue;
+    const task = tasksById.get(key);
+    if (!task) continue;
+    getTarget(task).push(mapRow(row));
+  }
+}
+
+/**
  * Query model calls and attach to task cards
  */
 export function queryAndAttachModelCalls(
@@ -364,22 +358,18 @@ export function queryAndAttachModelCalls(
   workflowIds: string[],
   tasksById: Map<string, DashboardTaskCard>,
 ): void {
-  if (workflowIds.length === 0) return;
-  const placeholders = workflowIds.map(() => '?').join(',');
-  const rows = db.prepare(
-    `SELECT id, workflow_id, task_id, model, provider, input_tokens, output_tokens,
-            cost_usd, latency_ms, source, created_at
-     FROM model_calls
-     WHERE workflow_id IN (${placeholders})
-     ORDER BY created_at ASC`,
-  ).all(...workflowIds) as ModelCallDetailRow[];
-  for (const row of rows) {
-    if (!row.task_id) continue;
-    const key = taskMapKey(row.workflow_id, row.task_id);
-    if (!key) continue;
-    const task = tasksById.get(key);
-    if (!task) continue;
-    task.model_calls.push({
+  attachRowsToTasks<ModelCallDetailRow, DashboardTaskModelCall>(
+    db,
+    (placeholders) =>
+      `SELECT id, workflow_id, task_id, model, provider, input_tokens, output_tokens,
+              cost_usd, latency_ms, source, created_at
+       FROM model_calls
+       WHERE workflow_id IN (${placeholders})
+       ORDER BY created_at ASC`,
+    workflowIds,
+    tasksById,
+    (task) => task.model_calls,
+    (row) => ({
       id: row.id,
       model: row.model,
       provider: row.provider,
@@ -389,8 +379,8 @@ export function queryAndAttachModelCalls(
       latency_ms: row.latency_ms,
       source: row.source,
       created_at: row.created_at,
-    });
-  }
+    }),
+  );
 }
 
 /**
@@ -401,21 +391,17 @@ export function queryAndAttachTraceSpans(
   workflowIds: string[],
   tasksById: Map<string, DashboardTaskCard>,
 ): void {
-  if (workflowIds.length === 0) return;
-  const placeholders = workflowIds.map(() => '?').join(',');
-  const rows = db.prepare(
-    `SELECT id, workflow_id, task_id, name, kind, status, started_at, ended_at, duration_ms
-     FROM trace_spans
-     WHERE workflow_id IN (${placeholders})
-     ORDER BY started_at ASC`,
-  ).all(...workflowIds) as TraceSpanDetailRow[];
-  for (const row of rows) {
-    if (!row.task_id) continue;
-    const key = taskMapKey(row.workflow_id, row.task_id);
-    if (!key) continue;
-    const task = tasksById.get(key);
-    if (!task) continue;
-    task.trace_spans.push({
+  attachRowsToTasks<TraceSpanDetailRow, DashboardTraceSpan>(
+    db,
+    (placeholders) =>
+      `SELECT id, workflow_id, task_id, name, kind, status, started_at, ended_at, duration_ms
+       FROM trace_spans
+       WHERE workflow_id IN (${placeholders})
+       ORDER BY started_at ASC`,
+    workflowIds,
+    tasksById,
+    (task) => task.trace_spans,
+    (row) => ({
       id: row.id,
       name: row.name,
       kind: row.kind,
@@ -423,8 +409,8 @@ export function queryAndAttachTraceSpans(
       started_at: row.started_at,
       ended_at: row.ended_at,
       duration_ms: row.duration_ms,
-    });
-  }
+    }),
+  );
 }
 
 /**
@@ -435,28 +421,24 @@ export function queryAndAttachArtifacts(
   workflowIds: string[],
   tasksById: Map<string, DashboardTaskCard>,
 ): void {
-  if (workflowIds.length === 0) return;
-  const placeholders = workflowIds.map(() => '?').join(',');
-  const rows = db.prepare(
-    `SELECT id, workflow_id, task_id, kind, content_path, size_bytes, created_at
-     FROM artifacts
-     WHERE workflow_id IN (${placeholders})
-     ORDER BY created_at ASC`,
-  ).all(...workflowIds) as ArtifactDetailRow[];
-  for (const row of rows) {
-    if (!row.task_id) continue;
-    const key = taskMapKey(row.workflow_id, row.task_id);
-    if (!key) continue;
-    const task = tasksById.get(key);
-    if (!task) continue;
-    task.artifacts.push({
+  attachRowsToTasks<ArtifactDetailRow, DashboardArtifact>(
+    db,
+    (placeholders) =>
+      `SELECT id, workflow_id, task_id, kind, content_path, size_bytes, created_at
+       FROM artifacts
+       WHERE workflow_id IN (${placeholders})
+       ORDER BY created_at ASC`,
+    workflowIds,
+    tasksById,
+    (task) => task.artifacts,
+    (row) => ({
       id: row.id,
       kind: row.kind,
       content_path: row.content_path,
       size_bytes: row.size_bytes,
       created_at: row.created_at,
-    });
-  }
+    }),
+  );
 }
 
 /**
@@ -467,20 +449,19 @@ export function queryAndAttachSubagentRuns(
   workflowIds: string[],
   tasksById: Map<string, DashboardTaskCard>,
 ): void {
-  if (workflowIds.length === 0) return;
-  const placeholders = workflowIds.map(() => '?').join(',');
-  const rows = db.prepare(
-    `SELECT run_id, task_id, workflow_id, parent_run_id, depth, model, task_text, status,
-            result_text, error_msg, cleanup, spawn_mode, timeout_seconds,
-            created_at, started_at, ended_at
-     FROM subagent_runs
-     WHERE workflow_id IN (${placeholders})
-     ORDER BY created_at ASC`,
-  ).all(...workflowIds) as SubagentRunDetailRow[];
-  for (const row of rows) {
-    const task = tasksById.get(`${row.workflow_id}::${row.task_id}`);
-    if (!task) continue;
-    task.subagent_runs.push({
+  attachRowsToTasks<SubagentRunDetailRow, DashboardSubagentRun>(
+    db,
+    (placeholders) =>
+      `SELECT run_id, task_id, workflow_id, parent_run_id, depth, model, task_text, status,
+              result_text, error_msg, cleanup, spawn_mode, timeout_seconds,
+              created_at, started_at, ended_at
+       FROM subagent_runs
+       WHERE workflow_id IN (${placeholders})
+       ORDER BY created_at ASC`,
+    workflowIds,
+    tasksById,
+    (task) => task.subagent_runs,
+    (row) => ({
       run_id: row.run_id,
       parent_run_id: row.parent_run_id,
       depth: row.depth,
@@ -495,8 +476,8 @@ export function queryAndAttachSubagentRuns(
       created_at: row.created_at,
       started_at: row.started_at,
       ended_at: row.ended_at,
-    });
-  }
+    }),
+  );
 }
 
 /**

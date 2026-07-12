@@ -8,6 +8,7 @@ import type { TestCase } from './framework.js';
 import type { EvaluationOutput, AgentEvaluator } from './framework.js';
 import { plannerAdvisor } from '../../advisors/planner/handler.js';
 import type { PlannerInput } from '../../advisors/planner/schema.js';
+import { estimateCost, estimateTokens } from './cost-estimation.js';
 
 export class PlannerEvaluator implements AgentEvaluator {
   /**
@@ -32,10 +33,10 @@ export class PlannerEvaluator implements AgentEvaluator {
       const duration = Date.now() - startTime;
 
       // Calculate cost (rough estimation based on model tier)
-      const cost = this.estimateCost(model, duration);
+      const cost = estimateCost(model, duration);
 
       // Calculate token usage (rough estimation)
-      const tokenUsage = this.estimateTokens(model, testCase.complexity);
+      const tokenUsage = estimateTokens(testCase.complexity);
 
       // Validate against expected output
       const validation = this.validateAgainstExpected(result.output, testCase.expectedOutput);
@@ -59,15 +60,13 @@ export class PlannerEvaluator implements AgentEvaluator {
         error: validation.isValid ? undefined : validation.error
       };
 
-    } catch (error: any) {
-      const duration = Date.now() - startTime;
-
+    } catch (error) {
       return {
         success: false,
         output: null,
         cost: 0,
         tokenUsage: 0,
-        error: error.message
+        error: error instanceof Error ? error.message : String(error)
       };
     }
   }
@@ -98,13 +97,13 @@ export class PlannerEvaluator implements AgentEvaluator {
     const validation = result.output.validation;
 
     // Step Quality - measures clarity and completeness of individual steps
-    const stepQuality = this.calculateStepQuality(plan, testCase);
+    const stepQuality = this.calculateStepQuality(plan);
 
     // Coverage - measures how well the plan covers the objective
     const coverage = this.calculateCoverage(plan, testCase.expectedOutput);
 
     // Coherence - measures logical flow between steps
-    const coherence = this.calculateCoherence(plan, testCase);
+    const coherence = this.calculateCoherence(plan);
 
     // Actionability - measures how actionable the plan is
     const actionability = this.calculateActionability(plan);
@@ -234,10 +233,10 @@ export class PlannerEvaluator implements AgentEvaluator {
 
       return { isValid: true };
 
-    } catch (error: any) {
+    } catch (error) {
       return {
         isValid: false,
-        error: `Validation error: ${error.message}`
+        error: `Validation error: ${error instanceof Error ? error.message : String(error)}`
       };
     }
   }
@@ -245,7 +244,7 @@ export class PlannerEvaluator implements AgentEvaluator {
   /**
    * Calculate step quality score
    */
-  private calculateStepQuality(plan: string, testCase: TestCase): number {
+  private calculateStepQuality(plan: string): number {
     const steps = plan.split(/\n+/).filter(s => s.trim().length > 0);
 
     if (steps.length === 0) return 0;
@@ -312,7 +311,7 @@ export class PlannerEvaluator implements AgentEvaluator {
   /**
    * Calculate coherence score
    */
-  private calculateCoherence(plan: string, testCase: TestCase): number {
+  private calculateCoherence(plan: string): number {
     const lines = plan.split(/\n+/).filter(s => s.trim().length > 0);
 
     if (lines.length < 2) return 1.0;
@@ -492,44 +491,4 @@ export class PlannerEvaluator implements AgentEvaluator {
     return checks > 0 ? score / checks : 0;
   }
 
-  /**
-   * Estimate cost based on model and duration
-   */
-  private estimateCost(model: string, duration: number): number {
-    const tier = this.getModelTier(model);
-
-    const costPerSecond = {
-      premium: 0.0001,
-      balanced: 0.00005,
-      cost: 0.00001,
-      alternative: 0.000008
-    };
-
-    const rate = costPerSecond[tier] || 0.00005;
-    return (duration / 1000) * rate;
-  }
-
-  /**
-   * Estimate token usage based on model and complexity
-   */
-  private estimateTokens(model: string, complexity: string): number {
-    const complexityMultiplier = {
-      simple: 1.0,
-      medium: 2.0,
-      complex: 4.0
-    };
-
-    const baseTokens = 1000;
-    return baseTokens * complexityMultiplier[complexity as keyof typeof complexityMultiplier];
-  }
-
-  /**
-   * Get model tier for cost estimation
-   */
-  private getModelTier(model: string): 'premium' | 'balanced' | 'cost' | 'alternative' {
-    if (model.includes('claude-opus') || model.includes('gpt-5.5')) return 'premium';
-    if (model.includes('claude-sonnet') || model.includes('kimi') || model.includes('opencode')) return 'balanced';
-    if (model.includes('gemini') || model.includes('deepseek') || model.includes('minimax')) return 'cost';
-    return 'alternative';
-  }
 }

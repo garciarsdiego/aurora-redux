@@ -51,7 +51,7 @@ import {
   type EvalRun as HarnessEvalRun,
 } from '../../v2/evals/harness.js';
 import type { Router } from './types.js';
-import { badRequest, jsonOk, notFound, readJsonBody } from './_shared.js';
+import { badRequest, jsonOk, notFound, readBodyOr400 } from './_shared.js';
 
 // ────────────────────────────────────────────────────────────────────
 //  EVAL CASES + SIMPLE RUN (Aurora EvalSuite screen)
@@ -206,120 +206,107 @@ function handleGetSimpleEvalRun(runId: string, res: ServerResponse): void {
 //  EVAL RUNS
 // ────────────────────────────────────────────────────────────────────
 
-function handleListEvalRuns(url: URL, res: ServerResponse): void {
-  const filters = ListEvalRunsFilterSchema.parse({
-    workspace: url.searchParams.get('workspace') ?? undefined,
-    agent_type: url.searchParams.get('agent_type') ?? undefined,
-    variant_id: url.searchParams.get('variant_id') ?? undefined,
-    status: url.searchParams.get('status') ?? undefined,
-    since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined,
-    until: url.searchParams.get('until') ? Number(url.searchParams.get('until')) : undefined,
-    limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
-  });
+/** Row shape shared by every SELECT over eval_runs in this file. */
+interface EvalRunRow {
+  id: string;
+  workspace: string;
+  suite_name: string;
+  status: string;
+  score: number;
+  case_count: number;
+  variant_id: string | null;
+  ab_test_id: string | null;
+  created_at: number;
+  completed_at: number | null;
+  total_cost_usd: number;
+  total_clock_ms: number;
+  agent_type: string | null;
+  metadata_json: string;
+}
 
+/** Maps an eval_runs row onto the EvalRunSummary API shape. */
+function mapEvalRunSummary(row: EvalRunRow): EvalRunSummary {
+  return {
+    id: row.id,
+    workspace: row.workspace,
+    suite_name: row.suite_name,
+    status: row.status as 'running' | 'completed' | 'failed',
+    score: row.score,
+    case_count: row.case_count,
+    variant_id: row.variant_id,
+    ab_test_id: row.ab_test_id,
+    agent_type: row.agent_type as 'decomposer' | 'planner' | 'reviewer' | null,
+    total_cost_usd: row.total_cost_usd,
+    total_clock_ms: row.total_clock_ms,
+    created_at: row.created_at,
+    completed_at: row.completed_at,
+    metadata: JSON.parse(row.metadata_json),
+  };
+}
+
+function handleListEvalRuns(url: URL, res: ServerResponse): void {
   const db = initDb(getDbPath());
   try {
-    let query = `
+    // Parse INSIDE the try so an invalid query param answers 400 instead of
+    // throwing an uncaught ZodError out of the router (contract in types.ts).
+    const filters = ListEvalRunsFilterSchema.parse({
+      workspace: url.searchParams.get('workspace') ?? undefined,
+      agent_type: url.searchParams.get('agent_type') ?? undefined,
+      variant_id: url.searchParams.get('variant_id') ?? undefined,
+      status: url.searchParams.get('status') ?? undefined,
+      since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined,
+      until: url.searchParams.get('until') ? Number(url.searchParams.get('until')) : undefined,
+      limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
+    });
+
+    // Build the filter clauses once — the paginated SELECT and the COUNT
+    // share them, so the two queries can never drift apart.
+    const conds: string[] = [];
+    const condParams: (string | number)[] = [];
+
+    if (filters.workspace) {
+      conds.push('workspace = ?');
+      condParams.push(filters.workspace);
+    }
+    if (filters.agent_type) {
+      conds.push('agent_type = ?');
+      condParams.push(filters.agent_type);
+    }
+    if (filters.variant_id) {
+      conds.push('variant_id = ?');
+      condParams.push(filters.variant_id);
+    }
+    if (filters.status) {
+      conds.push('status = ?');
+      condParams.push(filters.status);
+    }
+    if (filters.since) {
+      conds.push('created_at >= ?');
+      condParams.push(filters.since);
+    }
+    if (filters.until) {
+      conds.push('created_at <= ?');
+      condParams.push(filters.until);
+    }
+
+    const whereClause = conds.length > 0 ? ` AND ${conds.join(' AND ')}` : '';
+
+    const rows = db.prepare(`
       SELECT
         id, workspace, suite_name, status, score, case_count,
         variant_id, ab_test_id, created_at, completed_at,
         total_cost_usd, total_clock_ms, agent_type, metadata_json
       FROM eval_runs
-      WHERE 1=1
-    `;
-    const params: (string | number)[] = [];
+      WHERE 1=1${whereClause}
+      ORDER BY created_at DESC LIMIT ?
+    `).all(...condParams, filters.limit) as EvalRunRow[];
 
-    if (filters.workspace) {
-      query += ' AND workspace = ?';
-      params.push(filters.workspace);
-    }
-    if (filters.agent_type) {
-      query += ' AND agent_type = ?';
-      params.push(filters.agent_type);
-    }
-    if (filters.variant_id) {
-      query += ' AND variant_id = ?';
-      params.push(filters.variant_id);
-    }
-    if (filters.status) {
-      query += ' AND status = ?';
-      params.push(filters.status);
-    }
-    if (filters.since) {
-      query += ' AND created_at >= ?';
-      params.push(filters.since);
-    }
-    if (filters.until) {
-      query += ' AND created_at <= ?';
-      params.push(filters.until);
-    }
-
-    query += ' ORDER BY created_at DESC LIMIT ?';
-    params.push(filters.limit);
-
-    const rows = db.prepare(query).all(...params) as Array<{
-      id: string;
-      workspace: string;
-      suite_name: string;
-      status: string;
-      score: number;
-      case_count: number;
-      variant_id: string | null;
-      ab_test_id: string | null;
-      created_at: number;
-      completed_at: number | null;
-      total_cost_usd: number;
-      total_clock_ms: number;
-      agent_type: string | null;
-      metadata_json: string;
-    }>;
-
-    const runs: EvalRunSummary[] = rows.map((row) => ({
-      id: row.id,
-      workspace: row.workspace,
-      suite_name: row.suite_name,
-      status: row.status as 'running' | 'completed' | 'failed',
-      score: row.score,
-      case_count: row.case_count,
-      variant_id: row.variant_id,
-      ab_test_id: row.ab_test_id,
-      agent_type: row.agent_type as 'decomposer' | 'planner' | 'reviewer' | null,
-      total_cost_usd: row.total_cost_usd,
-      total_clock_ms: row.total_clock_ms,
-      created_at: row.created_at,
-      completed_at: row.completed_at,
-      metadata: JSON.parse(row.metadata_json),
-    }));
+    const runs: EvalRunSummary[] = rows.map(mapEvalRunSummary);
 
     // Get total count
-    let countQuery = 'SELECT COUNT(*) as total FROM eval_runs WHERE 1=1';
-    const countParams: (string | number)[] = [];
-    if (filters.workspace) {
-      countQuery += ' AND workspace = ?';
-      countParams.push(filters.workspace);
-    }
-    if (filters.agent_type) {
-      countQuery += ' AND agent_type = ?';
-      countParams.push(filters.agent_type);
-    }
-    if (filters.variant_id) {
-      countQuery += ' AND variant_id = ?';
-      countParams.push(filters.variant_id);
-    }
-    if (filters.status) {
-      countQuery += ' AND status = ?';
-      countParams.push(filters.status);
-    }
-    if (filters.since) {
-      countQuery += ' AND created_at >= ?';
-      countParams.push(filters.since);
-    }
-    if (filters.until) {
-      countQuery += ' AND created_at <= ?';
-      countParams.push(filters.until);
-    }
-
-    const countRow = db.prepare(countQuery).get(...countParams) as { total: number };
+    const countRow = db.prepare(
+      `SELECT COUNT(*) as total FROM eval_runs WHERE 1=1${whereClause}`,
+    ).get(...condParams) as { total: number };
 
     jsonOk(res, { runs, total: countRow.total });
   } catch (err) {
@@ -340,44 +327,14 @@ function handleGetEvalRun(runId: string, res: ServerResponse): void {
         total_cost_usd, total_clock_ms, agent_type, metadata_json
       FROM eval_runs
       WHERE id = ?
-    `).get(runId) as {
-      id: string;
-      workspace: string;
-      suite_name: string;
-      status: string;
-      score: number;
-      case_count: number;
-      variant_id: string | null;
-      ab_test_id: string | null;
-      created_at: number;
-      completed_at: number | null;
-      total_cost_usd: number;
-      total_clock_ms: number;
-      agent_type: string | null;
-      metadata_json: string;
-    } | undefined;
+    `).get(runId) as EvalRunRow | undefined;
 
     if (!runRow) {
       notFound(res, 'Eval run not found');
       return;
     }
 
-    const run: EvalRunSummary = {
-      id: runRow.id,
-      workspace: runRow.workspace,
-      suite_name: runRow.suite_name,
-      status: runRow.status as 'running' | 'completed' | 'failed',
-      score: runRow.score,
-      case_count: runRow.case_count,
-      variant_id: runRow.variant_id,
-      ab_test_id: runRow.ab_test_id,
-      agent_type: runRow.agent_type as 'decomposer' | 'planner' | 'reviewer' | null,
-      total_cost_usd: runRow.total_cost_usd,
-      total_clock_ms: runRow.total_clock_ms,
-      created_at: runRow.created_at,
-      completed_at: runRow.completed_at,
-      metadata: JSON.parse(runRow.metadata_json),
-    };
+    const run: EvalRunSummary = mapEvalRunSummary(runRow);
 
     // Fetch results
     const resultRows = db.prepare(`
@@ -414,27 +371,31 @@ function handleGetEvalRun(runId: string, res: ServerResponse): void {
       created_at: row.created_at,
     }));
 
-    // Fetch metric scores for each result
-    for (const result of results) {
-      const metricRows = db.prepare(`
-        SELECT
-          id, metric_name, score, threshold, passed, reason,
-          cost_usd, latency_ms, meta_json
-        FROM eval_metric_scores
-        WHERE result_id = ?
-      `).all(result.id) as Array<{
-        id: string;
-        metric_name: string;
-        score: number;
-        threshold: number;
-        passed: number;
-        reason: string | null;
-        cost_usd: number;
-        latency_ms: number;
-        meta_json: string;
-      }>;
+    // Fetch metric scores for all results in ONE query (same JOIN shape as
+    // handleGetEvalRunMetrics) and group in memory — avoids N+1 per result.
+    const metricRows = db.prepare(`
+      SELECT
+        ems.id, ems.result_id, ems.metric_name, ems.score, ems.threshold,
+        ems.passed, ems.reason, ems.cost_usd, ems.latency_ms, ems.meta_json
+      FROM eval_metric_scores ems
+      INNER JOIN eval_results er ON ems.result_id = er.id
+      WHERE er.run_id = ?
+    `).all(runId) as Array<{
+      id: string;
+      result_id: string;
+      metric_name: string;
+      score: number;
+      threshold: number;
+      passed: number;
+      reason: string | null;
+      cost_usd: number;
+      latency_ms: number;
+      meta_json: string;
+    }>;
 
-      result.metric_scores = metricRows.map((m) => ({
+    const scoresByResult = new Map<string, MetricScoreDetail[]>();
+    for (const m of metricRows) {
+      const detail: MetricScoreDetail = {
         id: m.id,
         metric_name: m.metric_name,
         score: m.score,
@@ -444,7 +405,14 @@ function handleGetEvalRun(runId: string, res: ServerResponse): void {
         cost_usd: m.cost_usd,
         latency_ms: m.latency_ms,
         meta: JSON.parse(m.meta_json),
-      }));
+      };
+      const list = scoresByResult.get(m.result_id);
+      if (list) list.push(detail);
+      else scoresByResult.set(m.result_id, [detail]);
+    }
+
+    for (const result of results) {
+      result.metric_scores = scoresByResult.get(result.id) ?? [];
     }
 
     // Calculate per-metric summary
@@ -585,16 +553,17 @@ function handleGetEvalRunMetrics(runId: string, res: ServerResponse): void {
 // ────────────────────────────────────────────────────────────────────
 
 function handleListABTests(url: URL, res: ServerResponse): void {
-  const filters = ListABTestsFilterSchema.parse({
-    workspace: url.searchParams.get('workspace') ?? undefined,
-    variant_id: url.searchParams.get('variant_id') ?? undefined,
-    since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined,
-    until: url.searchParams.get('until') ? Number(url.searchParams.get('until')) : undefined,
-    limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
-  });
-
   const db = initDb(getDbPath());
   try {
+    // Parse inside the try — invalid params answer 400, never throw uncaught.
+    const filters = ListABTestsFilterSchema.parse({
+      workspace: url.searchParams.get('workspace') ?? undefined,
+      variant_id: url.searchParams.get('variant_id') ?? undefined,
+      since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined,
+      until: url.searchParams.get('until') ? Number(url.searchParams.get('until')) : undefined,
+      limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
+    });
+
     let query = `
       SELECT
         ab.id, ab.workspace, ab.variant_a_id, ab.variant_b_id,
@@ -736,14 +705,14 @@ function handleGetABTest(testId: string, res: ServerResponse): void {
              variant_id, ab_test_id, created_at, completed_at,
              total_cost_usd, total_clock_ms, agent_type, metadata_json
       FROM eval_runs WHERE id = ?
-    `).get(testRow.run_a_id);
+    `).get(testRow.run_a_id) as EvalRunRow | undefined;
 
     const runBRow = db.prepare(`
       SELECT id, workspace, suite_name, status, score, case_count,
              variant_id, ab_test_id, created_at, completed_at,
              total_cost_usd, total_clock_ms, agent_type, metadata_json
       FROM eval_runs WHERE id = ?
-    `).get(testRow.run_b_id);
+    `).get(testRow.run_b_id) as EvalRunRow | undefined;
 
     if (!runARow || !runBRow) {
       notFound(res, 'One or both runs not found');
@@ -753,43 +722,13 @@ function handleGetABTest(testId: string, res: ServerResponse): void {
     const details: ABTestDetails = {
       test,
       run_a: {
-        run: {
-          id: (runARow as any).id,
-          workspace: (runARow as any).workspace,
-          suite_name: (runARow as any).suite_name,
-          status: (runARow as any).status,
-          score: (runARow as any).score,
-          case_count: (runARow as any).case_count,
-          variant_id: (runARow as any).variant_id,
-          ab_test_id: (runARow as any).ab_test_id,
-          agent_type: (runARow as any).agent_type,
-          total_cost_usd: (runARow as any).total_cost_usd,
-          total_clock_ms: (runARow as any).total_clock_ms,
-          created_at: (runARow as any).created_at,
-          completed_at: (runARow as any).completed_at,
-          metadata: JSON.parse((runARow as any).metadata_json),
-        },
+        run: mapEvalRunSummary(runARow),
         results: [],
         per_metric_summary: {},
         events: [],
       },
       run_b: {
-        run: {
-          id: (runBRow as any).id,
-          workspace: (runBRow as any).workspace,
-          suite_name: (runBRow as any).suite_name,
-          status: (runBRow as any).status,
-          score: (runBRow as any).score,
-          case_count: (runBRow as any).case_count,
-          variant_id: (runBRow as any).variant_id,
-          ab_test_id: (runBRow as any).ab_test_id,
-          agent_type: (runBRow as any).agent_type,
-          total_cost_usd: (runBRow as any).total_cost_usd,
-          total_clock_ms: (runBRow as any).total_clock_ms,
-          created_at: (runBRow as any).created_at,
-          completed_at: (runBRow as any).completed_at,
-          metadata: JSON.parse((runBRow as any).metadata_json),
-        },
+        run: mapEvalRunSummary(runBRow),
         results: [],
         per_metric_summary: {},
         events: [],
@@ -809,15 +748,16 @@ function handleGetABTest(testId: string, res: ServerResponse): void {
 // ────────────────────────────────────────────────────────────────────
 
 function handleListVariants(url: URL, res: ServerResponse): void {
-  const filters = ListVariantsFilterSchema.parse({
-    workspace: url.searchParams.get('workspace') ?? undefined,
-    component: url.searchParams.get('component') ?? undefined,
-    active_only: url.searchParams.get('active_only') === 'true',
-    limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
-  });
-
   const db = initDb(getDbPath());
   try {
+    // Parse inside the try — invalid params answer 400, never throw uncaught.
+    const filters = ListVariantsFilterSchema.parse({
+      workspace: url.searchParams.get('workspace') ?? undefined,
+      component: url.searchParams.get('component') ?? undefined,
+      active_only: url.searchParams.get('active_only') === 'true',
+      limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
+    });
+
     let query = `
       SELECT
         pv.id, pv.workspace, pv.component, pv.name, pv.parent_id, pv.created_at,
@@ -872,10 +812,12 @@ function handleListVariants(url: URL, res: ServerResponse): void {
 }
 
 function handleActivateVariant(variantId: string, body: unknown, res: ServerResponse): void {
-  const input = ActivateVariantRequestSchema.parse(body);
-
   const db = initDb(getDbPath());
   try {
+    // Validate-only parse (the schema carries no fields we consume here);
+    // inside the try so an invalid body answers 400, never throws uncaught.
+    ActivateVariantRequestSchema.parse(body);
+
     // Verify variant exists
     const variant = db.prepare(`
       SELECT id, workspace, component FROM eval_prompt_variants WHERE id = ?
@@ -912,17 +854,18 @@ function handleActivateVariant(variantId: string, body: unknown, res: ServerResp
 // ────────────────────────────────────────────────────────────────────
 
 function handleListOptimizations(url: URL, res: ServerResponse): void {
-  const filters = ListOptimizationsFilterSchema.parse({
-    workspace: url.searchParams.get('workspace') ?? undefined,
-    strategy: url.searchParams.get('strategy') ?? undefined,
-    status: url.searchParams.get('status') ?? undefined,
-    since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined,
-    until: url.searchParams.get('until') ? Number(url.searchParams.get('until')) : undefined,
-    limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
-  });
-
   const db = initDb(getDbPath());
   try {
+    // Parse inside the try — invalid params answer 400, never throw uncaught.
+    const filters = ListOptimizationsFilterSchema.parse({
+      workspace: url.searchParams.get('workspace') ?? undefined,
+      strategy: url.searchParams.get('strategy') ?? undefined,
+      status: url.searchParams.get('status') ?? undefined,
+      since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined,
+      until: url.searchParams.get('until') ? Number(url.searchParams.get('until')) : undefined,
+      limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : 50,
+    });
+
     let query = `
       SELECT
         id, workspace, base_variant_id, strategy, target_metric,
@@ -1127,13 +1070,8 @@ export const dashboardEvalsRouter: Router = async (req, url, res) => {
   // Run a suite (light EvalRun shape). Exact pathname + POST so it cannot be
   // swallowed by the GET /evals/runs list handler (different segment + method).
   if (req.method === 'POST' && url.pathname === '/api/dashboard/evals/run') {
-    let body: unknown;
-    try {
-      body = await readJsonBody(req);
-    } catch (err) {
-      badRequest(res, err instanceof Error ? err.message : String(err));
-      return true;
-    }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleRunEvalSuite(body, res);
     return true;
   }
@@ -1171,13 +1109,10 @@ export const dashboardEvalsRouter: Router = async (req, url, res) => {
   }
   if (req.method === 'POST' && url.pathname.match(/^\/api\/dashboard\/evals\/variants\/[^/]+\/activate$/)) {
     const variantId = url.pathname.split('/')[5];
-    let body: unknown;
-    try {
-      body = await new Response(req as unknown as BodyInit).json();
-    } catch {
-      badRequest(res, 'Invalid JSON body');
-      return true;
-    }
+    // readBodyOr400 (256 KB cap) — the previous `new Response(req).json()`
+    // bypassed the shared buffer-bomb protection.
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleActivateVariant(variantId!, body, res);
     return true;
   }

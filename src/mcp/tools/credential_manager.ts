@@ -6,8 +6,13 @@
 
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type {
+  CredentialAuditLog,
+  CredentialMetadata,
   CredentialProvider,
   CredentialProviderConfig,
+  CredentialSyncStatus,
+  CredentialType,
+  DecryptedCredential,
   OmniRouteSyncConfig,
 } from '../../v2/credentials/index.js';
 import {
@@ -295,33 +300,100 @@ export const omniforge_credential_validate_routing: Tool = {
 };
 
 /**
- * Tool handlers
+ * Handler argument shapes — mirror the inputSchema of each tool above.
+ * Handlers accept `unknown` (the MCP server forwards raw request arguments)
+ * and narrow via cast, so a typo like `args.credential_id` vs `args.id`
+ * no longer compiles silently.
  */
-export async function handleCredentialCreate(args: any): Promise<any> {
-  const { provider } = initializeCredentialManagement();
-  const credential = await provider.createCredential(
-    args.name,
-    args.service,
-    args.type,
-    args.value,
-    args.tags || [],
-  );
+interface CredentialCreateArgs {
+  name: string;
+  service: string;
+  type: CredentialType;
+  value: string;
+  tags?: string[];
+}
+
+interface CredentialIdArgs {
+  id: string;
+}
+
+interface CredentialServiceArgs {
+  service: string;
+}
+
+interface CredentialUpdateArgs {
+  id: string;
+  value?: string;
+  name?: string;
+  tags?: string[];
+}
+
+interface CredentialRotateArgs {
+  id: string;
+  new_value: string;
+}
+
+interface CredentialSyncArgs {
+  credential_id?: string;
+}
+
+/** Metadata-only serialization (no secret value) shared by all handlers. */
+function serializeCredentialMetadata(metadata: CredentialMetadata) {
   return {
-    success: true,
-    credential: {
-      id: credential.metadata.id,
-      name: credential.metadata.name,
-      service: credential.metadata.service,
-      type: credential.metadata.type,
-      created_at: credential.metadata.created_at,
-      tags: credential.metadata.tags,
-    },
+    id: metadata.id,
+    name: metadata.name,
+    service: metadata.service,
+    type: metadata.type,
+    created_at: metadata.created_at,
+    updated_at: metadata.updated_at,
+    tags: metadata.tags,
+    version: metadata.version,
   };
 }
 
-export async function handleCredentialGet(args: any): Promise<any> {
+type SerializedCredentialMetadata = ReturnType<typeof serializeCredentialMetadata>;
+type SerializedCredential = SerializedCredentialMetadata & { value?: string };
+
+/** Serializes a credential; `includeValue` appends the decrypted value. */
+function serializeCredential(
+  credential: DecryptedCredential,
+  opts: { includeValue?: boolean } = {},
+): SerializedCredential {
+  return {
+    ...serializeCredentialMetadata(credential.metadata),
+    ...(opts.includeValue ? { value: credential.value } : {}),
+  };
+}
+
+interface CredentialResult {
+  success: boolean;
+  credential?: SerializedCredential;
+  error?: string;
+}
+
+interface CredentialSyncResult {
+  success: boolean;
+  status?: CredentialSyncStatus;
+  statuses?: CredentialSyncStatus[];
+}
+
+/**
+ * Tool handlers
+ */
+export async function handleCredentialCreate(args: unknown): Promise<CredentialResult> {
+  const { name, service, type, value, tags } = args as CredentialCreateArgs;
   const { provider } = initializeCredentialManagement();
-  const credential = await provider.getCredential(args.id);
+  const credential = await provider.createCredential(name, service, type, value, tags || []);
+  return {
+    success: true,
+    credential: serializeCredential(credential),
+  };
+}
+
+export async function handleCredentialGet(args: unknown): Promise<CredentialResult> {
+  const { id } = args as CredentialIdArgs;
+  const { provider } = initializeCredentialManagement();
+  const credential = await provider.getCredential(id);
 
   if (!credential) {
     return {
@@ -332,23 +404,14 @@ export async function handleCredentialGet(args: any): Promise<any> {
 
   return {
     success: true,
-    credential: {
-      id: credential.metadata.id,
-      name: credential.metadata.name,
-      service: credential.metadata.service,
-      type: credential.metadata.type,
-      value: credential.value, // Decrypted value
-      created_at: credential.metadata.created_at,
-      updated_at: credential.metadata.updated_at,
-      tags: credential.metadata.tags,
-      version: credential.metadata.version,
-    },
+    credential: serializeCredential(credential, { includeValue: true }),
   };
 }
 
-export async function handleCredentialGetByService(args: any): Promise<any> {
+export async function handleCredentialGetByService(args: unknown): Promise<CredentialResult> {
+  const { service } = args as CredentialServiceArgs;
   const { provider } = initializeCredentialManagement();
-  const credential = await provider.getCredentialByService(args.service);
+  const credential = await provider.getCredentialByService(service);
 
   if (!credential) {
     return {
@@ -359,66 +422,52 @@ export async function handleCredentialGetByService(args: any): Promise<any> {
 
   return {
     success: true,
-    credential: {
-      id: credential.metadata.id,
-      name: credential.metadata.name,
-      service: credential.metadata.service,
-      type: credential.metadata.type,
-      value: credential.value,
-      created_at: credential.metadata.created_at,
-      updated_at: credential.metadata.updated_at,
-      tags: credential.metadata.tags,
-      version: credential.metadata.version,
-    },
+    credential: serializeCredential(credential, { includeValue: true }),
   };
 }
 
-export async function handleCredentialList(args: any): Promise<any> {
+export async function handleCredentialList(_args: unknown): Promise<{
+  success: boolean;
+  credentials: SerializedCredentialMetadata[];
+}> {
   const { provider } = initializeCredentialManagement();
   const credentials = await provider.listCredentials();
 
   return {
     success: true,
-    credentials: credentials.map((c) => ({
-      id: c.id,
-      name: c.name,
-      service: c.service,
-      type: c.type,
-      created_at: c.created_at,
-      updated_at: c.updated_at,
-      tags: c.tags,
-      version: c.version,
-    })),
+    credentials: credentials.map(serializeCredentialMetadata),
   };
 }
 
-export async function handleCredentialUpdate(args: any): Promise<any> {
+export async function handleCredentialUpdate(args: unknown): Promise<CredentialResult> {
+  const { id, value, name, tags } = args as CredentialUpdateArgs;
   const { provider } = initializeCredentialManagement();
-  const updates: any = {};
+  const updates: { value?: string; metadata?: Partial<CredentialMetadata> } = {};
 
-  if (args.value !== undefined) updates.value = args.value;
-  if (args.name !== undefined) updates.metadata = { name: args.name };
-  if (args.tags !== undefined) updates.metadata = { ...updates.metadata, tags: args.tags };
+  if (value !== undefined) updates.value = value;
+  if (name !== undefined) updates.metadata = { name };
+  if (tags !== undefined) updates.metadata = { ...updates.metadata, tags };
 
-  const credential = await provider.updateCredential(args.id, updates);
+  // Partial metadata is safe: updateCredential spreads it over the stored
+  // metadata and preserves id/created_at/version server-side.
+  const credential = await provider.updateCredential(
+    id,
+    updates as Partial<Pick<DecryptedCredential, 'value' | 'metadata'>>,
+  );
 
   return {
     success: true,
-    credential: {
-      id: credential.metadata.id,
-      name: credential.metadata.name,
-      service: credential.metadata.service,
-      type: credential.metadata.type,
-      updated_at: credential.metadata.updated_at,
-      tags: credential.metadata.tags,
-      version: credential.metadata.version,
-    },
+    credential: serializeCredential(credential),
   };
 }
 
-export async function handleCredentialDelete(args: any): Promise<any> {
+export async function handleCredentialDelete(args: unknown): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  const { id } = args as CredentialIdArgs;
   const { provider } = initializeCredentialManagement();
-  await provider.deleteCredential(args.id);
+  await provider.deleteCredential(id);
 
   return {
     success: true,
@@ -426,30 +475,23 @@ export async function handleCredentialDelete(args: any): Promise<any> {
   };
 }
 
-export async function handleCredentialRotate(args: any): Promise<any> {
+export async function handleCredentialRotate(args: unknown): Promise<CredentialResult> {
+  const { id, new_value } = args as CredentialRotateArgs;
   const { provider } = initializeCredentialManagement();
-  const credential = await provider.rotateCredential(args.id, args.new_value);
+  const credential = await provider.rotateCredential(id, new_value);
 
   return {
     success: true,
-    credential: {
-      id: credential.metadata.id,
-      name: credential.metadata.name,
-      service: credential.metadata.service,
-      type: credential.metadata.type,
-      created_at: credential.metadata.created_at,
-      updated_at: credential.metadata.updated_at,
-      tags: credential.metadata.tags,
-      version: credential.metadata.version,
-    },
+    credential: serializeCredential(credential),
   };
 }
 
-export async function handleCredentialSync(args: any): Promise<any> {
+export async function handleCredentialSync(args: unknown): Promise<CredentialSyncResult> {
+  const { credential_id } = args as CredentialSyncArgs;
   const { sync } = initializeCredentialManagement();
 
-  if (args.credential_id) {
-    const status = await sync.syncCredential(args.credential_id);
+  if (credential_id) {
+    const status = await sync.syncCredential(credential_id);
     return {
       success: true,
       status,
@@ -464,11 +506,12 @@ export async function handleCredentialSync(args: any): Promise<any> {
   }
 }
 
-export async function handleCredentialSyncStatus(args: any): Promise<any> {
+export async function handleCredentialSyncStatus(args: unknown): Promise<CredentialSyncResult> {
+  const { credential_id } = args as CredentialSyncArgs;
   const { sync } = initializeCredentialManagement();
 
-  if (args.credential_id) {
-    const status = sync.getSyncStatus(args.credential_id);
+  if (credential_id) {
+    const status = sync.getSyncStatus(credential_id);
     return {
       success: true,
       status,
@@ -482,7 +525,10 @@ export async function handleCredentialSyncStatus(args: any): Promise<any> {
   }
 }
 
-export async function handleCredentialAuditLog(args: any): Promise<any> {
+export async function handleCredentialAuditLog(_args: unknown): Promise<{
+  success: boolean;
+  audit_log: CredentialAuditLog[];
+}> {
   const { provider } = initializeCredentialManagement();
   const auditLog = provider.getAuditLog();
 
@@ -492,7 +538,10 @@ export async function handleCredentialAuditLog(args: any): Promise<any> {
   };
 }
 
-export async function handleCredentialValidateRouting(args: any): Promise<any> {
+export async function handleCredentialValidateRouting(_args: unknown): Promise<{
+  success: boolean;
+  validation: { omniroute: boolean; telegram: boolean; overall: boolean };
+}> {
   const { routingManager } = initializeCredentialManagement();
   const validation = await routingManager.validateRoutingCredentials();
 

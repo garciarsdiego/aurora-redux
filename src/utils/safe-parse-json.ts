@@ -78,6 +78,26 @@ export function safeParseJson<T = unknown>(
   }
 }
 
+/**
+ * Tolerant object variant: parse `raw` and return it ONLY when it is a plain
+ * JSON object; `{}` on absence, parse failure, or any non-object value.
+ *
+ * Consolidates the identical private helpers that used to live in
+ * execution-context.ts (parseTaskInput) and workspace-profile.ts
+ * (safeJsonObject). Routes through {@link safeParseJson} so callers that DO
+ * have a workflow context can pass `ctx` and get the audit event for free;
+ * without `ctx` it degrades to the silent `{}` fallback those helpers had.
+ */
+export function safeJsonObject(
+  raw: string | null | undefined,
+  ctx?: SafeParseJsonContext,
+): Record<string, unknown> {
+  const parsed = safeParseJson<unknown>(raw, ctx ?? { where: 'safe_json_object' });
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
+}
+
 function emitMalformedEvent(
   ctx: SafeParseJsonContext,
   errorMessage: string,

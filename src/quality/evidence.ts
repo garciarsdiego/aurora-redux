@@ -5,6 +5,7 @@ import type { QualityEvidenceRef, TaskQualityEvidenceBundle } from './types.js';
 import type { Task, Workflow } from '../types/index.js';
 import { verifyAcceptanceArtifacts } from '../v2/agents/validators/filesystem.js';
 import { redactContextJson, redactContextText } from '../context/redaction.js';
+import { safeParseJson, tableExists } from './internal-utils.js';
 
 interface TaskRow extends Omit<Task, 'depends_on' | 'kind' | 'status' | 'hitl'> {
   depends_on_json: string | null;
@@ -21,25 +22,6 @@ function rowToTask(row: TaskRow): Task {
     depends_on: row.depends_on_json ? (JSON.parse(row.depends_on_json) as string[]) : [],
     hitl: Boolean(row.hitl),
   };
-}
-
-function tableExists(db: Database.Database, table: string): boolean {
-  const row = db
-    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
-    .get(table) as { name: string } | undefined;
-  return row?.name === table;
-}
-
-function safeParseJson(raw: string | null | undefined): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
 }
 
 function optionalPath(value: unknown): string | null {

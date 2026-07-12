@@ -279,9 +279,10 @@ export class SchemaMatchJudge implements Judge {
           shape[key] = this.buildZodSchema(value as Record<string, unknown>);
         }
 
-        const required = Array.isArray(def.required) ? def.required as string[] : [];
-        for (const key of required) {
-          if (shape[key]) {
+        // Keys not listed in `required` are optional (JSON Schema semantics).
+        const required = new Set(Array.isArray(def.required) ? def.required as string[] : []);
+        for (const key of Object.keys(shape)) {
+          if (!required.has(key)) {
             shape[key] = shape[key].optional();
           }
         }

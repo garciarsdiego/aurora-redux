@@ -9,6 +9,7 @@
 
 import type Database from 'better-sqlite3';
 import { workspaceProfileFromRow, type WorkspaceProfile } from '../utils/workspace-profile.js';
+import { durationMs } from './_json-utils.js';
 
 export type WorkflowStatus =
   | 'pending'
@@ -91,11 +92,6 @@ function emptyWorkflowColumns(): Record<WorkflowStatus, DashboardWorkflowCard[]>
     acc[status] = [];
     return acc;
   }, {} as Record<WorkflowStatus, DashboardWorkflowCard[]>);
-}
-
-function durationMs(startedAt: number | null, completedAt: number | null, now: number): number | null {
-  if (!startedAt) return null;
-  return (completedAt ?? now) - startedAt;
 }
 
 function countByStatus(tasks: Array<{ status: string }>): Record<string, number> {

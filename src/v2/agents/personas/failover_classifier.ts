@@ -18,8 +18,7 @@
 import { z } from 'zod';
 
 import { DagTaskSchema } from '../../../types/schemas.js';
-import { ModelEntrySchema, pickAlternativeModel } from './decomposer.js';
-import { KNOWN_CLIS } from './decomposer.js';
+import { KNOWN_CLIS, ModelEntrySchema, pickAlternativeModel } from './decomposer.js';
 import type { AgentPersona, FailureMode, PostHookResult, RemediationStrategy } from '../types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,7 +91,7 @@ const KNOWN_PATTERNS: readonly KnownPattern[] = [
   {
     id: 'worker.described_without_writing',
     match: (e) => e.mode === 'worker.described_without_writing' || /described_without_writing/i.test(e.type),
-    build: (input) => ({
+    build: () => ({
       strategy: 'retry_with_stronger_prompt',
       mutations: [
         {
@@ -196,10 +195,7 @@ const KNOWN_PATTERNS: readonly KnownPattern[] = [
   },
   {
     id: 'worker.timeout_first',
-    match: (e) =>
-      (e.mode === 'worker.timeout' || /\btimeout\b/i.test(e.type)) &&
-      // First-time only — handled by preHook checking retry_count separately.
-      true,
+    match: (e) => e.mode === 'worker.timeout' || /\btimeout\b/i.test(e.type),
     build: (input) => {
       const oldTimeout = input.task.timeout_seconds ?? 600;
       const newTimeout = Math.min(1800, Math.round(oldTimeout * 1.5));
@@ -374,7 +370,8 @@ export const FAILOVER_CLASSIFIER_PERSONA: AgentPersona<FailoverClassifierInput, 
 
     // 2. Known-pattern shortcuts — skip the LLM call when we have a canonical fix.
     for (const pattern of KNOWN_PATTERNS) {
-      // Skip the timeout-first shortcut after the first attempt
+      // Skip the timeout-first shortcut after the first attempt — the
+      // "first-time only" half of that pattern lives here, not in its match().
       if (pattern.id === 'worker.timeout_first' && input.retry_count > 0) continue;
       if (pattern.match(input.failure_event)) {
         ctx.emit('failover_shortcut', {

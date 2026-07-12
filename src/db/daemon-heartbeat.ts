@@ -47,8 +47,8 @@ export function writeDaemonHeartbeat(
   now = Date.now(),
   pid = process.pid,
 ): DaemonHeartbeatPayload {
-  const payload: DaemonHeartbeatPayload = { pid, alive_at: now };
-  setDaemonState(db, DAEMON_HEARTBEAT_KEY, payload as unknown as Record<string, unknown>, now);
+  const payload = { pid, alive_at: now } satisfies DaemonHeartbeatPayload;
+  setDaemonState(db, DAEMON_HEARTBEAT_KEY, payload, now);
   return payload;
 }
 

@@ -42,6 +42,7 @@ export class RuntimeManager {
     request: RuntimeTurnRequest,
     adapter: (context: RuntimeTurnContext) => Promise<string>,
   ): Promise<string> {
+    const runtimeMode = request.runtimeMode ?? 'oneshot';
     const session = createRuntimeSession(this.db, {
       workflowId: request.workflowId,
       taskId: request.taskId,
@@ -49,7 +50,7 @@ export class RuntimeManager {
       protocolTier: request.protocolTier,
       streamFormat: request.streamFormat,
       nativeSessionId: request.nativeSessionId,
-      runtimeMode: request.runtimeMode ?? 'oneshot',
+      runtimeMode,
       workspacePath: request.workspacePath,
       fallbackReason: request.fallbackReason,
       approvalStatus: request.approvalStatus,
@@ -84,25 +85,26 @@ export class RuntimeManager {
       raw: {
         protocolTier: request.protocolTier,
         streamFormat: request.streamFormat,
-        runtimeMode: request.runtimeMode ?? 'oneshot',
+        runtimeMode,
         fallbackReason: request.fallbackReason ?? null,
       },
     });
 
     try {
       const result = await adapter({ session, turn, emit });
+      const resultSummary = result.slice(0, 500);
       emit({
         type: 'runtime.result',
         ts: Date.now(),
         executorId: request.executorId,
         sessionId: session.id,
         turnId: turn.id,
-        text: result.slice(0, 500),
+        text: resultSummary,
         result: { chars: result.length },
       });
       completeRuntimeTurn(this.db, turn.id, {
         status: 'completed',
-        resultSummary: result.slice(0, 500),
+        resultSummary,
       });
       return result;
     } catch (err) {

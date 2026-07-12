@@ -26,6 +26,7 @@ import { getBootResult } from './bootstrap.js';
 import { useReplStore } from './state/store.js';
 import { appendOutput } from './state/outputBuffer.js';
 import { useSession, useGateHead, useUi } from './state/hooks.js';
+import { errorMessage } from './utils/errors.js';
 import type { ReplCtx, SlashCommand } from './commands/types.js';
 
 export interface AppProps {
@@ -229,8 +230,7 @@ async function dispatchSlash(
       process.exit(result.exitCode);
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    appendOutput(`Command error: ${msg}`, 'error');
+    appendOutput(`Command error: ${errorMessage(err)}`, 'error');
   }
 }
 

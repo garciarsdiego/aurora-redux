@@ -10,13 +10,10 @@ import type {
   Advisor,
   AdvisorContext,
   AdvisorResult,
-  StepwiseAdvisorContext,
   StepwiseAdvisorResult,
 } from '../types.js';
-import { appendStep, ensureConversation, getHistory } from '../shared/conversationMemory.js';
 import { shouldUseStepwiseMemory } from '../shared/mode.js';
-import { extractContinueFocus, formatStepHistoryBlock } from '../shared/stepwisePrompt.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
+import { runStepwiseAdvisor, type StepwisePromptExtras } from '../shared/stepwisePrompt.js';
 import { ThinkDeepInputSchema, type ThinkDeepInput } from './schema.js';
 import { THINKDEEP_SYSTEM_PROMPT } from './prompt.js';
 
@@ -25,10 +22,7 @@ const DESCRIPTION =
   'Use for architecture decisions, complex bugs, performance challenges, and security analysis. ' +
   'Provides systematic hypothesis testing, evidence-based investigation, and expert validation.';
 
-export interface ThinkDeepPromptExtras {
-  priorOutputsBlock?: string;
-  trackedFindingsLines?: string;
-}
+export type ThinkDeepPromptExtras = StepwisePromptExtras;
 
 function buildUserPrompt(parsed: ThinkDeepInput, extras?: ThinkDeepPromptExtras): string {
   const lines: string[] = [];
@@ -47,6 +41,8 @@ function buildUserPrompt(parsed: ThinkDeepInput, extras?: ThinkDeepPromptExtras)
 
   lines.push(`=== THINKING STEP ${parsed.step_number} of ${parsed.total_steps} ===`);
   lines.push(`Confidence: ${parsed.confidence}`);
+  // Schema accepts thinking_mode — surface it to the model instead of silently dropping it.
+  if (parsed.thinking_mode) lines.push(`Thinking mode: ${parsed.thinking_mode}`);
   lines.push(`Next step required: ${parsed.next_step_required}`);
 
   if (parsed.problem_context) {
@@ -112,43 +108,13 @@ export const thinkdeepAdvisor: Advisor = {
   isStepwise: true,
   async run(ctx: AdvisorContext, args: unknown): Promise<AdvisorResult | StepwiseAdvisorResult> {
     const parsed = ThinkDeepInputSchema.parse(args);
-    const stepCtx = ctx as StepwiseAdvisorContext;
-    const useStepwiseMemory = shouldUseStepwiseMemory(ctx, args);
-
-    let extras: ThinkDeepPromptExtras | undefined;
-    if (useStepwiseMemory && stepCtx.step != null) {
-      ensureConversation(stepCtx.step.conversationId, 'thinkdeep', ctx.workspace);
-      const priorOutputsBlock = formatStepHistoryBlock(getHistory(stepCtx.step.conversationId));
-      const trackedFindingsLines =
-        stepCtx.step.findings.length > 0 ? stepCtx.step.findings.map((f) => `- ${f}`).join('\n') : undefined;
-      extras = { priorOutputsBlock, trackedFindingsLines };
-    }
-
-    const userPrompt = buildUserPrompt(parsed, extras);
-    const text = await callOmniroute({
+    return runStepwiseAdvisor(ctx, {
+      advisorName: 'thinkdeep',
       systemPrompt: THINKDEEP_SYSTEM_PROMPT,
-      userPrompt,
-      model: 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      useStepwiseMemory: shouldUseStepwiseMemory(ctx, args),
+      buildUserPrompt: (extras) => buildUserPrompt(parsed, extras),
+      // Schema accepts temperature — forward it instead of silently pinning the default.
+      ...(parsed.temperature !== undefined ? { temperature: parsed.temperature } : {}),
     });
-
-    if (useStepwiseMemory && stepCtx.step != null) {
-      appendStep(stepCtx.step.conversationId, stepCtx.step.stepNumber, text);
-    }
-
-    const focus = extractContinueFocus(text);
-    if (
-      useStepwiseMemory &&
-      stepCtx.step != null &&
-      stepCtx.step.stepNumber < stepCtx.step.totalSteps &&
-      focus
-    ) {
-      return {
-        output: text,
-        nextStep: { stepNumber: stepCtx.step.stepNumber + 1, request: focus },
-      };
-    }
-
-    return { output: text };
   },
 };

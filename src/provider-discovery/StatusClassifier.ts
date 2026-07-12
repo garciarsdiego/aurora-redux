@@ -4,6 +4,7 @@
  */
 
 import { ProviderHealthStatus } from './ProviderHealthChecker.js';
+import { groupBy } from './internal.js';
 
 export interface AvailabilityReport {
   timestamp: number;
@@ -76,16 +77,7 @@ export class StatusClassifier {
   }
   
   private groupByProvider(results: ProviderHealthStatus[]): Record<string, ProviderHealthStatus[]> {
-    const byProvider: Record<string, ProviderHealthStatus[]> = {};
-    
-    for (const result of results) {
-      if (!byProvider[result.provider]) {
-        byProvider[result.provider] = [];
-      }
-      byProvider[result.provider].push(result);
-    }
-    
-    return byProvider;
+    return groupBy(results, r => r.provider);
   }
   
   private extractAvailable(results: ProviderHealthStatus[], byProvider: Record<string, ProviderHealthStatus[]>) {
@@ -113,55 +105,48 @@ export class StatusClassifier {
   
   private extractUnavailable(results: ProviderHealthStatus[]) {
     const unavailable = results.filter(r => r.status !== 'available');
-    
+
+    const bucket = (status: ProviderHealthStatus['status']) => {
+      const details = unavailable.filter(r => r.status === status);
+      return {
+        providers: new Set(details.map(r => r.provider)).size,
+        models: details.length,
+        details
+      };
+    };
+
     return {
-      no_credits: {
-        providers: new Set(unavailable.filter(r => r.status === 'no_credits').map(r => r.provider)).size,
-        models: unavailable.filter(r => r.status === 'no_credits').length,
-        details: unavailable.filter(r => r.status === 'no_credits')
-      },
-      no_credentials: {
-        providers: new Set(unavailable.filter(r => r.status === 'no_credentials').map(r => r.provider)).size,
-        models: unavailable.filter(r => r.status === 'no_credentials').length,
-        details: unavailable.filter(r => r.status === 'no_credentials')
-      },
-      error: {
-        providers: new Set(unavailable.filter(r => r.status === 'error').map(r => r.provider)).size,
-        models: unavailable.filter(r => r.status === 'error').length,
-        details: unavailable.filter(r => r.status === 'error')
-      },
-      timeout: {
-        providers: new Set(unavailable.filter(r => r.status === 'timeout').map(r => r.provider)).size,
-        models: unavailable.filter(r => r.status === 'timeout').length,
-        details: unavailable.filter(r => r.status === 'timeout')
-      }
+      no_credits: bucket('no_credits'),
+      no_credentials: bucket('no_credentials'),
+      error: bucket('error'),
+      timeout: bucket('timeout')
     };
   }
   
-  private generateProviderStats(byProvider: Record<string, ProviderHealthStatus[]>) {
-    const stats: Record<string, any> = {};
-    
+  private generateProviderStats(byProvider: Record<string, ProviderHealthStatus[]>): AvailabilityReport['by_provider'] {
+    const stats: AvailabilityReport['by_provider'] = {};
+
     for (const [provider, models] of Object.entries(byProvider)) {
       const available = models.filter(m => m.status === 'available');
       const availabilityRate = available.length / models.length;
-      
+
       let status: 'fully_available' | 'partially_available' | 'unavailable';
       if (availabilityRate === 1) status = 'fully_available';
       else if (availabilityRate > 0) status = 'partially_available';
       else status = 'unavailable';
-      
+
       // Calcular latência média dos disponíveis
       const latencies = available
         .map(m => m.latency_ms)
         .filter((l): l is number => l !== undefined);
-      const avgLatency = latencies.length > 0 
-        ? latencies.reduce((a, b) => a + b, 0) / latencies.length 
+      const avgLatency = latencies.length > 0
+        ? latencies.reduce((a, b) => a + b, 0) / latencies.length
         : 0;
-      
+
       stats[provider] = {
         total_models: models.length,
         available_models: available.length,
-        availabilityRate,
+        availability_rate: availabilityRate,
         status,
         avg_latency_ms: Math.round(avgLatency),
         recommended_models: available
@@ -171,7 +156,7 @@ export class StatusClassifier {
           .map(m => m.model)
       };
     }
-    
+
     return stats;
   }
   
@@ -182,19 +167,23 @@ export class StatusClassifier {
       0
     );
     
-    const overallAvailabilityRate = totalAvailable / totalModels;
-    
+    const overallAvailabilityRate = totalModels > 0 ? totalAvailable / totalModels : 0;
+
     // Providers recomendados (100% disponibilidade + baixa latência)
     const recommendedProviders = Object.entries(byProvider)
-      .filter(([_, models]) => {
-        const available = models.filter(m => m.status === 'available');
-        return available.length === models.length && available.length > 0;
-      })
-      .map(([provider, models]) => {
-        const avgLatency = models
-          .filter(m => m.status === 'available' && m.latency_ms !== undefined)
-          .reduce((sum, m) => sum + (m.latency_ms || 0), 0) / 
-          models.filter(m => m.status === 'available').length;
+      .map(([provider, models]) => ({
+        provider,
+        available: models.filter(m => m.status === 'available'),
+        total: models.length
+      }))
+      .filter(({ available, total }) => available.length === total && total > 0)
+      .map(({ provider, available }) => {
+        const latencies = available
+          .map(m => m.latency_ms)
+          .filter((l): l is number => l !== undefined);
+        const avgLatency = latencies.length > 0
+          ? latencies.reduce((a, b) => a + b, 0) / latencies.length
+          : 0;
         return { provider, avgLatency };
       })
       .sort((a, b) => a.avgLatency - b.avgLatency)

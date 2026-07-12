@@ -204,17 +204,17 @@ export async function* callOmnirouteStream(
       parser.feed(decoder.decode(chunk, { stream: true }));
       if (parserError) throw parserError;
 
-      // Flush whatever the parser pushed into `pending`.
-      while (pending.length > 0) {
-        const next = pending.shift()!;
+      // Flush whatever the parser pushed into `pending`. splice(0) drains the
+      // array without the non-null assertion shift() would need; the parser
+      // only pushes synchronously inside feed(), never while we yield.
+      for (const next of pending.splice(0)) {
         yield next;
       }
     }
 
     // Drain any remaining buffered chunks after [DONE].
     parser.feed(decoder.decode(new Uint8Array(0), { stream: false }));
-    while (pending.length > 0) {
-      const next = pending.shift()!;
+    for (const next of pending.splice(0)) {
       yield next;
     }
   } catch (err) {
@@ -249,9 +249,15 @@ function extractUsage(parsed: unknown): OmnirouteStreamUsage | null {
   };
   if (!data.usage) return null;
   const u = data.usage;
+  // typeof checks (não truthiness) — alinhado ao extractUsage de
+  // omniroute-call.ts: um usage legítimo de 0 tokens não deve ser descartado.
   return {
-    ...(u.input_tokens ?? u.prompt_tokens ? { input_tokens: u.input_tokens ?? u.prompt_tokens } : {}),
-    ...(u.output_tokens ?? u.completion_tokens ? { output_tokens: u.output_tokens ?? u.completion_tokens } : {}),
-    ...(u.total_cost_usd !== undefined ? { total_cost_usd: u.total_cost_usd } : {}),
+    ...(typeof (u.input_tokens ?? u.prompt_tokens) === 'number'
+      ? { input_tokens: u.input_tokens ?? u.prompt_tokens }
+      : {}),
+    ...(typeof (u.output_tokens ?? u.completion_tokens) === 'number'
+      ? { output_tokens: u.output_tokens ?? u.completion_tokens }
+      : {}),
+    ...(typeof u.total_cost_usd === 'number' ? { total_cost_usd: u.total_cost_usd } : {}),
   };
 }

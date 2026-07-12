@@ -16,8 +16,8 @@
 
 import type { Advisor, AdvisorContext, AdvisorResult } from '../types.js';
 import { getAdvisorMode } from '../shared/mode.js';
-import { callOmniroute } from '../../../utils/omniroute-call.js';
-import { TestgenInputSchema } from './schema.js';
+import { callAdvisorLlm } from '../shared/llm.js';
+import { TestgenInputSchema, type TestgenInput } from './schema.js';
 import { TESTGEN_SYSTEM_PROMPT } from './prompt.js';
 
 const DESCRIPTION =
@@ -25,7 +25,7 @@ const DESCRIPTION =
   'Analyzes code paths, identifies failure modes, and generates framework-specific tests. ' +
   'Be specific about scope - target particular components rather than testing everything.';
 
-function buildUserPrompt(parsed: ReturnType<typeof TestgenInputSchema.parse>): string {
+function buildUserPrompt(parsed: TestgenInput): string {
   const lines: string[] = [];
 
   lines.push(`=== TEST GENERATION STEP ${parsed.step_number} of ${parsed.total_steps} ===`);
@@ -74,11 +74,10 @@ export const testgenAdvisor: Advisor = {
     const parsed = TestgenInputSchema.parse(args);
     void getAdvisorMode(ctx, args);
     const userPrompt = buildUserPrompt(parsed);
-    const text = await callOmniroute({
+    const text = await callAdvisorLlm(ctx, {
       systemPrompt: TESTGEN_SYSTEM_PROMPT,
       userPrompt,
-      model: parsed.model ?? 'cc/claude-sonnet-4-6',
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      model: parsed.model,
     });
     return { output: text };
   },

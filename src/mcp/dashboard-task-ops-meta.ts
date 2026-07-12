@@ -13,7 +13,7 @@ import type { Dag, DagTask, Task } from '../types/index.js';
 import { TaskKindSchema } from '../types/schemas.js';
 import { insertEvent, loadWorkflowTasks } from '../db/persist.js';
 import { withSqliteRetrySync } from '../db/sqlite-retry.js';
-import { getUsePersonas, getAutoCompactThreshold } from '../utils/config.js';
+import { getAutoCompactThreshold } from '../utils/config.js';
 import {
   DEFAULT_COMPACTION_SETTINGS,
   maybeCompact,
@@ -21,6 +21,7 @@ import {
 } from '../v2/context-engine/compaction.js';
 import { loadTaskHandoff } from '../context/store.js';
 import { validateDashboardDag } from './dashboard-dag-ops.js';
+import { safeJsonObject } from './_json-utils.js';
 
 const ModelRouteSchema = z.object({
   use_case: z.string().min(1).max(120).optional(),
@@ -109,26 +110,10 @@ export interface DashboardTaskAdjustResult {
   refiner_changelog?: string[];
 }
 
-function safeJsonObject(raw: string | null): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function taskById(db: Database.Database, workflowId: string, taskId: string): Task {
+export function reloadTask(db: Database.Database, workflowId: string, taskId: string): Task {
   const task = loadWorkflowTasks(db, workflowId).find((item) => item.id === taskId);
   if (!task) throw new Error(`Task not found in workflow: ${taskId}`);
   return task;
-}
-
-export function reloadTask(db: Database.Database, workflowId: string, taskId: string): Task {
-  return taskById(db, workflowId, taskId);
 }
 
 async function compactDashboardText(input: {

@@ -12,20 +12,24 @@ import type {
   SlidingWindowOptions,
   RateLimitMetrics,
 } from './types.js';
+import { MetricsTracker } from './metrics-tracker.js';
 
 export class SlidingWindowLimiter {
   private readonly maxRequests: number;
   private readonly windowMs: number;
   private readonly windows: Map<string, SlidingWindowCounter>;
   private readonly now: () => number;
-  private readonly metrics: Map<string, RateLimitMetrics>;
+  private readonly tracker: MetricsTracker;
 
   constructor(opts: SlidingWindowOptions) {
     this.maxRequests = Math.max(1, opts.maxRequests);
     this.windowMs = Math.max(1, opts.windowMs);
     this.windows = new Map();
-    this.metrics = new Map();
     this.now = opts.now ?? Date.now;
+    this.tracker = new MetricsTracker(this.now, () => ({
+      remaining: this.maxRequests,
+      limit: this.maxRequests,
+    }));
   }
 
   /**
@@ -37,32 +41,15 @@ export class SlidingWindowLimiter {
     const existing = this.windows.get(key);
 
     // Update metrics
-    this.updateMetrics(key);
+    this.tracker.check(key);
 
-    if (!existing) {
-      // First request in this window
+    // New window: first request for this key, or the previous window expired
+    if (!existing || currentMs - existing.windowStartMs >= this.windowMs) {
       this.windows.set(key, {
         count: 1,
         windowStartMs: currentMs,
       });
-      this.recordAllowance(key, this.maxRequests - 1);
-      return {
-        allowed: true,
-        remaining: this.maxRequests - 1,
-        limit: this.maxRequests,
-        windowMs: this.windowMs,
-      };
-    }
-
-    // Check if the window has expired
-    const elapsed = currentMs - existing.windowStartMs;
-    if (elapsed >= this.windowMs) {
-      // Window expired, start fresh
-      this.windows.set(key, {
-        count: 1,
-        windowStartMs: currentMs,
-      });
-      this.recordAllowance(key, this.maxRequests - 1);
+      this.tracker.allow(key, this.maxRequests - 1);
       return {
         allowed: true,
         remaining: this.maxRequests - 1,
@@ -72,9 +59,10 @@ export class SlidingWindowLimiter {
     }
 
     // Window still active, check capacity
+    const elapsed = currentMs - existing.windowStartMs;
     if (existing.count >= this.maxRequests) {
       const retryAfterMs = this.windowMs - elapsed;
-      this.recordDenial(key);
+      this.tracker.deny(key);
       return {
         allowed: false,
         retryAfterMs,
@@ -87,7 +75,7 @@ export class SlidingWindowLimiter {
     // Increment count
     existing.count += 1;
     this.windows.set(key, existing);
-    this.recordAllowance(key, this.maxRequests - existing.count);
+    this.tracker.allow(key, this.maxRequests - existing.count);
     return {
       allowed: true,
       remaining: this.maxRequests - existing.count,
@@ -100,18 +88,7 @@ export class SlidingWindowLimiter {
    * Get metrics for a specific key.
    */
   getMetrics(key: string): RateLimitMetrics {
-    const metrics = this.metrics.get(key);
-    if (!metrics) {
-      return {
-        totalChecks: 0,
-        allowed: 0,
-        denied: 0,
-        remaining: this.maxRequests,
-        limit: this.maxRequests,
-        lastCheckMs: this.now(),
-      };
-    }
-    return { ...metrics };
+    return this.tracker.get(key);
   }
 
   /**
@@ -120,11 +97,10 @@ export class SlidingWindowLimiter {
   reset(key?: string): void {
     if (key) {
       this.windows.delete(key);
-      this.metrics.delete(key);
     } else {
       this.windows.clear();
-      this.metrics.clear();
     }
+    this.tracker.reset(key);
   }
 
   /**
@@ -132,39 +108,6 @@ export class SlidingWindowLimiter {
    */
   inspectWindow(key: string): SlidingWindowCounter | undefined {
     return this.windows.get(key);
-  }
-
-  private updateMetrics(key: string): void {
-    const existing = this.metrics.get(key);
-    if (!existing) {
-      this.metrics.set(key, {
-        totalChecks: 1,
-        allowed: 0,
-        denied: 0,
-        remaining: this.maxRequests,
-        limit: this.maxRequests,
-        lastCheckMs: this.now(),
-      });
-      return;
-    }
-    existing.totalChecks += 1;
-    existing.lastCheckMs = this.now();
-  }
-
-  private recordAllowance(key: string, remaining: number): void {
-    const metrics = this.metrics.get(key);
-    if (metrics) {
-      metrics.allowed += 1;
-      metrics.remaining = remaining;
-    }
-  }
-
-  private recordDenial(key: string): void {
-    const metrics = this.metrics.get(key);
-    if (metrics) {
-      metrics.denied += 1;
-      metrics.remaining = 0;
-    }
   }
 }
 

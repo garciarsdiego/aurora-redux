@@ -37,12 +37,29 @@ export class DefaultContextEngine implements ContextEngine {
     const tail = params.messages.slice(splitIdx);
     const firstKeptEntryId = tail[0]?.id;
 
-    const summary = await callOmniroute({
-      systemPrompt:
-        'Summarize the following conversation for context preservation. Keep key decisions, data, and caveats. Omit greetings and filler.',
-      userPrompt: toSummarize.map(m => `${m.role}: ${m.content}`).join('\n\n'),
-      model: params.model ?? 'cc/claude-haiku-4-5-20251001',
-    });
+    // Fewer than 2 messages → splitIdx is 0 and there is nothing to summarize.
+    // Skip the LLM round-trip instead of calling it with an empty prompt.
+    if (toSummarize.length === 0) {
+      return { ok: true, compacted: false, reason: 'nothing to summarize' };
+    }
+
+    let summary: string;
+    try {
+      summary = await callOmniroute({
+        systemPrompt:
+          'Summarize the following conversation for context preservation. Keep key decisions, data, and caveats. Omit greetings and filler.',
+        userPrompt: toSummarize.map(m => `${m.role}: ${m.content}`).join('\n\n'),
+        model: params.model ?? 'cc/claude-haiku-4-5-20251001',
+      });
+    } catch (err) {
+      // Honor the CompactResult contract (ok/reason) instead of leaking the
+      // raw LLM exception to the caller.
+      return {
+        ok: false,
+        compacted: false,
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
 
     const compactedMessages: AgentMessage[] = [
       {

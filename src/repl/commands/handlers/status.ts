@@ -5,6 +5,7 @@ import type Database from 'better-sqlite3';
 import type { SlashCommand, SlashResult, ReplCtx } from '../types.js';
 import { loadWorkflowById, loadWorkflowTasks } from '../../../db/persist.js';
 import type { Workflow, Task } from '../../../types/index.js';
+import { toError } from '../../utils/errors.js';
 
 interface StatusArgs {
   workflow_id?: string;
@@ -112,7 +113,7 @@ export const statusCommand: SlashCommand<StatusArgs> = {
       const events = loadRecentEvents(ctx.db, wf.id, 8);
       return { output: formatStatus(wf, tasks, events) };
     } catch (err) {
-      return { error: err instanceof Error ? err : new Error(String(err)) };
+      return { error: toError(err) };
     }
   },
 };

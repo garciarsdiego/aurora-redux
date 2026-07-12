@@ -16,7 +16,7 @@ export abstract class BaseProviderAdapter implements ProviderAdapter {
   /**
    * Stream a response from the provider
    */
-  async *stream(request: LLMRequest): AsyncGenerator<string> {
+  async *stream(_request: LLMRequest): AsyncGenerator<string> {
     throw new Error('Stream not implemented');
   }
 
@@ -29,7 +29,7 @@ export abstract class BaseProviderAdapter implements ProviderAdapter {
    * Validate if request is supported
    */
   validateRequest(request: LLMRequest): boolean {
-    if (!this.supportedModels.includes(request.model)) {
+    if (!this.supportedModels.includes(this.stripModelPrefix(request.model))) {
       return false;
     }
 
@@ -42,10 +42,17 @@ export abstract class BaseProviderAdapter implements ProviderAdapter {
   }
 
   /**
+   * Strip registry prefixes (e.g. 'cc/', 'gh/') to get the base model name
+   */
+  protected stripModelPrefix(model: string): string {
+    return model.split('/').pop() || model;
+  }
+
+  /**
    * Get model-specific configuration
    */
-  protected getModelConfig(model: string) {
-    const config: Record<string, any> = {
+  protected getModelConfig(model: string): { max_tokens: number; temperature: number } {
+    const config = {
       max_tokens: 4096,
       temperature: 0.7
     };
@@ -60,6 +67,53 @@ export abstract class BaseProviderAdapter implements ProviderAdapter {
     }
 
     return config;
+  }
+
+  /**
+   * Parse an SSE response body, yielding each 'data:' payload as a string
+   */
+  protected async *parseSSEPayloads(response: Response): AsyncGenerator<string> {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('Response body is not readable');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          yield line.slice(6);
+        }
+      }
+    }
+  }
+
+  /**
+   * Compute cost from a per-1K-token pricing table (prices per 1000 tokens)
+   */
+  protected computeCost(
+    inputTokens: number,
+    outputTokens: number,
+    model: string,
+    pricing: Record<string, { input: number; output: number }>,
+    fallbackModel: string
+  ): number {
+    const baseModel = this.stripModelPrefix(model);
+    const prices = pricing[baseModel] || pricing[fallbackModel];
+
+    const inputCost = (inputTokens / 1000) * prices.input;
+    const outputCost = (outputTokens / 1000) * prices.output;
+
+    return inputCost + outputCost;
   }
 
   /**

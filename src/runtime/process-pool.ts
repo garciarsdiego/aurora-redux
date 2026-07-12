@@ -224,7 +224,9 @@ export class RuntimeProcessPool {
 
   startSession(db: Database.Database, input: RuntimeProcessSessionInput): RuntimeSessionRow {
     if (input.profile === 'autonomous' && input.runMode !== 'approved-run') {
-      throw new Error('autonomous runtime sessions require approved-run mode');
+      // Same typed error as acquireAcpProcess/tryAcquireRuntimeSession so
+      // callers can always rely on `instanceof RuntimePoolEscalationError`.
+      throw new RuntimePoolEscalationError('autonomous runtime sessions require approved-run mode');
     }
 
     let child: ChildProcessWithoutNullStreams | null = null;
@@ -521,10 +523,10 @@ export class RuntimeProcessPool {
     for (const [poolKey, entry] of Array.from(this.acpProcesses.entries())) {
       const child = entry.child;
       if (!child || child.exitCode !== null || child.killed) continue;
+      // gracefulThenForceKill never rejects (kill errors are swallowed
+      // internally and it always resolves), so no catch is needed here.
       tasks.push(this.gracefulThenForceKill(child).then(() => {
         killed += 1;
-      }).catch(() => {
-        // Already-dead processes throw on kill — non-fatal.
       }));
       // Optimistically drop our reference — heartbeat tick will not see it again.
       this.acpProcesses.delete(poolKey);
@@ -606,12 +608,13 @@ export class RuntimeProcessPool {
     // Chain ourselves AFTER the previous tail and immediately publish ours
     // as the new tail. Cleanup removes the entry only if no other caller has
     // already replaced it (avoids leaking memory across many short bursts).
-    this.acpMutexes.set(poolKey, previous.then(() => next));
+    const tail = previous.then(() => next);
+    this.acpMutexes.set(poolKey, tail);
     await previous;
     return () => {
       release();
       // If we are still the registered tail, drop the entry to avoid leak.
-      if (this.acpMutexes.get(poolKey) === previous.then(() => next)) {
+      if (this.acpMutexes.get(poolKey) === tail) {
         this.acpMutexes.delete(poolKey);
       }
     };
@@ -785,7 +788,7 @@ export class RuntimeProcessPool {
         resolve();
       };
       // If the child is already gone, short-circuit.
-      if ((child as { exitCode: number | null }).exitCode !== null || (child as { killed?: boolean }).killed) {
+      if (child.exitCode !== null || child.killed) {
         finish();
         return;
       }
@@ -870,12 +873,7 @@ export async function recoverOrphanAcpSessions(
     errors: [],
   };
   for (const row of rows) {
-    let metadata: Record<string, unknown> = {};
-    try {
-      metadata = JSON.parse(row.metadata_json) as Record<string, unknown>;
-    } catch {
-      // fall through with empty metadata
-    }
+    const metadata = parseMetadata(row);
     const recordedDaemonPid = typeof metadata.daemon_pid === 'number' ? metadata.daemon_pid : null;
     const recordedChildPid = typeof metadata.pid === 'number' ? metadata.pid : null;
     const ownDaemon = recordedDaemonPid === process.pid;
@@ -1055,6 +1053,13 @@ export async function tryAcquireRuntimeSession(
       };
     } catch (err) {
       if (err instanceof RuntimePoolEscalationError) throw err;
+      // Contract: non-escalation failures degrade to "pool unavailable" (null),
+      // but the cause must not vanish — spawn ENOENT / initialize timeout etc.
+      console.warn('[runtime-pool] ACP acquire failed; falling back to pool-unavailable', {
+        executorId: input.executorId,
+        workspacePath: input.workspacePath ?? null,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return null;
     }
   }
@@ -1075,6 +1080,12 @@ export async function tryAcquireRuntimeSession(
     };
   } catch (err) {
     if (err instanceof RuntimePoolEscalationError) throw err;
+    // Same degradation contract as the ACP branch above — never lose the cause.
+    console.warn('[runtime-pool] metadata-only session start failed; falling back to pool-unavailable', {
+      executorId: input.executorId,
+      workspacePath: input.workspacePath ?? null,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }

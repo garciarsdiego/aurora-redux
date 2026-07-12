@@ -40,13 +40,19 @@ export function acquireTaskLease(
   input: AcquireTaskLeaseInput,
 ): TaskLease {
   const now = input.now ?? Date.now();
-  const existing = db
-    .prepare('SELECT attempt FROM workflow_task_leases WHERE task_id = ?')
-    .get(input.taskId) as { attempt: number } | undefined;
-  const attempt = (existing?.attempt ?? 0) + 1;
-  const idempotencyKey = `${input.workflowId}:${input.taskId}:${attempt}`;
 
-  withSqliteRetrySync(() =>
+  // Read attempt + upsert inside a single IMMEDIATE transaction so two
+  // concurrent acquirers (daemon + HTTP + REPL sharing the same DB) cannot
+  // read the same attempt and mint a duplicate idempotency_key. A losing
+  // writer surfaces SQLITE_BUSY, which the retry wrapper re-runs from the
+  // fresh read.
+  const acquire = db.transaction(() => {
+    const existing = db
+      .prepare('SELECT attempt FROM workflow_task_leases WHERE task_id = ?')
+      .get(input.taskId) as { attempt: number } | undefined;
+    const attempt = (existing?.attempt ?? 0) + 1;
+    const idempotencyKey = `${input.workflowId}:${input.taskId}:${attempt}`;
+
     db.prepare(
       `INSERT INTO workflow_task_leases
        (task_id, workflow_id, lease_owner, status, attempt, idempotency_key,
@@ -71,8 +77,9 @@ export function acquireTaskLease(
       now,
       now,
       now + input.ttlMs,
-    ),
-  );
+    );
+  });
+  withSqliteRetrySync(() => acquire.immediate());
 
   return loadTaskLease(db, input.taskId)!;
 }

@@ -8,6 +8,10 @@ export const WorkflowStatusSchema = z.enum([
   'completed',
   'failed',
   'cancelled',
+  // W2 — parent workflow status while a remediation child is pending/executing.
+  // Kept in sync with WorkflowStatus in types/index.ts (written to the DB by
+  // quality/remediation.ts).
+  'awaiting_remediation',
 ]);
 
 export const TaskStatusSchema = z.enum([

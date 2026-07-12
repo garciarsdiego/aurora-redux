@@ -20,7 +20,6 @@ type Listener = () => void;
 
 // Internal mutable state — intentionally NOT exported; mutations go via appendOutput().
 let _items: OutputItem[] = [];
-let _version = 0;
 const _listeners = new Set<Listener>();
 
 let _flushScheduled = false;
@@ -52,7 +51,6 @@ export function appendOutput(text: string, kind: OutputKind = 'info'): void {
     _items = [..._items, item];
   }
 
-  _version++;
   scheduleFlush();
 }
 
@@ -72,11 +70,5 @@ export function getOutputSnapshot(): readonly OutputItem[] {
 /** Reset buffer — intended for test isolation. */
 export function resetOutputBuffer(): void {
   _items = [];
-  _version = 0;
   scheduleFlush();
-}
-
-/** Expose version for debugging / testing. */
-export function getOutputVersion(): number {
-  return _version;
 }

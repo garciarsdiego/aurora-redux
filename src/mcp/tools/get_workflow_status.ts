@@ -13,6 +13,15 @@ interface EventRow {
   timestamp: number;
 }
 
+/** Parses persisted JSON; returns the raw string when it is not valid JSON. */
+function tryParseJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
 export async function getWorkflowStatusTool(raw: unknown): Promise<string> {
   const { workflow_id } = GetWorkflowStatusSchema.parse(raw);
   const db = initDb(getDbPath());
@@ -47,9 +56,7 @@ export async function getWorkflowStatusTool(raw: unknown): Promise<string> {
         name: t.name,
         status: t.status,
         kind: t.kind,
-        output: t.output_json
-          ? (() => { try { return JSON.parse(t.output_json!); } catch { return t.output_json; } })()
-          : null,
+        output: t.output_json ? tryParseJson(t.output_json) : null,
       })),
       recent_events: recentEvents.map((e) => ({
         type: e.type,

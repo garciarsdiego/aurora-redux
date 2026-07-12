@@ -46,7 +46,12 @@ export interface AdaptiveSupervisorOpts {
   maxIterations?: number;
   /** Stub the per-turn execution (tests). Production calls `runOmniRouteTask`. */
   executeTurnFn?: ExecuteAdaptiveTurnFn;
-  /** Stub the post-completion review hook (tests). Defaults to noop. */
+  /**
+   * Stub the post-completion review hook (tests). Defaults to noop.
+   * NOT IMPLEMENTED: declared for the planned post-completion review pass but
+   * currently never consumed by `runAdaptiveSupervisor` — kept on the exported
+   * interface for API stability; passing it today has no effect.
+   */
   reviewFn?: (task: Task, output: string, ctx?: ReviewerRuntimeContext) => Promise<ReviewResult>;
   /** Per-event observability hook. Errors are swallowed inside the loop. */
   onSubagentEvent?: (event: SubagentEvent) => void | Promise<void>;

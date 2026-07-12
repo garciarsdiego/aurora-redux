@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { initDb } from '../../db/client.js';
 import { getDbPath } from '../../utils/config.js';
 import { VALID_WORKSPACE_RE } from '../../utils/workspace.js';
-import { callOmnirouteWithUsage } from '../../utils/omniroute-call.js';
 import {
   BUILDER_CONVERSATIONAL_PERSONA,
   CONSOLIDATOR_PERSONA,
@@ -17,7 +16,6 @@ import {
   WORKER_TOOL_CALL_PERSONA,
   createInMemoryContext,
   runAgent,
-  type AgentInvoker,
   type AgentPersona,
 } from '../../v2/agents/index.js';
 import {
@@ -25,6 +23,7 @@ import {
   diffPersonaOutputs,
   getPersonaVersionSnapshot,
 } from '../../v2/agents/version-registry.js';
+import { omnirouteInvoker } from './omniroute-invoker.js';
 
 export const toolName = 'omniforge_replay_persona_version';
 
@@ -34,15 +33,6 @@ export const inputSchema = z.object({
   input: z.unknown(),
   workspace: z.string().regex(VALID_WORKSPACE_RE, 'Invalid workspace name').default('global'),
 });
-
-const omnirouteInvoker: AgentInvoker = async (args) => {
-  const result = await callOmnirouteWithUsage({
-    model: args.model,
-    systemPrompt: args.systemPrompt,
-    userPrompt: args.userPrompt ?? 'Respond per the system contract above.',
-  });
-  return result.content;
-};
 
 const LIVE_PERSONAS = [
   BUILDER_CONVERSATIONAL_PERSONA,

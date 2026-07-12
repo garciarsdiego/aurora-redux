@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { withSqliteRetrySync } from '../db/sqlite-retry.js';
 import { redactContextJson } from '../context/redaction.js';
+import { clamp01 } from './internal-utils.js';
 import type {
   CreateQualityReviewInput,
   QualityEvidenceRef,
@@ -19,9 +20,7 @@ function safeJson(value: unknown): string {
 
 function normalizeScore(score: number | null | undefined): number | null {
   if (typeof score !== 'number' || !Number.isFinite(score)) return null;
-  if (score < 0) return 0;
-  if (score > 1) return 1;
-  return score;
+  return clamp01(score);
 }
 
 export function saveQualityReview(
@@ -60,7 +59,13 @@ export function saveQualityReview(
     ),
   );
 
-  return loadQualityReview(db, id)!;
+  const review = loadQualityReview(db, id);
+  if (!review) {
+    // Impossible on the happy path — surfaces a swallowed/rolled-back INSERT
+    // as a diagnosable error instead of a null typed as QualityReviewRow.
+    throw new Error(`Quality review ${id} not found immediately after insert.`);
+  }
+  return review;
 }
 
 export function loadQualityReview(

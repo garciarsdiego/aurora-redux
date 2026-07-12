@@ -14,12 +14,23 @@ import {
 } from '../v2/observability/tracing.js';
 import { evaluateActionGate } from '../v2/security/action-gate.js';
 
+// Local helper — open the configured DB, run `fn`, always close. The
+// open/try/finally/close pattern appeared three times in this file;
+// centralising it removes the risk of a future path forgetting the close.
+function withDb<T>(fn: (db: ReturnType<typeof initDb>) => T): T {
+  const db = initDb(getDbPath());
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
 export function loadConfiguredToolPolicy(workspace: string): unknown | undefined {
   const policyName = getToolPolicyName();
   if (!policyName) return undefined;
 
-  const db = initDb(getDbPath());
-  try {
+  return withDb((db) => {
     const definition = getActiveVersionedDefinition(db, {
       workspace,
       kind: 'policy',
@@ -29,9 +40,7 @@ export function loadConfiguredToolPolicy(workspace: string): unknown | undefined
       throw new Error(`Configured tool policy '${policyName}' is not pinned for workspace '${workspace}'`);
     }
     return definition.spec;
-  } finally {
-    db.close();
-  }
+  });
 }
 
 export async function runToolCallTask(task: Task, signal?: AbortSignal): Promise<string> {
@@ -41,14 +50,27 @@ export async function runToolCallTask(task: Task, signal?: AbortSignal): Promise
   // retryable failure.
   if (signal?.aborted) {
     const err = new Error(`tool_call '${task.name}' cancelled before dispatch`);
-    (err as Error & { name: string }).name = 'AbortError';
+    err.name = 'AbortError';
     throw err;
   }
 
-  const inputCtx = JSON.parse(task.input_json ?? '{}') as Record<string, unknown>;
-  const toolName = (inputCtx['tool_name'] as string | undefined) ?? task.tool_name ?? '';
+  // Malformed input_json must still FAIL the task (silently running the tool
+  // with empty args would change behavior) — but rethrow with task context
+  // instead of a bare SyntaxError that identifies nothing.
+  let inputCtx: Record<string, unknown>;
+  try {
+    inputCtx = JSON.parse(task.input_json ?? '{}') as Record<string, unknown>;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`tool_call '${task.name}' has malformed input_json: ${msg}`);
+  }
+  const rawToolName = inputCtx['tool_name'];
+  const toolName = (typeof rawToolName === 'string' ? rawToolName : undefined) ?? task.tool_name ?? '';
   if (!toolName) throw new Error(`tool_call task '${task.name}' has no tool_name`);
-  const args = (inputCtx['args'] ?? {}) as Record<string, unknown>;
+  const rawArgs = inputCtx['args'];
+  const args = rawArgs !== null && typeof rawArgs === 'object'
+    ? rawArgs as Record<string, unknown>
+    : {};
 
   // WS3 — per-task tool allowlist. When the task declares `allowed_tools`, deny
   // any tool outside it BEFORE resolution/execution (auto-deny the rest). This
@@ -58,17 +80,14 @@ export async function runToolCallTask(task: Task, signal?: AbortSignal): Promise
     ? (inputCtx['allowed_tools'] as unknown[]).filter((t): t is string => typeof t === 'string')
     : undefined;
   if (!isToolAllowed(toolName, allowedTools)) {
-    const db = initDb(getDbPath());
-    try {
+    withDb((db) => {
       insertEvent(db, {
         workflow_id: task.workflow_id,
         task_id: task.id,
         type: 'tool_blocked_by_allowlist',
         payload: { tool: toolName, allowed_tools: allowedTools },
       });
-    } finally {
-      db.close();
-    }
+    });
     throw new Error(
       `tool_call '${toolName}' denied: not in this task's allowed_tools [${(allowedTools ?? []).join(', ')}]`,
     );
@@ -87,7 +106,9 @@ export async function runToolCallTask(task: Task, signal?: AbortSignal): Promise
   // when it materialises the DAG). Falls back to 'internal' if absent so
   // legacy tasks without workspace metadata still execute under the safest
   // default rather than the project root.
-  const workspace = task.workspace ?? (inputCtx['workspace'] as string | undefined) ?? 'internal';
+  const workspace = task.workspace
+    ?? (typeof inputCtx['workspace'] === 'string' ? inputCtx['workspace'] : undefined)
+    ?? 'internal';
   const ctx: ToolContext = {
     workspace,
     workflowId: task.workflow_id,
@@ -125,25 +146,20 @@ export async function runToolCallTask(task: Task, signal?: AbortSignal): Promise
   // If the DB is unavailable the gate falls back to 'allow' so it is never a
   // reliability blocker. 'require-approval' is in observe-only mode until the
   // HITL gate creation path is wired in a follow-up (Tier 2).
-  {
-    const gateDb = initDb(getDbPath());
-    try {
-      const gate = evaluateActionGate(toolName, '__default__', gateDb);
-      if (gate.disposition === 'block') {
-        throw new Error(`tool_call blocked by action gate [${gate.category}]: ${toolName}`);
-      }
-      // 'require-approval' is observe-only until Tier 2 HITL wiring.
-      // Log to stderr so the bypassed policy is observable without a DB write on the hot path.
-      // Deferred: replace this with createHitlGate() when per-agent policies are
-      // enforced. Tracked in Tier 0.5 backlog — see
-      // docs/notes/2026-05-12-master-goal-plan-all-tiers.md (Tier D).
-      if (gate.disposition === 'require-approval') {
-        process.stderr.write(`[action-gate] observe-only: ${toolName} [${gate.category}] would require approval\n`);
-      }
-    } finally {
-      gateDb.close();
+  withDb((gateDb) => {
+    const gate = evaluateActionGate(toolName, '__default__', gateDb);
+    if (gate.disposition === 'block') {
+      throw new Error(`tool_call blocked by action gate [${gate.category}]: ${toolName}`);
     }
-  }
+    // 'require-approval' is observe-only until Tier 2 HITL wiring.
+    // Log to stderr so the bypassed policy is observable without a DB write on the hot path.
+    // Deferred: replace this with createHitlGate() when per-agent policies are
+    // enforced. Tracked in Tier 0.5 backlog — see
+    // docs/notes/2026-05-12-master-goal-plan-all-tiers.md (Tier D).
+    if (gate.disposition === 'require-approval') {
+      process.stderr.write(`[action-gate] observe-only: ${toolName} [${gate.category}] would require approval\n`);
+    }
+  });
 
   const spanCtx = spanContextStorage.getStore();
   let spanId: string | undefined;

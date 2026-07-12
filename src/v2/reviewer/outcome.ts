@@ -299,24 +299,15 @@ export function reviewerOutputToOutcome(output: ReviewerOutput): ReviewOutcome {
       refine_hint: refineHint,
     };
   }
-  if (output.verdict === 'refine') {
-    return {
-      outcome_type: 'soft_failure',
-      confidence: 0.6,
-      feedback: output.feedback,
-      caveats,
-      next_action: 'refine',
-      refine_hint: refineHint,
-    };
-  }
-  // Opt 2b — a single reviewer verdict 'fail' is RECOVERABLE: map it to
-  // soft_failure + refine so the worker gets refine retries rather than an
-  // instant workflow abort. One cosmetic miss should trigger a refine loop,
-  // not a hard failure. Genuine hard failures still fail AFTER refine
-  // exhaustion (handled in refine.ts). hard_failure/abort is reserved for
-  // cases the reviewer EXPLICITLY signals as non-recoverable; the current
-  // ReviewerOutput contract carries no unrecoverable/abort flag, so verdict
-  // 'fail' alone never aborts on its own.
+  // Opt 2b — verdict 'refine' and a single reviewer verdict 'fail' map to the
+  // SAME outcome: 'fail' is RECOVERABLE, so it becomes soft_failure + refine
+  // and the worker gets refine retries rather than an instant workflow abort.
+  // One cosmetic miss should trigger a refine loop, not a hard failure.
+  // Genuine hard failures still fail AFTER refine exhaustion (handled in
+  // refine.ts). hard_failure/abort is reserved for cases the reviewer
+  // EXPLICITLY signals as non-recoverable; the current ReviewerOutput contract
+  // carries no unrecoverable/abort flag, so verdict 'fail' alone never aborts
+  // on its own.
   return {
     outcome_type: 'soft_failure',
     confidence: 0.6,

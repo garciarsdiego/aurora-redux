@@ -36,6 +36,26 @@ export function modelNameForCli(model: string | null | undefined): string | null
   return model;
 }
 
+// Single source of truth for the provider-family ↔ CLI mapping. Both
+// `isModelCompatibleWithCli` (CLI → providers it `accepts`) and
+// `inferCliIdFromTask` (provider → CLI via `infers`) derive from this record
+// so the two directions can never drift when a provider family grows.
+//
+// NOTE the deliberate accepts/infers asymmetry on gemini: a bare `gemini/`
+// prefix is ACCEPTED when the caller explicitly hints cli:gemini (the model
+// arg survives), but only the unambiguous `gemini-cli/` prefix INFERS the
+// gemini CLI implicitly — bare `gemini/` models without a hint keep routing
+// to the default CLI, exactly as before this table existed.
+const CLI_PROVIDER_FAMILIES: Record<string, { accepts: readonly string[]; infers: readonly string[] }> = {
+  'claude-code': { accepts: ['cc', 'claude'], infers: ['cc', 'claude'] },
+  codex: { accepts: ['cx', 'codex'], infers: ['cx', 'codex'] },
+  gemini: { accepts: ['gemini-cli', 'gemini'], infers: ['gemini-cli'] },
+  kimi: {
+    accepts: ['kimi', 'kmc', 'kmca', 'kimi-coding'],
+    infers: ['kimi', 'kmc', 'kmca', 'kimi-coding'],
+  },
+};
+
 // Example smoke test 2026-04-30 — AETHER α-init bug: a cli_spawn task with
 // `executor_hint=cli:codex` and `model=cc/claude-sonnet-4-6` (the H10 default
 // for cli_spawn) was being spawned as `codex exec --model claude-sonnet-4-6
@@ -52,26 +72,15 @@ export function modelNameForCli(model: string | null | undefined): string | null
 // — we just drop the incompatible model arg). An event surfaces the mismatch
 // so the operator sees the silent demotion.
 //
-// Compatibility map mirrors the inverse of `inferCliIdFromTask`'s provider
-// → CLI mapping: each CLI accepts only models from its own provider family.
+// Each CLI accepts only models from its own provider family — sourced from
+// CLI_PROVIDER_FAMILIES above, shared with `inferCliIdFromTask`.
 export function isModelCompatibleWithCli(cliId: string, model: string | null | undefined): boolean {
   if (!model) return true; // no model → CLI default is always fine
   const provider = modelProvider(model)?.toLowerCase();
   if (!provider) return true; // unprefixed model — pass through (CLI will validate)
+  const family = CLI_PROVIDER_FAMILIES[cliId];
+  if (family) return family.accepts.includes(provider);
   switch (cliId) {
-    case 'claude-code':
-      return provider === 'cc' || provider === 'claude';
-    case 'codex':
-      return provider === 'cx' || provider === 'codex';
-    case 'gemini':
-      return provider === 'gemini-cli' || provider === 'gemini';
-    case 'kimi':
-      return (
-        provider === 'kimi'
-        || provider === 'kmc'
-        || provider === 'kmca'
-        || provider === 'kimi-coding'
-      );
     case 'cursor':
     case 'kilo':
       // These CLIs accept `provider/model` as-is via their own routing
@@ -121,10 +130,13 @@ export function inferCliIdFromTask(hint: string | null | undefined, task?: Pick<
   const explicit = hint?.startsWith('cli:') ? hint.slice(4) : null;
   if (explicit && explicit !== 'claude-code' && explicit !== 'auto' && explicit !== 'default') return explicit;
   const provider = modelProvider(task?.model)?.toLowerCase();
-  if (provider === 'codex' || provider === 'cx') return 'codex';
-  if (provider === 'gemini-cli') return 'gemini';
-  if (provider === 'kimi' || provider === 'kmc' || provider === 'kmca' || provider === 'kimi-coding') return 'kimi';
-  if (provider === 'cc' || provider === 'claude') return 'claude-code';
+  if (provider) {
+    // Provider prefixes are disjoint across families, so lookup order is
+    // irrelevant. See CLI_PROVIDER_FAMILIES for the gemini infers carve-out.
+    for (const [cliId, family] of Object.entries(CLI_PROVIDER_FAMILIES)) {
+      if (family.infers.includes(provider)) return cliId;
+    }
+  }
   return explicit ?? 'claude-code';
 }
 

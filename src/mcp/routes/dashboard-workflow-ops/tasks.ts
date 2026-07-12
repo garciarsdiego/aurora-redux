@@ -31,7 +31,7 @@ import { postTaskHandoffTool } from '../../tools/post_task_handoff.js';
 import { readTaskThreadTool } from '../../tools/read_task_thread.js';
 import { withCliPermissionMode, type CliPermissionMode } from '../../../executors/cli.js';
 import type { Router } from '../types.js';
-import { badRequest, jsonOk, notFound, readJsonBody } from '../_shared.js';
+import { badRequest, jsonOk, notFound, readBodyOr400 } from '../_shared.js';
 import { respondWithCollaborationTool } from './shared.js';
 
 async function handleDashboardTaskThread(
@@ -368,8 +368,8 @@ async function handleDashboardTaskReplay(
 export const tasksRouter: Router = async (req, url, res, ctx) => {
   const taskRetryMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/tasks\/([^/]+)\/retry$/);
   if (req.method === 'POST' && taskRetryMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardTaskRetry(
       decodeURIComponent(taskRetryMatch[1] ?? ''),
       decodeURIComponent(taskRetryMatch[2] ?? ''),
@@ -381,8 +381,8 @@ export const tasksRouter: Router = async (req, url, res, ctx) => {
   }
   const subagentSteerMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/tasks\/([^/]+)\/subagents\/steer$/);
   if (req.method === 'POST' && subagentSteerMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardSubagentSteer(
       decodeURIComponent(subagentSteerMatch[1] ?? ''),
       decodeURIComponent(subagentSteerMatch[2] ?? ''),
@@ -392,8 +392,8 @@ export const tasksRouter: Router = async (req, url, res, ctx) => {
   }
   const subagentKillMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/tasks\/([^/]+)\/subagents\/kill$/);
   if (req.method === 'POST' && subagentKillMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardSubagentKill(
       decodeURIComponent(subagentKillMatch[1] ?? ''),
       decodeURIComponent(subagentKillMatch[2] ?? ''),
@@ -403,8 +403,8 @@ export const tasksRouter: Router = async (req, url, res, ctx) => {
   }
   const taskAdjustMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/tasks\/([^/]+)\/adjust$/);
   if (req.method === 'POST' && taskAdjustMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardTaskAdjust(
       decodeURIComponent(taskAdjustMatch[1] ?? ''),
       decodeURIComponent(taskAdjustMatch[2] ?? ''),
@@ -433,8 +433,8 @@ export const tasksRouter: Router = async (req, url, res, ctx) => {
   }
   const taskHandoffMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/tasks\/([^/]+)\/handoffs$/);
   if (req.method === 'POST' && taskHandoffMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardPostTaskHandoff(
       decodeURIComponent(taskHandoffMatch[1] ?? ''),
       decodeURIComponent(taskHandoffMatch[2] ?? ''),
@@ -445,8 +445,8 @@ export const tasksRouter: Router = async (req, url, res, ctx) => {
   }
   const taskPatchMatch = url.pathname.match(/^\/api\/dashboard\/workflows\/([^/]+)\/tasks\/([^/]+)$/);
   if (req.method === 'PATCH' && taskPatchMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     handleDashboardTaskPatch(
       decodeURIComponent(taskPatchMatch[1] ?? ''),
       decodeURIComponent(taskPatchMatch[2] ?? ''),
@@ -456,8 +456,8 @@ export const tasksRouter: Router = async (req, url, res, ctx) => {
   }
   const taskReplayMatch = url.pathname.match(/^\/api\/dashboard\/tasks\/([^/]+)\/replay$/);
   if (req.method === 'POST' && taskReplayMatch) {
-    let body: unknown;
-    try { body = await readJsonBody(req); } catch (err) { badRequest(res, (err as Error).message); return true; }
+    const body = await readBodyOr400(req, res);
+    if (body === undefined) return true;
     await handleDashboardTaskReplay(decodeURIComponent(taskReplayMatch[1] ?? ''), body, res);
     return true;
   }

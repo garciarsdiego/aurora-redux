@@ -168,112 +168,10 @@ export function shouldReviewTask(task: {
   return true;
 }
 
-// OTIMIZAÇÃO 5: Model selection automática por complexidade
-export const MODEL_SELECTION_POLICY = {
-  simple_tasks: {
-    models: ['cc/claude-haiku-4-5-20251001', 'gh/gpt-4o-mini', 'gemini-cli/gemini-2.5-flash'],
-    default: 'cc/claude-haiku-4-5-20251001',
-    max_cost_per_1k_tokens: 0.0001,
-  },
-  medium_tasks: {
-    models: ['cc/claude-sonnet-4-6', 'gh/gpt-5.1', 'cx/gpt-5.1-codex'],
-    default: 'cc/claude-sonnet-4-6',
-    max_cost_per_1k_tokens: 0.001,
-  },
-  complex_tasks: {
-    models: ['cc/claude-opus-4-6', 'cc/claude-opus-4-7', 'cx/gpt-5.4'],
-    default: 'cc/claude-opus-4-6',
-    max_cost_per_1k_tokens: 0.01,
-  },
-  review_tasks: {
-    models: ['cc/claude-sonnet-4-6'],
-    default: 'cc/claude-sonnet-4-6',
-    max_cost_per_1k_tokens: 0.001,
-  },
-  decomposer: {
-    models: ['cc/claude-sonnet-4-6'],
-    default: 'cc/claude-sonnet-4-6',
-    max_cost_per_1k_tokens: 0.001,
-  },
-  consolidator: {
-    models: ['cc/claude-opus-4-6', 'kmc/kimi-k2.5-thinking'],
-    default: 'cc/claude-opus-4-6',
-    max_cost_per_1k_tokens: 0.01,
-  },
-} as const;
-
-export function selectModelForTask(
-  task: { complexity?: string; kind?: string; role?: string },
-  fallback?: string
-): string {
-  const role = task.role || 'medium_tasks';
-  
-  // Se não for um role conhecido, usar complexidade
-  if (!MODEL_SELECTION_POLICY[role as keyof typeof MODEL_SELECTION_POLICY]) {
-    const complexity = task.complexity || 'media';
-    const policy = MODEL_SELECTION_POLICY[
-      `${complexity}_tasks` as keyof typeof MODEL_SELECTION_POLICY
-    ] || MODEL_SELECTION_POLICY.medium_tasks;
-    return policy.default;
-  }
-  
-  const policy = MODEL_SELECTION_POLICY[role as keyof typeof MODEL_SELECTION_POLICY];
-  return policy.default;
-}
-
-// OTIMIZAÇÃO 6: Early timeout prediction
-export function predictWorkflowDuration(dag: { tasks: { timeout_seconds?: number; depends_on?: string[] }[] }, maxParallelTasks: number): number {
-  const parallelizableTasks = dag.tasks.filter(t => !t.depends_on || t.depends_on.length === 0).length;
-  const sequentialBatches = Math.ceil(dag.tasks.length / maxParallelTasks);
-  
-  const avgTaskDuration = 60000; // 60s média
-  const avgReviewDuration = 30000; // 30s média
-  const consolidationTime = 30000; // 30s fixo
-  
-  const executionTime = sequentialBatches * avgTaskDuration;
-  const reviewTime = dag.tasks.length * avgReviewDuration;
-  
-  return executionTime + reviewTime + consolidationTime;
-}
-
-export function shouldAbortWorkflow(dag: { tasks: { timeout_seconds?: number }[] }, maxTimeout: number, maxParallelTasks: number): boolean {
-  const predictedDuration = predictWorkflowDuration(dag, maxParallelTasks);
-  return predictedDuration > maxTimeout;
-}
-
-// OTIMIZAÇÃO 7: Fallback automático entre modelos
-export async function callWithFallback(
-  callFn: (model: string) => Promise<any>,
-  models: string[],
-  options: { timeout?: number } = {}
-): Promise<any> {
-  const errors = [];
-  
-  for (const model of models) {
-    try {
-      return await callFn(model);
-    } catch (error: any) {
-      errors.push({ model, error: error.message, code: error.code });
-      
-      // Continuar apenas se for timeout ou rate limit
-      if (error.code === 'TIMEOUT' || error.code === 'RATE_LIMITED') {
-        continue;
-      }
-      
-      // Para outros erros, não fazer fallback
-      throw error;
-    }
-  }
-  
-  // Todos os modelos falharam
-  throw new Error(`All models failed: ${JSON.stringify(errors)}`);
-}
-
-export const FALLBACK_POLICIES = {
-  simple_tasks: ['cc/claude-haiku-4-5-20251001', 'gh/gpt-4o-mini', 'gemini-cli/gemini-2.5-flash'],
-  medium_tasks: ['cc/claude-sonnet-4-6', 'gh/gpt-5.1', 'cx/gpt-5.1-codex'],
-  complex_tasks: ['cc/claude-opus-4-6', 'cc/claude-opus-4-7', 'cx/gpt-5.4'],
-} as const;
+// OTIMIZAÇÃO 5/6/7 (selectModelForTask / predictWorkflowDuration /
+// callWithFallback e suas policies) removidas em 2026-07-11: nenhum chamador
+// em src/ ou tests/ — eram exports mortos de uma geração anterior, com `any`
+// e divisão-por-zero latente (maxParallelTasks=0 é válido).
 
 // OTIMIZAÇÃO 10: Métricas do decomposer
 const decomposerMetrics = {
@@ -351,7 +249,15 @@ export function getAutoTagOverrides(): AutoTagOverrides {
   const raw = optional('OMNIFORGE_AUTO_TAG_OVERRIDES', '').trim();
   if (!raw) return runtime ?? {};
 
-  const parsed: unknown = JSON.parse(raw);
+  // Env malformada NÃO pode derrubar o chokepoint LLM (getAutoTagOverrides roda
+  // em toda chamada) — degrada para o mesmo fallback das demais rotas inválidas.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    warnMalformedAutoTagOverridesOnce(err);
+    return runtime ?? {};
+  }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return runtime ?? {};
 
   const overrides: AutoTagOverrides = {};
@@ -365,6 +271,18 @@ export function getAutoTagOverrides(): AutoTagOverrides {
     }
   }
   return overrides;
+}
+
+// Warn-once: getAutoTagOverrides é hot path (toda chamada LLM); logar em cada
+// leitura de uma env quebrada inundaria o daemon.log.
+let warnedMalformedAutoTagOverrides = false;
+function warnMalformedAutoTagOverridesOnce(err: unknown): void {
+  if (warnedMalformedAutoTagOverrides) return;
+  warnedMalformedAutoTagOverrides = true;
+  console.warn(
+    '[config] OMNIFORGE_AUTO_TAG_OVERRIDES is not valid JSON — ignoring the env var:',
+    err instanceof Error ? err.message : String(err),
+  );
 }
 
 function isAutoTagKey(tag: string): tag is keyof AutoTagOverrides {

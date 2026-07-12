@@ -2,8 +2,8 @@ import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import {
   loadWorkflowById,
-  loadWorkflowTasks,
 } from '../db/persist.js';
+import { reloadTask } from './dashboard-task-ops-meta.js';
 import {
   countActiveRunsForTask,
 } from '../v2/subagent/registry.js';
@@ -19,12 +19,6 @@ const DashboardSubagentSteerSchema = z.object({
 const DashboardSubagentKillSchema = z.object({
   reason: z.string().trim().min(1).max(4_000).optional(),
 });
-
-function taskById(db: Database.Database, workflowId: string, taskId: string) {
-  const task = loadWorkflowTasks(db, workflowId).find((item) => item.id === taskId);
-  if (!task) throw new Error(`Task not found in workflow: ${taskId}`);
-  return task;
-}
 
 function hasSubagentSurface(
   db: Database.Database,
@@ -56,7 +50,7 @@ export function steerDashboardSubagents(
 } {
   const workflow = loadWorkflowById(db, workflowId);
   if (!workflow) throw new Error(`Workflow not found: ${workflowId}`);
-  const task = taskById(db, workflowId, taskId);
+  const task = reloadTask(db, workflowId, taskId);
   if (!hasSubagentSurface(db, workflowId, taskId, task.execution_mode)) {
     throw new Error(`Task has no subagent console surface: ${taskId}`);
   }
@@ -65,7 +59,7 @@ export function steerDashboardSubagents(
   const result = steer(db, taskId, input.instruction);
   if (result === 'not_found') throw new Error(`Task not found: ${taskId}`);
 
-  const reloaded = taskById(db, workflowId, taskId);
+  const reloaded = reloadTask(db, workflowId, taskId);
   return {
     workflow_id: workflowId,
     task_id: taskId,
@@ -90,7 +84,7 @@ export function killDashboardSubagents(
 } {
   const workflow = loadWorkflowById(db, workflowId);
   if (!workflow) throw new Error(`Workflow not found: ${workflowId}`);
-  const task = taskById(db, workflowId, taskId);
+  const task = reloadTask(db, workflowId, taskId);
   if (!hasSubagentSurface(db, workflowId, taskId, task.execution_mode)) {
     throw new Error(`Task has no subagent console surface: ${taskId}`);
   }
@@ -103,7 +97,7 @@ export function killDashboardSubagents(
   );
   if (result === 'not_found') throw new Error(`Task not found: ${taskId}`);
 
-  const reloaded = taskById(db, workflowId, taskId);
+  const reloaded = reloadTask(db, workflowId, taskId);
   return {
     workflow_id: workflowId,
     task_id: taskId,

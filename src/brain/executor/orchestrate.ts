@@ -10,6 +10,7 @@ import {
   setTaskPending,
   setTaskCompleted,
   setTaskFailed,
+  setTaskSkipped,
   loadWorkflowTasks,
 } from '../../db/persist.js';
 import { promptApproval } from '../../hitl/cli.js';
@@ -21,7 +22,6 @@ import {
   bestComboForTask,
   syncWorkflowCostsOnCompletion,
 } from '../../v2/omniroute-bridge/index.js';
-import { setTaskSkipped } from '../../db/persist.js';
 import {
   getRefineCostPerCallUsd,
   getMaxRefineTimeMs,
@@ -57,54 +57,34 @@ import {
 
 const ROUTING_KINDS = new Set(['if_else', 'switch', 'evaluator'] as const);
 
-// WIRE-04 — fire-and-forget, fully fail-safe wrappers around the notification
+// WIRE-04 — fire-and-forget, fully fail-safe wrapper around the notification
 // service. The notification WRITE side (bell / inbox panel) reads the
-// `notifications` table; nothing wrote to it before this wiring. These helpers
+// `notifications` table; nothing wrote to it before this wiring. This helper
 // MUST NOT throw into the orchestration path and MUST NOT block workflow
-// completion, so the async createNotification is dispatched without await and
-// any rejection is swallowed into an `insertEvent` audit row.
-function fireWorkflowCompletedNotification(
-  db: Database.Database,
+// completion, so the async createNotification is dispatched without await.
+// On failure, LOG to stderr (observable in the daemon log) rather than
+// insertEvent — appending a workflow event after the terminal
+// workflow_completed would break the "completed is the last event" invariant
+// (and pollute the lifecycle stream).
+function fireWorkflowNotification(
+  kind: 'completed' | 'failed',
   wfId: string,
   objective: string,
+  error = '',
 ): void {
-  // Post-completion side effect. On failure, LOG to stderr (observable in the
-  // daemon log) rather than insertEvent — appending a workflow event after the
-  // terminal workflow_completed would break the "completed is the last event"
-  // invariant (and pollute the lifecycle stream). Never throws into orchestration.
   try {
-    void notifyWorkflowCompleted(wfId, objective).catch((err) => {
+    const dispatched = kind === 'completed'
+      ? notifyWorkflowCompleted(wfId, objective)
+      : notifyWorkflowFailed(wfId, objective, error);
+    void dispatched.catch((err) => {
       process.stderr.write(
-        `[notification] workflow_completed dispatch failed for ${wfId}: ` +
+        `[notification] workflow_${kind} dispatch failed for ${wfId}: ` +
         `${err instanceof Error ? err.message : String(err)}\n`,
       );
     });
   } catch (err) {
     process.stderr.write(
-      `[notification] workflow_completed dispatch threw synchronously for ${wfId}: ` +
-      `${err instanceof Error ? err.message : String(err)}\n`,
-    );
-  }
-}
-
-function fireWorkflowFailedNotification(
-  db: Database.Database,
-  wfId: string,
-  objective: string,
-  error: string,
-): void {
-  // Post-failure side effect — same rationale as fireWorkflowCompletedNotification:
-  // log on dispatch failure, never append a workflow event or throw.
-  try {
-    void notifyWorkflowFailed(wfId, objective, error).catch((err) => {
-      process.stderr.write(
-        `[notification] workflow_failed dispatch failed for ${wfId}: ` +
-        `${err instanceof Error ? err.message : String(err)}\n`,
-      );
-    });
-  } catch (err) {
-    process.stderr.write(
-      `[notification] workflow_failed dispatch threw synchronously for ${wfId}: ` +
+      `[notification] workflow_${kind} dispatch threw synchronously for ${wfId}: ` +
       `${err instanceof Error ? err.message : String(err)}\n`,
     );
   }
@@ -288,6 +268,207 @@ async function doOnSubagentEvent(
   } catch { /* DB errors must not propagate */ }
 }
 
+// Loop phase (a) — select the ready candidates, order them workload-first,
+// filter file-scope overlaps and apply the parallelism cap. Pure move out of
+// runTaskLoop; behaviour (including the deadlock throw and the
+// workflow_parallelism_limited events) is unchanged.
+function selectReadyBatch(
+  db: Database.Database,
+  wfId: string,
+  pending: Task[],
+  completedIds: Set<string>,
+  maxParallelTasks: number,
+): Task[] {
+  // All tasks whose dependencies are satisfied form the ready candidates.
+  // A runtime cap can intentionally throttle the fan-out without changing
+  // DAG semantics; the next loop picks up the remaining ready tasks.
+  const readyCandidates = pending.filter((t) =>
+    t.depends_on.every((dep) => completedIds.has(dep)),
+  );
+
+  if (readyCandidates.length === 0) {
+    setWorkflowDone(db, wfId, 'failed');
+    throw new Error(`Cycle or unsatisfiable dependency in workflow ${wfId}`);
+  }
+
+  // OTIMIZAÇÃO 3: Workload-aware scheduling - priorizar tasks mais longas primeiro
+  // Isso maximiza o paralelismo executando tasks longas em paralelo com tasks curtas
+  const sortedReadyCandidates = [...readyCandidates].sort((a, b) => {
+    const timeoutA = a.timeout_seconds || 300; // Default 5 min
+    const timeoutB = b.timeout_seconds || 300;
+    return timeoutB - timeoutA; // Decrescente: tasks mais longas primeiro
+  });
+
+  // File-scope overlap guard (Fusion Tier 1 T1.2):
+  // When multiple ready candidates declare file_scope, avoid scheduling two
+  // that touch the same paths concurrently. Walk candidates in order; once a
+  // task is accepted into the batch, collect its scope and skip any later
+  // candidate that overlaps it. Deferred candidates remain pending and are
+  // picked up on the next loop iteration after the current batch settles.
+  const activeScopes: Array<string[]> = [];
+  const fileScopeFiltered: typeof readyCandidates = [];
+  const fileScopeDeferred: typeof readyCandidates = [];
+  for (const candidate of sortedReadyCandidates) { // OTIMIZAÇÃO 3: Usar sorted
+    const scope = candidate.file_scope ?? [];
+    if (scope.length > 0 && activeScopes.some((s) => pathsOverlap(scope, s))) {
+      fileScopeDeferred.push(candidate);
+    } else {
+      fileScopeFiltered.push(candidate);
+      if (scope.length > 0) activeScopes.push(scope);
+    }
+  }
+
+  // If every ready candidate was file-scope deferred, run the first deferred task to
+  // guarantee forward progress and prevent an infinite spin (no completions → same
+  // candidate set next tick).
+  const cappedCandidates = fileScopeFiltered.length > 0
+    ? fileScopeFiltered
+    : fileScopeDeferred.slice(0, 1);
+  const readyBatch = maxParallelTasks > 0
+    ? cappedCandidates.slice(0, maxParallelTasks)
+    : cappedCandidates;
+
+  if (fileScopeDeferred.length > 0) {
+    insertEvent(db, {
+      workflow_id: wfId,
+      type: 'workflow_parallelism_limited',
+      payload: {
+        limit: maxParallelTasks,
+        ready_count: readyCandidates.length,
+        scheduled_count: readyBatch.length,
+        file_scope_deferred: fileScopeDeferred.map((t) => t.id),
+      },
+    });
+  } else if (maxParallelTasks > 0 && readyCandidates.length > readyBatch.length) {
+    insertEvent(db, {
+      workflow_id: wfId,
+      type: 'workflow_parallelism_limited',
+      payload: {
+        limit: maxParallelTasks,
+        ready_count: readyCandidates.length,
+        scheduled_count: readyBatch.length,
+      },
+    });
+  }
+
+  return readyBatch;
+}
+
+// Loop phase (b) — Bloco 1.5: detect fan-out upstreams that qualify for
+// auto-summary and inject the summaries into each dependent's input_json.
+// Pure move out of runTaskLoop.
+async function injectFanoutAutoSummaries(
+  db: Database.Database,
+  tasks: Task[],
+  readyBatch: Task[],
+  wfId: string,
+  ws: string,
+  doExecute: (task: Task, signal?: AbortSignal) => Promise<string>,
+  doSleep: (ms: number) => Promise<void>,
+): Promise<void> {
+  const completedTasks = tasks.filter(t => t.status === 'completed');
+  const fanoutUpstreams = detectFanoutUpstreams(readyBatch, completedTasks);
+  for (const upstreamId of fanoutUpstreams) {
+    const upstream = completedTasks.find(t => t.id === upstreamId)!;
+    const dependents = readyBatch.filter(t => t.depends_on.includes(upstreamId));
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: upstream.id,
+      type: 'task_auto_summary_injected',
+      payload: {
+        upstream_task_id: upstreamId,
+        dependent_task_ids: dependents.map(t => t.id),
+        upstream_output_length: upstream.output_json?.length ?? 0,
+      },
+    });
+    const summaryText = await runAutoSummaryTask(
+      db, upstream, dependents, wfId, ws, doExecute, doSleep,
+    );
+    insertEvent(db, {
+      workflow_id: wfId,
+      task_id: upstream.id,
+      type: 'task_auto_summary_completed',
+      payload: { upstream_task_id: upstreamId, summary_length: summaryText.length },
+    });
+    for (const dep of dependents) {
+      const depCtx = safeParseJson<Record<string, unknown>>(dep.input_json, {
+        db,
+        workflowId: wfId,
+        taskId: dep.id,
+        where: 'auto_summary_merge_summarized_upstreams',
+      }) ?? {};
+      const existing = (depCtx['summarized_upstreams'] ?? {}) as Record<string, string>;
+      dep.input_json = JSON.stringify({
+        ...depCtx,
+        summarized_upstreams: { ...existing, [upstreamId]: summaryText },
+      });
+    }
+  }
+}
+
+// Loop phase (d) — adaptive path: a single supervisor call drives all adaptive
+// tasks in the batch, and its outcomes are mapped to PromiseSettledResult so
+// the rest of the loop (completedIds += success, throw on first rejection)
+// treats them uniformly with the ephemeral results. Pure move out of
+// runTaskLoop.
+async function runAdaptiveBatch(
+  db: Database.Database,
+  adaptiveBatch: Task[],
+  wfId: string,
+  opts: TaskLoopOpts,
+): Promise<PromiseSettledResult<void>[]> {
+  let adaptiveResults: PromiseSettledResult<void>[] = [];
+  if (adaptiveBatch.length === 0) return adaptiveResults;
+
+  try {
+    const supervisorResult = await runAdaptiveSupervisor(db, adaptiveBatch, {
+      workflowId: wfId,
+      workspace: opts.workspace ?? '',
+      maxIterations: opts.adaptiveMaxIterations ?? getAdaptiveMaxIterations(),
+      executeTurnFn: opts.adaptiveExecuteTurnFn,
+      onSubagentEvent: (event: SubagentEvent) => doOnSubagentEvent(db, event, wfId, opts),
+    });
+
+    // R-MED-1 fix: this push loop is INSIDE the try so a mid-loop throw can
+    // not produce a partially-populated array that the catch block then
+    // doubles. Either we fully populate, or catch resets to a clean fail.
+    for (const task of adaptiveBatch) {
+      const outcome = supervisorResult.outcomes.get(task.id);
+      if (outcome === undefined || outcome.status === 'ok') {
+        const resultText = outcome?.resultText ?? '(empty adaptive output)';
+        setTaskCompleted(db, task.id, resultText);
+        task.status = 'completed';
+        task.output_json = resultText;
+        adaptiveResults.push({ status: 'fulfilled', value: undefined });
+      } else {
+        setTaskFailed(db, task.id);
+        task.status = 'failed';
+        adaptiveResults.push({
+          status: 'rejected',
+          reason: new Error(`Adaptive task '${task.name}' failed: ${outcome.errorMsg ?? outcome.status}`),
+        });
+      }
+    }
+  } catch (err) {
+    // Whole-supervisor failure (or a throw inside the outcome-mapping loop
+    // above). Reset adaptiveResults to guarantee the array length matches
+    // adaptiveBatch.length so the readyBatch.map indexing stays valid.
+    adaptiveResults = [];
+    for (const task of adaptiveBatch) {
+      setTaskFailed(db, task.id);
+      task.status = 'failed';
+      insertEvent(db, {
+        workflow_id: wfId,
+        task_id: task.id,
+        type: 'adaptive_supervisor_error',
+        payload: { error: (err as Error).message },
+      });
+      adaptiveResults.push({ status: 'rejected', reason: err as Error });
+    }
+  }
+  return adaptiveResults;
+}
+
 // Exported for unit-testing retry and parallelism directly.
 export async function runTaskLoop(
   db: Database.Database,
@@ -329,12 +510,10 @@ export async function runTaskLoop(
   const seedSharedStateFromCompleted = (): void => {
     for (const t of tasks) {
       if (t.status !== 'completed' || t.output_json === null || t.output_json === undefined) continue;
-      const key = dagIdOf(t);
-      // Do not clobber a value a deterministic step already wrote under the same
-      // key (output_key collisions are author error, but completed-output wins
-      // only when the key is still unset to keep step writes authoritative).
-      if (!(key in sharedState)) sharedState[key] = t.output_json;
-      else sharedState[key] = t.output_json; // refresh upstream output each tick
+      // Completed-task output is refreshed under its DAG id every tick, so an
+      // output_key collision with a deterministic-step write (author error) is
+      // resolved in favour of the completed output.
+      sharedState[dagIdOf(t)] = t.output_json;
     }
   };
 
@@ -358,8 +537,7 @@ export async function runTaskLoop(
       db,
     });
 
-  const baseExecute = opts.executeTaskFn ?? dispatchDeterministic;
-  const doExecute = baseExecute;
+  const doExecute = opts.executeTaskFn ?? dispatchDeterministic;
   const doSleep = opts.sleepFn ?? sleep;
   // MÉDIO-4 (revisão adversarial 2026-07-04): envolve o reviewer num span
   // context com ledgerSource='reviewer' para que o chokepoint LLM grave a
@@ -396,119 +574,18 @@ export async function runTaskLoop(
     // deterministic step scheduled in this one.
     seedSharedStateFromCompleted();
 
-    // All tasks whose dependencies are satisfied form the ready candidates.
-    // A runtime cap can intentionally throttle the fan-out without changing
-    // DAG semantics; the next loop picks up the remaining ready tasks.
-    const readyCandidates = pending.filter((t) =>
-      t.depends_on.every((dep) => completedIds.has(dep)),
+    // Phase (a) — ready-candidate selection + workload ordering + file-scope
+    // guard + parallelism cap (see selectReadyBatch above).
+    const readyBatch = selectReadyBatch(
+      db,
+      wfId,
+      pending,
+      completedIds,
+      opts.maxParallelTasks ?? getMaxParallelTasks(),
     );
 
-    if (readyCandidates.length === 0) {
-      setWorkflowDone(db, wfId, 'failed');
-      throw new Error(`Cycle or unsatisfiable dependency in workflow ${wfId}`);
-    }
-
-    const maxParallelTasks = opts.maxParallelTasks ?? getMaxParallelTasks();
-
-    // OTIMIZAÇÃO 3: Workload-aware scheduling - priorizar tasks mais longas primeiro
-    // Isso maximiza o paralelismo executando tasks longas em paralelo com tasks curtas
-    const sortedReadyCandidates = [...readyCandidates].sort((a, b) => {
-      const timeoutA = a.timeout_seconds || 300; // Default 5 min
-      const timeoutB = b.timeout_seconds || 300;
-      return timeoutB - timeoutA; // Decrescente: tasks mais longas primeiro
-    });
-
-    // File-scope overlap guard (Fusion Tier 1 T1.2):
-    // When multiple ready candidates declare file_scope, avoid scheduling two
-    // that touch the same paths concurrently. Walk candidates in order; once a
-    // task is accepted into the batch, collect its scope and skip any later
-    // candidate that overlaps it. Deferred candidates remain pending and are
-    // picked up on the next loop iteration after the current batch settles.
-    const activeScopes: Array<string[]> = [];
-    const fileScopeFiltered: typeof readyCandidates = [];
-    const fileScopeDeferred: typeof readyCandidates = [];
-    for (const candidate of sortedReadyCandidates) { // OTIMIZAÇÃO 3: Usar sorted
-      const scope = candidate.file_scope ?? [];
-      if (scope.length > 0 && activeScopes.some((s) => pathsOverlap(scope, s))) {
-        fileScopeDeferred.push(candidate);
-      } else {
-        fileScopeFiltered.push(candidate);
-        if (scope.length > 0) activeScopes.push(scope);
-      }
-    }
-
-    // If every ready candidate was file-scope deferred, run the first deferred task to
-    // guarantee forward progress and prevent an infinite spin (no completions → same
-    // candidate set next tick).
-    const cappedCandidates = fileScopeFiltered.length > 0
-      ? fileScopeFiltered
-      : fileScopeDeferred.slice(0, 1);
-    const readyBatch = maxParallelTasks > 0
-      ? cappedCandidates.slice(0, maxParallelTasks)
-      : cappedCandidates;
-
-    if (fileScopeDeferred.length > 0) {
-      insertEvent(db, {
-        workflow_id: wfId,
-        type: 'workflow_parallelism_limited',
-        payload: {
-          limit: maxParallelTasks,
-          ready_count: readyCandidates.length,
-          scheduled_count: readyBatch.length,
-          file_scope_deferred: fileScopeDeferred.map((t) => t.id),
-        },
-      });
-    } else if (maxParallelTasks > 0 && readyCandidates.length > readyBatch.length) {
-      insertEvent(db, {
-        workflow_id: wfId,
-        type: 'workflow_parallelism_limited',
-        payload: {
-          limit: maxParallelTasks,
-          ready_count: readyCandidates.length,
-          scheduled_count: readyBatch.length,
-        },
-      });
-    }
-
-    // Bloco 1.5 — detect fan-out upstreams that qualify for auto-summary
-    const completedTasks = tasks.filter(t => t.status === 'completed');
-    const fanoutUpstreams = detectFanoutUpstreams(readyBatch, completedTasks);
-    for (const upstreamId of fanoutUpstreams) {
-      const upstream = completedTasks.find(t => t.id === upstreamId)!;
-      const dependents = readyBatch.filter(t => t.depends_on.includes(upstreamId));
-      insertEvent(db, {
-        workflow_id: wfId,
-        task_id: upstream.id,
-        type: 'task_auto_summary_injected',
-        payload: {
-          upstream_task_id: upstreamId,
-          dependent_task_ids: dependents.map(t => t.id),
-          upstream_output_length: upstream.output_json?.length ?? 0,
-        },
-      });
-      const summaryText = await runAutoSummaryTask(
-        db, upstream, dependents, wfId, ws, doExecute, doSleep,
-      );
-      insertEvent(db, {
-        workflow_id: wfId,
-        task_id: upstream.id,
-        type: 'task_auto_summary_completed',
-        payload: { upstream_task_id: upstreamId, summary_length: summaryText.length },
-      });
-      for (const dep of dependents) {
-        const depCtx = safeParseJson<Record<string, unknown>>(dep.input_json, {
-          db,
-          workflowId: wfId,
-          taskId: dep.id,
-          where: 'auto_summary_merge_summarized_upstreams',
-        }) ?? {};
-        const existing = (depCtx['summarized_upstreams'] ?? {}) as Record<string, string>;
-        dep.input_json = JSON.stringify({
-          ...depCtx,
-          summarized_upstreams: { ...existing, [upstreamId]: summaryText },
-        });
-      }
-    }
+    // Phase (b) — Bloco 1.5: auto-summary injection for fan-out upstreams.
+    await injectFanoutAutoSummaries(db, tasks, readyBatch, wfId, ws, doExecute, doSleep);
 
     // Execute the entire batch in parallel; collect all outcomes before continuing
     await doOnEvent({
@@ -594,58 +671,10 @@ export async function runTaskLoop(
       }),
     );
 
-    // Adaptive path — single supervisor call drives all adaptive tasks in this batch.
-    let adaptiveResults: PromiseSettledResult<void>[] = [];
-    if (adaptiveBatch.length > 0) {
-      try {
-        const supervisorResult = await runAdaptiveSupervisor(db, adaptiveBatch, {
-          workflowId: wfId,
-          workspace: ws,
-          maxIterations: opts.adaptiveMaxIterations ?? getAdaptiveMaxIterations(),
-          executeTurnFn: opts.adaptiveExecuteTurnFn,
-          onSubagentEvent: (event: SubagentEvent) => doOnSubagentEvent(db, event, wfId, opts),
-        });
-
-        // Map supervisor outcomes to PromiseSettledResult so the rest of the loop
-        // (completedIds += success, throw on first rejection) treats them uniformly.
-        // R-MED-1 fix: this push loop is INSIDE the try so a mid-loop throw can
-        // not produce a partially-populated array that the catch block then
-        // doubles. Either we fully populate, or catch resets to a clean fail.
-        for (const task of adaptiveBatch) {
-          const outcome = supervisorResult.outcomes.get(task.id);
-          if (outcome === undefined || outcome.status === 'ok') {
-            const resultText = outcome?.resultText ?? '(empty adaptive output)';
-            setTaskCompleted(db, task.id, resultText);
-            task.status = 'completed';
-            task.output_json = resultText;
-            adaptiveResults.push({ status: 'fulfilled', value: undefined });
-          } else {
-            setTaskFailed(db, task.id);
-            task.status = 'failed';
-            adaptiveResults.push({
-              status: 'rejected',
-              reason: new Error(`Adaptive task '${task.name}' failed: ${outcome.errorMsg ?? outcome.status}`),
-            });
-          }
-        }
-      } catch (err) {
-        // Whole-supervisor failure (or a throw inside the outcome-mapping loop
-        // above). Reset adaptiveResults to guarantee the array length matches
-        // adaptiveBatch.length so the readyBatch.map indexing stays valid.
-        adaptiveResults = [];
-        for (const task of adaptiveBatch) {
-          setTaskFailed(db, task.id);
-          task.status = 'failed';
-          insertEvent(db, {
-            workflow_id: wfId,
-            task_id: task.id,
-            type: 'adaptive_supervisor_error',
-            payload: { error: (err as Error).message },
-          });
-          adaptiveResults.push({ status: 'rejected', reason: err as Error });
-        }
-      }
-    }
+    // Phase (d) — adaptive path: single supervisor call drives all adaptive
+    // tasks in this batch, outcomes mapped to PromiseSettledResult (see
+    // runAdaptiveBatch above).
+    const adaptiveResults = await runAdaptiveBatch(db, adaptiveBatch, wfId, opts);
 
     // Combine results back into the readyBatch order so the existing
     // completedIds/failure logic continues to work.
@@ -988,8 +1017,8 @@ export async function executeWorkflow(
       || /\bcancel(?:l)?ed\b/i.test((err as Error)?.message ?? '')
       || /canceled by operator/i.test((err as Error)?.message ?? '');
     if (!isAbort) {
-      fireWorkflowFailedNotification(
-        db,
+      fireWorkflowNotification(
+        'failed',
         wfId,
         objective,
         err instanceof Error ? err.message : String(err),
@@ -1086,7 +1115,7 @@ export async function executeWorkflow(
   // WIRE-04 — surface a dashboard notification on successful completion.
   // Fail-safe: dispatched fire-and-forget so a notification-service failure
   // never blocks or masks the workflow result.
-  fireWorkflowCompletedNotification(db, wfId, objective);
+  fireWorkflowNotification('completed', wfId, objective);
 
   // W2 (2026-05-11): if this workflow has a parent (i.e. it's a
   // remediation child), flip the parent's status now that we resolved
@@ -1094,10 +1123,9 @@ export async function executeWorkflow(
   // the helper is no-op when there's no parent and audit-logs all
   // failures into the events table.
   try {
-    const completedWf = workflow.id ? db
+    const completedWf = db
       .prepare(`SELECT parent_workflow_id FROM workflows WHERE id = ?`)
-      .get(wfId) as { parent_workflow_id: string | null } | undefined
-      : undefined;
+      .get(wfId) as { parent_workflow_id: string | null } | undefined;
     if (completedWf?.parent_workflow_id) {
       resolveParentAfterRemediation(db, completedWf.parent_workflow_id, wfId, 'completed');
     }
@@ -1236,8 +1264,8 @@ export async function continueWorkflowExecution(
 
     // WIRE-04 — resume path failed to clear all failed tasks. Surface a
     // dashboard notification (fail-safe, fire-and-forget).
-    fireWorkflowFailedNotification(
-      db,
+    fireWorkflowNotification(
+      'failed',
       workflow.id,
       workflow.objective,
       `Workflow still has ${failedTasks.length} failed task(s) after resume/retry`,
@@ -1292,7 +1320,7 @@ export async function continueWorkflowExecution(
 
   // WIRE-04 — resume path completed successfully. Surface a dashboard
   // notification (fail-safe, fire-and-forget).
-  fireWorkflowCompletedNotification(db, workflow.id, workflow.objective);
+  fireWorkflowNotification('completed', workflow.id, workflow.objective);
 
   // Sync costs to OmniRoute (non-blocking, runs in background).
   // INTEL-05 — no silent swallow. This runs AFTER the terminal

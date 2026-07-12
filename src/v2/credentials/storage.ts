@@ -6,12 +6,12 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import type {
   CredentialStorage,
   DecryptedCredential,
   CredentialMetadata,
   CredentialProviderConfig,
+  CredentialType,
   EncryptedCredential,
 } from './types.js';
 import {
@@ -49,8 +49,10 @@ export class EnvCredentialStorage implements CredentialStorage {
       `${service.toUpperCase()}_API_KEY`,
       `${service.toUpperCase()}_TOKEN`,
       `${this.prefix}${service.toUpperCase()}_API_KEY`,
-      `OMNIROUTE_API_KEY`, // Special case for Omniroute
     ];
+    if (service === 'omniroute') {
+      patterns.push(`OMNIROUTE_API_KEY`); // Special case for Omniroute
+    }
 
     for (const pattern of patterns) {
       const value = process.env[pattern];
@@ -86,7 +88,7 @@ export class EnvCredentialStorage implements CredentialStorage {
           credentials.push({
             id: generateCredentialId(),
             name: `${service} credential`,
-            type: type as any,
+            type: type as CredentialType,
             service,
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
@@ -109,7 +111,9 @@ export class EnvCredentialStorage implements CredentialStorage {
   }
 
   async exists(id: string): Promise<boolean> {
-    return (await this.retrieve(id)) !== null;
+    // Env storage doesn't support ID-based retrieval (see retrieve above),
+    // so existence checks by ID always report false. Use retrieveByService instead.
+    return false;
   }
 }
 
@@ -164,12 +168,12 @@ export class EncryptedFileStorage implements CredentialStorage {
     await this.save();
   }
 
-  async retrieve(id: string): Promise<DecryptedCredential | null> {
-    await this.ensureLoaded();
-
-    const encrypted = this.credentials.get(id);
-    if (!encrypted) return null;
-
+  /**
+   * Decrypt a stored credential, treating failures as "not found".
+   * Note: a wrong master key surfaces as a logged error + null, not a throw —
+   * callers see the credential as missing.
+   */
+  private tryDecrypt(id: string, encrypted: EncryptedCredential): DecryptedCredential | null {
     try {
       return decryptCredentialObject(encrypted, this.config.masterKey);
     } catch (error) {
@@ -178,17 +182,22 @@ export class EncryptedFileStorage implements CredentialStorage {
     }
   }
 
+  async retrieve(id: string): Promise<DecryptedCredential | null> {
+    await this.ensureLoaded();
+
+    const encrypted = this.credentials.get(id);
+    if (!encrypted) return null;
+
+    return this.tryDecrypt(id, encrypted);
+  }
+
   async retrieveByService(service: string): Promise<DecryptedCredential | null> {
     await this.ensureLoaded();
 
     for (const [id, encrypted] of this.credentials.entries()) {
       if (encrypted.metadata.service === service) {
-        try {
-          return decryptCredentialObject(encrypted, this.config.masterKey);
-        } catch (error) {
-          console.error(`Failed to decrypt credential ${id}:`, error);
-          continue;
-        }
+        const decrypted = this.tryDecrypt(id, encrypted);
+        if (decrypted) return decrypted;
       }
     }
 

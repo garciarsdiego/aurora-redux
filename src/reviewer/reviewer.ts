@@ -1,8 +1,7 @@
 import { spawn, type SpawnOptionsWithoutStdio } from 'node:child_process';
-import { z } from 'zod';
 import type { Task, ReviewResult } from '../types/index.js';
 import { callOmniroute } from '../utils/omniroute-call.js';
-import { getReviewerModel, getReviewPassThreshold, getUsePersonas } from '../utils/config.js';
+import { getReviewerModel, getUsePersonas } from '../utils/config.js';
 import {
   ReviewOutcomeSchema,
   reviewOutcomeToResult,
@@ -68,12 +67,23 @@ function spawnClaude(prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn('claude', claudeArgs, getReviewerSpawnOptions());
     const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
     child.stdout.on('data', (c: Buffer) => chunks.push(c));
+    child.stderr.on('data', (c: Buffer) => errChunks.push(c));
+    // Swallow EPIPE when the spawn fails before stdin is consumed; the
+    // 'error'/'close' handlers below report the real cause.
+    child.stdin.on('error', () => {});
     child.stdin.write(prompt, 'utf8');
     child.stdin.end();
     child.on('close', (code) => {
-      if (code === 0) resolve(Buffer.concat(chunks).toString('utf8').trim());
-      else reject(new Error(`Reviewer CLI exited ${String(code)}`));
+      if (code === 0) {
+        resolve(Buffer.concat(chunks).toString('utf8').trim());
+      } else {
+        const stderr = Buffer.concat(errChunks).toString('utf8').trim();
+        reject(new Error(
+          `Reviewer CLI exited ${String(code)}${stderr ? `. Stderr: ${stderr.slice(0, 300)}` : ''}`,
+        ));
+      }
     });
     child.on('error', (err: Error) => reject(new Error(`Reviewer CLI spawn: ${err.message}`)));
   });

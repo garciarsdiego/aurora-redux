@@ -23,11 +23,25 @@ export type HitlConfig = z.infer<typeof HitlConfigSchema>;
 
 export function loadHitlConfig(workspace: string): HitlConfig | null {
   const configPath = resolve('workspaces', workspace, '.hitl.json');
+
+  let raw: string;
   try {
-    const raw = readFileSync(configPath, 'utf-8');
+    raw = readFileSync(configPath, 'utf-8');
+  } catch (err) {
+    // Missing config is expected (workspace without HITL configured).
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn(`[HITL] Failed to read ${configPath}: ${(err as Error).message}`);
+    }
+    return null;
+  }
+
+  try {
     const parsed = JSON.parse(raw) as unknown;
     return HitlConfigSchema.parse(parsed);
-  } catch {
+  } catch (err) {
+    // Config exists but is malformed/invalid — warn instead of silently
+    // falling back to the terminal channel.
+    console.warn(`[HITL] Invalid config at ${configPath}, falling back to terminal: ${(err as Error).message}`);
     return null;
   }
 }

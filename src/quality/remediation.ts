@@ -433,20 +433,22 @@ export function resolveParentAfterRemediation(
   if (!parent) return;
   if (parent.status !== 'awaiting_remediation') return;
 
-  if (childOutcome === 'completed') {
-    // Parent now considered completed because the child cleared its fix-
-    // tasks under operator approval. The parent's task fan-out itself is
-    // already in `failed` / `completed` state from the original loop — we
-    // don't re-execute anything.
-    db.prepare(
-      `UPDATE workflows SET status = 'completed', completed_at = ? WHERE id = ?`,
-    ).run(Date.now(), parentWfId);
-    insertEvent(db, {
-      workflow_id: parentWfId,
-      type: 'workflow_remediation_completed',
-      payload: { child_workflow_id: childWfId },
-    });
+  // On child success the parent is considered completed because the child
+  // cleared its fix-tasks under operator approval; on child failure the
+  // parent fails too. The parent's task fan-out itself is already in
+  // `failed` / `completed` state from the original loop — we don't
+  // re-execute anything.
+  const completed = childOutcome === 'completed';
+  db.prepare(
+    `UPDATE workflows SET status = ?, completed_at = ? WHERE id = ?`,
+  ).run(completed ? 'completed' : 'failed', Date.now(), parentWfId);
+  insertEvent(db, {
+    workflow_id: parentWfId,
+    type: completed ? 'workflow_remediation_completed' : 'workflow_remediation_failed',
+    payload: { child_workflow_id: childWfId },
+  });
 
+  if (completed) {
     // Sweep the workflow_tasks: any tasks still in 'pending' (downstream
     // dependents of the failed task) stay pending and the operator can
     // resume the parent manually. We don't auto-resume because the parent
@@ -464,14 +466,5 @@ export function resolveParentAfterRemediation(
         },
       });
     }
-  } else {
-    db.prepare(
-      `UPDATE workflows SET status = 'failed', completed_at = ? WHERE id = ?`,
-    ).run(Date.now(), parentWfId);
-    insertEvent(db, {
-      workflow_id: parentWfId,
-      type: 'workflow_remediation_failed',
-      payload: { child_workflow_id: childWfId },
-    });
   }
 }

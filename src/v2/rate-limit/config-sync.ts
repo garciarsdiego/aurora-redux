@@ -5,8 +5,8 @@
  * Fetches OmniRoute's reported limits and updates adaptive limiters accordingly.
  */
 
-import type { OmniRouteRateLimitInfo, RateLimitConfig } from './types.js';
-import { AdaptiveLimiter } from './adaptive-limiter.js';
+import type { OmniRouteRateLimitInfo } from './types.js';
+import type { AdaptiveLimiter } from './adaptive-limiter.js';
 import { checkDetailedHealth } from '../omniroute-bridge/client.js';
 
 export interface ConfigSyncOptions {
@@ -108,7 +108,7 @@ export class RateLimitConfigSync {
 
       // Update all registered adaptive limiters
       for (const limiter of this.adaptiveLimiters) {
-        for (const [endpoint, limitInfo] of limits) {
+        for (const limitInfo of limits.values()) {
           limiter.updateOmniRouteLimit(limitInfo);
         }
       }

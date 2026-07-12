@@ -34,10 +34,8 @@ import {
   endTraceSpan,
   spanContextStorage,
 } from '../../v2/observability/tracing.js';
-import { runtimeError, type RuntimeRunEvent } from '../../runtime/events.js';
+import { runtimeError } from '../../runtime/events.js';
 import {
-  appendRuntimeStreamEvent,
-  completeRuntimeTurn,
   createRuntimeSession,
   startRuntimeTurn,
 } from '../../runtime/store.js';
@@ -51,12 +49,15 @@ import { buildCliSpawnOptions, resolveSpawnTarget } from './spawn-common.js';
 import { buildPrompt } from './prompt-builder.js';
 import { applyRuntimeInjections } from './runtime-injection.js';
 import {
+  extractToolUsesFromEvent,
   parseClaudeStreamJson,
   parseGeminiStreamJson,
   geminiParsedToClaudeShape,
+  summarizeToolCallInput,
   wrapClaudeOutput,
 } from './jsonl-parser.js';
 import { runOpencodeViaAcp, shouldUseOpencodeAcp } from './opencode-acp.js';
+import { createRuntimeRecorders, type RuntimeRecorderIds } from './runtime-recorders.js';
 
 // =============================================================================
 // Public re-exports — preserve the entire surface area that downstream
@@ -132,60 +133,31 @@ export function runCliTask(
     } catch { /* tracing must not break execution */ }
   }
 
+  // Best-effort span close shared by the 'close' and 'error' handlers below.
+  const closeSpan = (status: 'ok' | 'error', attributes: Record<string, unknown>): void => {
+    if (!spanId || !spanCtx) return;
+    try {
+      endTraceSpan(spanCtx.db, spanId, { status, attributes });
+    } catch { /* tracing must not break execution */ }
+  };
+
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     let cumulativeChars = 0;
     let chunkSeq = 0;
     let firstChunkAt: number | null = null;
-    let runtimeSessionId: string | null = null;
-    let runtimeTurnId: string | null = null;
-    const appendRuntime = (event: RuntimeRunEvent): void => {
-      if (!spanCtx || !runtimeSessionId || !runtimeTurnId) return;
-      try {
-        appendRuntimeStreamEvent(spanCtx.db, {
-          sessionId: runtimeSessionId,
-          turnId: runtimeTurnId,
-          workflowId: task.workflow_id,
-          taskId: task.id,
-          event: {
-            ...event,
-            executorId: event.executorId || runtimeExecutorId,
-            sessionId: event.sessionId ?? runtimeSessionId,
-            turnId: event.turnId ?? runtimeTurnId,
-          },
-        });
-      } catch {
-        // Runtime recording is observability only; never break CLI execution.
-      }
-    };
-    const completeRuntime = (
-      status: 'completed' | 'failed' | 'canceled',
-      resultSummary?: string | null,
-      errorMessage?: string,
-    ): void => {
-      if (!spanCtx || !runtimeTurnId) return;
-      try {
-        completeRuntimeTurn(spanCtx.db, runtimeTurnId, {
-          status,
-          resultSummary,
-          error: errorMessage
-            ? {
-              code: 'cli_spawn_failed',
-              origin: `task:${task.id}`,
-              message: errorMessage,
-              suggestedAction: 'Inspect the task terminal, runtime tab, and CLI fallback reason before retrying.',
-              safeContext: {
-                executorId: runtimeExecutorId,
-                model: task.model ?? null,
-                fallbackReason: runtimeFormat.fallbackReason,
-              },
-            }
-            : null,
-        });
-      } catch {
-        // Runtime recording is best-effort.
-      }
-    };
+    // Session/turn ids are stamped onto this holder once the runtime rows
+    // exist; the recorders are no-ops until then (see runtime-recorders.ts).
+    const recorderIds: RuntimeRecorderIds = { sessionId: null, turnId: null };
+    const { appendRuntime, completeRuntime } = createRuntimeRecorders({
+      spanCtx,
+      task,
+      runtimeExecutorId,
+      ids: recorderIds,
+      errorCode: 'cli_spawn_failed',
+      suggestedAction: 'Inspect the task terminal, runtime tab, and CLI fallback reason before retrying.',
+      safeContextExtras: { fallbackReason: runtimeFormat.fallbackReason },
+    });
     if (spanCtx) {
       try {
         const session = createRuntimeSession(spanCtx.db, {
@@ -220,8 +192,8 @@ export function runCliTask(
             max_retries: task.max_retries,
           },
         });
-        runtimeSessionId = session.id;
-        runtimeTurnId = turn.id;
+        recorderIds.sessionId = session.id;
+        recorderIds.turnId = turn.id;
         appendRuntime({
           type: 'runtime.turn.started',
           ts: startedAt,
@@ -374,18 +346,16 @@ export function runCliTask(
     let lineBuffer = '';
     const emitToolCall = (toolName: string, input: Record<string, unknown>): void => {
       if (!opts.onEvent) return;
-      // Build a tiny human-readable input summary — full input in the buffered
-      // wrap that the reviewer sees; this is just for live UI.
-      const summary = toolName === 'Agent'
-        ? `subagent_type=${String(input['subagent_type'] ?? 'general-purpose')}`
-        : Object.keys(input).slice(0, 3).join(',');
+      // Tiny human-readable input summary (shared with formatToolCallSummary
+      // via summarizeToolCallInput) — full input in the buffered wrap that the
+      // reviewer sees; this is just for live UI.
       void opts.onEvent({
         type: 'cli_tool_call',
         workflow_id: task.workflow_id,
         payload: {
           task_id: task.id,
           tool_name: toolName,
-          input_summary: summary,
+          input_summary: summarizeToolCallInput(toolName, input),
         },
       });
     };
@@ -396,17 +366,10 @@ export function runCliTask(
       let event: unknown;
       try { event = JSON.parse(trimmed); } catch { return; }
       if (typeof event !== 'object' || event === null) return;
-      const ev = event as Record<string, unknown>;
-      if (ev['type'] !== 'assistant') return;
-      const message = ev['message'] as Record<string, unknown> | undefined;
-      const content = message?.['content'];
-      if (!Array.isArray(content)) return;
-      for (const block of content) {
-        if (typeof block !== 'object' || block === null) continue;
-        const b = block as Record<string, unknown>;
-        if (b['type'] === 'tool_use' && typeof b['name'] === 'string') {
-          emitToolCall(b['name'], (b['input'] as Record<string, unknown> | undefined) ?? {});
-        }
+      // tool_use extraction is single-sourced in jsonl-parser.ts so this live
+      // tap and the buffered parseClaudeStreamJson pass can never drift.
+      for (const call of extractToolUsesFromEvent(event as Record<string, unknown>)) {
+        emitToolCall(call.name, call.input);
       }
     };
 
@@ -441,6 +404,21 @@ export function runCliTask(
     }
     child.stdin.end();
 
+    // Success epilogue shared by the three code===0 exits below (stream-json
+    // ok, stream-json parse fallback, plain text): record the result event,
+    // complete the turn, resolve with a never-empty string.
+    const resolveWithOutput = (text: string, extraResult?: Record<string, unknown>): void => {
+      appendRuntime({
+        type: 'runtime.result',
+        ts: Date.now(),
+        executorId: runtimeExecutorId,
+        text: text.slice(0, 500),
+        result: { chars: text.length, ...(extraResult ?? {}) },
+      });
+      completeRuntime('completed', text.slice(0, 500));
+      resolve(text);
+    };
+
     // Sprint 3.8 (D-H2.066, F-REL-7): use `once` for terminal events to
      // prevent listener accumulation if abort fires after rapid retries.
      // 'close' and 'error' fire exactly once per child lifecycle.
@@ -459,17 +437,10 @@ export function runCliTask(
           exit_code: code,
         },
       });
-      if (spanId && spanCtx) {
-        try {
-          endTraceSpan(spanCtx.db, spanId, {
-            status: code === 0 && !signal?.aborted ? 'ok' : 'error',
-            attributes: {
-              exit_code: code ?? null,
-              duration_ms: durationMs,
-            },
-          });
-        } catch { /* tracing must not break execution */ }
-      }
+      closeSpan(code === 0 && !signal?.aborted ? 'ok' : 'error', {
+        exit_code: code ?? null,
+        duration_ms: durationMs,
+      });
       if (signal?.aborted) {
         const message = `CLI ${bin} killed (timeout)`;
         appendRuntime(runtimeError(runtimeExecutorId, 'cli_killed_timeout', message, 'Retry with a higher timeout or inspect the task terminal for the last emitted line.', {
@@ -522,41 +493,16 @@ export function runCliTask(
               reject(new Error(message));
               return;
             }
-            const wrapped = wrapClaudeOutput(parsed);
-            appendRuntime({
-              type: 'runtime.result',
-              ts: Date.now(),
-              executorId: runtimeExecutorId,
-              text: wrapped.slice(0, 500),
-              result: { chars: wrapped.length, tool_calls: parsed.toolCalls.length },
-            });
-            completeRuntime('completed', wrapped.slice(0, 500));
-            resolve(wrapped);
+            resolveWithOutput(wrapClaudeOutput(parsed), { tool_calls: parsed.toolCalls.length });
             return;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             process.stderr.write(`[cli] stream-json parse failed (${msg}); returning raw output\n`);
-            appendRuntime({
-              type: 'runtime.result',
-              ts: Date.now(),
-              executorId: runtimeExecutorId,
-              text: (out || '(empty output)').slice(0, 500),
-              result: { chars: (out || '(empty output)').length, parse_fallback: msg },
-            });
-            completeRuntime('completed', (out || '(empty output)').slice(0, 500));
-            resolve(out || '(empty output)');
+            resolveWithOutput(out || '(empty output)', { parse_fallback: msg });
             return;
           }
         }
-        appendRuntime({
-          type: 'runtime.result',
-          ts: Date.now(),
-          executorId: runtimeExecutorId,
-          text: (out || '(empty output)').slice(0, 500),
-          result: { chars: (out || '(empty output)').length },
-        });
-        completeRuntime('completed', (out || '(empty output)').slice(0, 500));
-        resolve(out || '(empty output)');
+        resolveWithOutput(out || '(empty output)');
       } else {
         // Tier-0 Wave 4 (0.15) — stderr-tail redaction. The error message is
         // both rejected (caller observes it) and recorded via runtimeError;
@@ -575,17 +521,10 @@ export function runCliTask(
     });
 
     child.once('error', (err: NodeJS.ErrnoException) => {
-      if (spanId && spanCtx) {
-        try {
-          endTraceSpan(spanCtx.db, spanId, {
-            status: 'error',
-            attributes: {
-              error: err.message,
-              duration_ms: Date.now() - startedAt,
-            },
-          });
-        } catch { /* tracing must not break execution */ }
-      }
+      closeSpan('error', {
+        error: err.message,
+        duration_ms: Date.now() - startedAt,
+      });
       const message = `CLI ${bin} spawn error: ${err.message}`;
       appendRuntime(runtimeError(runtimeExecutorId, 'cli_spawn_error', message, 'Verify the CLI binary path and spawn target resolution.', {
         bin,

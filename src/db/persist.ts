@@ -16,8 +16,7 @@ import type { WorkflowProgressEvent } from '../brain/executor/types.js';
 import { redactSecrets } from '../v2/security/redact.js';
 import { withSqliteRetrySync } from './sqlite-retry.js';
 
-// Raw DB row shapes (depends_on stored as JSON string, not array)
-type WorkflowRow = Omit<Workflow, never>;
+// Raw DB row shape (depends_on stored as JSON string, not array)
 type TaskRow = Omit<Task, 'depends_on' | 'kind' | 'status' | 'hitl' | 'file_scope' | 'output_pinned'> & {
   depends_on_json: string | null;
   file_scope_json: string | null;
@@ -26,10 +25,6 @@ type TaskRow = Omit<Task, 'depends_on' | 'kind' | 'status' | 'hitl' | 'file_scop
   hitl: number; // 0 or 1
   output_pinned?: number; // 0 or 1 (migration 060)
 };
-
-function rowToWorkflow(row: WorkflowRow): Workflow {
-  return row as Workflow;
-}
 
 function rowToTask(row: TaskRow): Task {
   return {
@@ -247,6 +242,36 @@ export function setWorkflowStarted(db: Database.Database, id: string): void {
   );
 }
 
+// W2 (2026-05-11): when a remediation child fails, propagate the outcome to
+// the parent inline (no dynamic import to avoid a circular edge with
+// quality/remediation.ts). Uses raw SQL so setWorkflowDone remains the bottom
+// of the dependency graph.
+//
+// Only fires when the row has a parent_workflow_id. The completed-OK path
+// emits a richer event from orchestrate.ts; here we only need to cover the
+// FAIL path so the parent doesn't stay stuck in 'awaiting_remediation'
+// forever when the child fails.
+function propagateRemediationFailureToParent(db: Database.Database, childId: string): void {
+  const row = db
+    .prepare(`SELECT parent_workflow_id FROM workflows WHERE id = ?`)
+    .get(childId) as { parent_workflow_id: string | null } | undefined;
+  if (!row?.parent_workflow_id) return;
+
+  const parentId = row.parent_workflow_id;
+  const parentRow = db
+    .prepare(`SELECT status FROM workflows WHERE id = ?`)
+    .get(parentId) as { status: string } | undefined;
+  if (parentRow?.status !== 'awaiting_remediation') return;
+
+  db.prepare(
+    `UPDATE workflows SET status = 'failed', completed_at = ? WHERE id = ?`,
+  ).run(Date.now(), parentId);
+  db.prepare(
+    `INSERT INTO events (workflow_id, task_id, type, payload_json, timestamp)
+     VALUES (?, NULL, 'workflow_remediation_failed', ?, ?)`,
+  ).run(parentId, JSON.stringify({ child_workflow_id: childId }), Date.now());
+}
+
 export function setWorkflowDone(
   db: Database.Database,
   id: string,
@@ -258,34 +283,9 @@ export function setWorkflowDone(
     ).run(status, Date.now(), id),
   );
 
-  // W2 (2026-05-11): when this row is a remediation child, propagate the
-  // outcome to the parent inline (no dynamic import to avoid a circular
-  // edge with quality/remediation.ts). Use raw SQL here so this function
-  // remains the bottom of the dependency graph.
-  //
-  // Only fires when the row has a parent_workflow_id. The completed-OK
-  // path emits a richer event from orchestrate.ts; here we only need to
-  // cover the FAIL path so the parent doesn't stay stuck in
-  // 'awaiting_remediation' forever when the child fails.
+  if (status !== 'failed') return;
   try {
-    const row = db
-      .prepare(`SELECT parent_workflow_id FROM workflows WHERE id = ?`)
-      .get(id) as { parent_workflow_id: string | null } | undefined;
-    if (row?.parent_workflow_id && status === 'failed') {
-      const parentId = row.parent_workflow_id;
-      const parentRow = db
-        .prepare(`SELECT status FROM workflows WHERE id = ?`)
-        .get(parentId) as { status: string } | undefined;
-      if (parentRow?.status === 'awaiting_remediation') {
-        db.prepare(
-          `UPDATE workflows SET status = 'failed', completed_at = ? WHERE id = ?`,
-        ).run(Date.now(), parentId);
-        db.prepare(
-          `INSERT INTO events (workflow_id, task_id, type, payload_json, timestamp)
-           VALUES (?, NULL, 'workflow_remediation_failed', ?, ?)`,
-        ).run(parentId, JSON.stringify({ child_workflow_id: id }), Date.now());
-      }
-    }
+    propagateRemediationFailureToParent(db, id);
   } catch (err) {
     // setWorkflowDone must never throw, but a silent catch hides a stuck
     // parent in 'awaiting_remediation'. Best-effort: write a single stderr
@@ -475,8 +475,8 @@ export function findExecutingWorkflow(
        WHERE workspace = ? AND objective = ? AND status = 'executing'
        ORDER BY created_at DESC LIMIT 1`,
     )
-    .get(workspace, objective) as WorkflowRow | undefined;
-  return row ? rowToWorkflow(row) : null;
+    .get(workspace, objective) as Workflow | undefined;
+  return row ?? null;
 }
 
 export function insertReview(db: Database.Database, review: Review): void {
@@ -494,8 +494,8 @@ export function insertReview(db: Database.Database, review: Review): void {
 }
 
 export function loadWorkflowById(db: Database.Database, id: string): Workflow | null {
-  const row = db.prepare(`SELECT * FROM workflows WHERE id = ?`).get(id) as WorkflowRow | undefined;
-  return row ? rowToWorkflow(row) : null;
+  const row = db.prepare(`SELECT * FROM workflows WHERE id = ?`).get(id) as Workflow | undefined;
+  return row ?? null;
 }
 
 export function loadWorkflowTasks(db: Database.Database, workflowId: string): Task[] {
@@ -630,11 +630,18 @@ export function loadArtifactsByWorkflowId(db: Database.Database, workflowId: str
 }
 
 function normalizeCostNumber(value: number | null | undefined): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.round((value ?? 0) * 1_000_000) / 1_000_000;
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
-function normalizeCostSummary(row: CostSummary): CostSummary {
+// Columns shared by CostSummary / CostByTask / CostByModel — SQLite can hand
+// back NULLs despite the TS types, so every query result passes through here.
+type CostTotals = Pick<
+  CostSummary,
+  'input_tokens' | 'output_tokens' | 'total_tokens' | 'total_cost_usd' | 'first_call_at' | 'last_call_at'
+>;
+
+function normalizeCostTotals<T extends CostTotals>(row: T): T {
   return {
     ...row,
     input_tokens: row.input_tokens ?? 0,
@@ -662,7 +669,7 @@ export function getCostSummary(db: Database.Database, workflowId: string): CostS
        WHERE workflow_id = ?`,
     )
     .get(workflowId, workflowId) as CostSummary;
-  return normalizeCostSummary(row);
+  return normalizeCostTotals(row);
 }
 
 export function getCostByTask(db: Database.Database, workflowId: string): CostByTask[] {
@@ -687,15 +694,9 @@ export function getCostByTask(db: Database.Database, workflowId: string): CostBy
     )
     .all(workflowId) as CostByTask[];
   return rows.map((row) => ({
-    ...row,
-    input_tokens: row.input_tokens ?? 0,
-    output_tokens: row.output_tokens ?? 0,
-    total_tokens: row.total_tokens ?? 0,
-    total_cost_usd: normalizeCostNumber(row.total_cost_usd),
+    ...normalizeCostTotals(row),
     task_id: row.task_id ?? null,
     task_name: row.task_name ?? null,
-    first_call_at: row.first_call_at ?? null,
-    last_call_at: row.last_call_at ?? null,
   }));
 }
 
@@ -720,14 +721,8 @@ export function getCostByModel(db: Database.Database, workflowId: string): CostB
     )
     .all(workflowId) as CostByModel[];
   return rows.map((row) => ({
-    ...row,
-    input_tokens: row.input_tokens ?? 0,
-    output_tokens: row.output_tokens ?? 0,
-    total_tokens: row.total_tokens ?? 0,
-    total_cost_usd: normalizeCostNumber(row.total_cost_usd),
+    ...normalizeCostTotals(row),
     provider: row.provider ?? null,
-    first_call_at: row.first_call_at ?? null,
-    last_call_at: row.last_call_at ?? null,
   }));
 }
 
@@ -923,6 +918,31 @@ export interface AdvisorConversationRow {
   history: AdvisorConversationStep[];
 }
 
+type AdvisorConversationDbRow = Omit<AdvisorConversationRow, 'history'> & { history_json: string };
+
+// Tolerant history_json parse: corrupted or non-array blobs collapse to [].
+function parseAdvisorHistory(raw: string): AdvisorConversationStep[] {
+  try {
+    const history = JSON.parse(raw) as AdvisorConversationStep[];
+    return Array.isArray(history) ? history : [];
+  } catch {
+    return [];
+  }
+}
+
+function rowToAdvisorConversation(row: AdvisorConversationDbRow): AdvisorConversationRow {
+  return {
+    id: row.id,
+    advisor_name: row.advisor_name,
+    workflow_id: row.workflow_id,
+    task_id: row.task_id,
+    started_at: row.started_at,
+    completed_at: row.completed_at,
+    status: row.status,
+    history: parseAdvisorHistory(row.history_json),
+  };
+}
+
 export function newAdvisorConversationId(): string {
   return `ac_${crypto.randomUUID()}`;
 }
@@ -955,13 +975,7 @@ export function appendAdvisorConversationStep(
     if (!row) {
       throw new Error(`advisor_conversations row not found: ${cid}`);
     }
-    let history: AdvisorConversationStep[];
-    try {
-      history = JSON.parse(row.history_json) as AdvisorConversationStep[];
-      if (!Array.isArray(history)) history = [];
-    } catch {
-      history = [];
-    }
+    const history = parseAdvisorHistory(row.history_json);
     history.push(s);
     db.prepare('UPDATE advisor_conversations SET history_json = ? WHERE id = ?')
       .run(JSON.stringify(history), cid);
@@ -997,27 +1011,8 @@ export function getAdvisorConversation(
               history_json, status
          FROM advisor_conversations WHERE id = ?`,
     )
-    .get(conversationId) as
-    | (Omit<AdvisorConversationRow, 'history'> & { history_json: string })
-    | undefined;
-  if (!row) return null;
-  let history: AdvisorConversationStep[];
-  try {
-    history = JSON.parse(row.history_json) as AdvisorConversationStep[];
-    if (!Array.isArray(history)) history = [];
-  } catch {
-    history = [];
-  }
-  return {
-    id: row.id,
-    advisor_name: row.advisor_name,
-    workflow_id: row.workflow_id,
-    task_id: row.task_id,
-    started_at: row.started_at,
-    completed_at: row.completed_at,
-    status: row.status,
-    history,
-  };
+    .get(conversationId) as AdvisorConversationDbRow | undefined;
+  return row ? rowToAdvisorConversation(row) : null;
 }
 
 export function getAdvisorConversationsByTask(
@@ -1033,28 +1028,8 @@ export function getAdvisorConversationsByTask(
          WHERE workflow_id = ? AND task_id = ?
          ORDER BY started_at ASC`,
     )
-    .all(workflowId, taskId) as Array<
-    Omit<AdvisorConversationRow, 'history'> & { history_json: string }
-  >;
-  return rows.map((row) => {
-    let history: AdvisorConversationStep[];
-    try {
-      history = JSON.parse(row.history_json) as AdvisorConversationStep[];
-      if (!Array.isArray(history)) history = [];
-    } catch {
-      history = [];
-    }
-    return {
-      id: row.id,
-      advisor_name: row.advisor_name,
-      workflow_id: row.workflow_id,
-      task_id: row.task_id,
-      started_at: row.started_at,
-      completed_at: row.completed_at,
-      status: row.status,
-      history,
-    };
-  });
+    .all(workflowId, taskId) as AdvisorConversationDbRow[];
+  return rows.map(rowToAdvisorConversation);
 }
 
 // ── App settings (migration 042, D-H2.076) ────────────────────────────────

@@ -116,6 +116,34 @@ function normalizeParticipant(value: CouncilParticipant): CouncilParticipant {
   };
 }
 
+/** Default panel used when the caller supplies no participants. */
+const DEFAULT_COUNCIL_PARTICIPANTS: CouncilParticipant[] = [
+  { id: 'planner', role: 'planner' },
+  { id: 'debug', role: 'debug' },
+  { id: 'codereview', role: 'code review' },
+];
+
+const DEFAULT_CONTEXT_SUMMARY = 'No additional context summary was supplied.';
+
+/**
+ * Shared by the deterministic and live council paths so the default panel
+ * and normalization never diverge between the two.
+ */
+function resolveParticipants(input: CreateCouncilRunInput): CouncilParticipant[] {
+  return (input.participants.length > 0
+    ? input.participants
+    : DEFAULT_COUNCIL_PARTICIPANTS
+  ).map(normalizeParticipant);
+}
+
+function ensureCouncilRunChannel(db: Database.Database, input: CreateCouncilRunInput) {
+  return ensureRunContextChannel(db, {
+    workspace: input.workspace,
+    runId: input.runId,
+    title: `Run ${input.runId}`,
+  });
+}
+
 /**
  * F6-4: Generic adapter that converts a council prompt into the args object
  * the registered advisor expects. Stepwise advisors (codereview, debug,
@@ -306,23 +334,13 @@ function runDeterministicCouncil(
   db: Database.Database,
   input: CreateCouncilRunInput,
 ): CouncilRunRecord {
-  const participants = (input.participants.length > 0
-    ? input.participants
-    : [
-        { id: 'planner', role: 'planner' },
-        { id: 'debug', role: 'debug' },
-        { id: 'codereview', role: 'code review' },
-      ]).map(normalizeParticipant);
+  const participants = resolveParticipants(input);
   const runMode = input.runMode ?? 'dry-run';
   if (runMode === 'approved-run' && !input.approvedBy?.trim()) {
     throw new Error('approved-run council requires approved_by metadata');
   }
 
-  const channel = ensureRunContextChannel(db, {
-    workspace: input.workspace,
-    runId: input.runId,
-    title: `Run ${input.runId}`,
-  });
+  const channel = ensureCouncilRunChannel(db, input);
   const thread = createContextThread(db, {
     channelId: channel.id,
     kind: 'advisor',
@@ -340,7 +358,7 @@ function runDeterministicCouncil(
     },
   });
 
-  const contextSummary = redactContextBody(input.contextSummary ?? 'No additional context summary was supplied.');
+  const contextSummary = redactContextBody(input.contextSummary ?? DEFAULT_CONTEXT_SUMMARY);
   const messages = participants.map((participant, index) =>
     createContextMessage(db, {
       threadId: thread.id,
@@ -423,19 +441,9 @@ async function createCouncilRunInternal(
     throw new Error('Live council never runs in approved-run; flip back to dry-run and approve the resulting fix-task explicitly.');
   }
 
-  const participants = (input.participants.length > 0
-    ? input.participants
-    : [
-        { id: 'planner', role: 'planner' },
-        { id: 'debug', role: 'debug' },
-        { id: 'codereview', role: 'code review' },
-      ]).map(normalizeParticipant);
+  const participants = resolveParticipants(input);
 
-  const channel = ensureRunContextChannel(db, {
-    workspace: input.workspace,
-    runId: input.runId,
-    title: `Run ${input.runId}`,
-  });
+  const channel = ensureCouncilRunChannel(db, input);
   const thread = createContextThread(db, {
     channelId: channel.id,
     kind: 'advisor',
@@ -454,7 +462,7 @@ async function createCouncilRunInternal(
     },
   });
 
-  const contextSummary = redactContextBody(input.contextSummary ?? 'No additional context summary was supplied.');
+  const contextSummary = redactContextBody(input.contextSummary ?? DEFAULT_CONTEXT_SUMMARY);
   const invoker = input.advisorInvoker ?? runAdvisorViaRegistry;
   const messages: ContextMessageRow[] = [];
   const liveOutputs: Array<{ advisor: string; output: string }> = [];

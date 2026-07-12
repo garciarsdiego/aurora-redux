@@ -19,6 +19,7 @@ import {
   getDirectProviderApiKey,
   extractContentRobust,
   providerSupportsVision,
+  type DirectProviderRoute,
 } from './provider-routes.js';
 import { isCliModel, callViaCli } from './cli-invoker.js';
 // Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): pure image ->
@@ -36,6 +37,7 @@ import {
   startTraceSpan,
   endTraceSpan,
   spanContextStorage,
+  type SpanContext,
 } from '../v2/observability/tracing.js';
 import http from 'node:http';
 import https from 'node:https';
@@ -141,9 +143,12 @@ function nativeFetch(url: string, options: {
             ? value.join(', ')
             : String(value);
         }
+        // statusCode is only undefined before 'response' fires — capture once
+        // with a defensive 0 fallback instead of repeating non-null assertions.
+        const status = res.statusCode ?? 0;
         resolve({
-          ok: res.statusCode! >= 200 && res.statusCode! < 300,
-          status: res.statusCode!,
+          ok: status >= 200 && status < 300,
+          status,
           text: async () => data,
           responseHeaders,
         });
@@ -271,7 +276,7 @@ export interface OmnirouteCallResult {
 /**
  * Minimal Omniroute HTTP caller.
  *
- * Scope for D2: single POST to /v1/chat/completions, no retry, no idempotency.
+ * Scope for D2: single POST to /api/v1/chat/completions, no retry, no idempotency.
  * Robust executor with retry/idempotency/paralelism is Bloco 2 (D6-D12).
  */
 export async function callOmniroute(
@@ -306,65 +311,21 @@ export async function callOmnirouteWithUsage(
     images,
   } = input;
 
-  // Cost-aware routing (Aurora-parity Wave 2): when the caller threads budget
-  // constraints (opt-in via OMNIFORGE_COST_ROUTER + a budget cap — see
-  // internal-utils.ts), downshift to a cheaper adequate model as the cap is
-  // approached. A router FAILURE degrades to the requested model; the opt-in
-  // enforce gate is the one INTENTIONAL throw and must not be swallowed — it is
-  // thrown as a BudgetExceededError so the retry loop treats it as terminal.
-  let resolvedModel = model;
-  // Gate on budgetUsd specifically: routing is meaningless without a budget,
-  // and this avoids the branch firing if a future caller threads only
-  // taskType/minQuality. (executeTask threads all-or-nothing today.)
-  if (budgetUsd !== undefined) {
-    let routingDecision: SelectModelResult | undefined;
-    try {
-      routingDecision = getCostAwareRouter().selectModel({
-        requested_model: model,
-        task_type: taskType || 'general',
-        budget_usd: budgetUsd,
-        // `?? 0.7`, NOT `|| 0.7`: a deliberately-configured minQuality of 0
-        // (accept any cheaper model) must NOT be coerced back to the default.
-        min_quality: minQuality ?? 0.7,
-        use_case: taskType || 'general',
-        // Thread the REAL prompt size so the per-call estimate reflects this
-        // actual call rather than a ~13-char "task: <type>" literal. Without
-        // this the downshift/enforce gate stayed inert until the budget
-        // headroom itself went sub-cent (medium-sev correctness bug).
-        prompt_chars: systemPrompt.length + userPrompt.length,
-      });
-    } catch (error) {
-      // Router failure (e.g. cost DB unavailable) must never block a call —
-      // degrade to the requested model. Distinct from the enforce gate below,
-      // which is a deliberate budget decision rather than a failure.
-      console.warn('[CostAwareRouting] Failed to select optimal model, using original:', error);
-      routingDecision = undefined;
-    }
-    if (routingDecision) {
-      if (routingDecision.recommended_model !== model) {
-        console.log(
-          `[CostAwareRouting] Switched from ${model} to ${routingDecision.recommended_model} (reason: ${routingDecision.reasoning})`,
-        );
-        resolvedModel = routingDecision.recommended_model;
-      }
-      if (enforceBudget && !routingDecision.within_budget) {
-        // No model fits the remaining budget at the required quality and enforce
-        // is on → gate the call BEFORE any HTTP request (no trace span has been
-        // opened at this point — the span is started further down, after auto-tag
-        // resolution). CostRouterBudgetExceededError subclasses BudgetExceededError
-        // so the retry loop still treats it as terminal (never retried), but its
-        // fields/message are correctly labelled: arg 2 is the upcoming call's
-        // ESTIMATED cost (we have no db handle here to read realized spend) and
-        // arg 3 is the remaining budget HEADROOM (not the cap) — so the audit
-        // message never claims money was spent that wasn't.
-        throw new CostRouterBudgetExceededError(
-          workflowId ?? 'unknown',
-          routingDecision.estimated_cost_usd,
-          budgetUsd, // narrowed to number by the enclosing `budgetUsd !== undefined`
-        );
-      }
-    }
-  }
+  // Total prompt size — feeds both the cost router's per-call estimate and the
+  // prompt-size-scaled timeout further down.
+  const promptChars = systemPrompt.length + userPrompt.length;
+
+  // Cost-aware routing (Aurora-parity Wave 2) — see resolveCostAwareModel for
+  // the gate/degrade/enforce semantics.
+  let resolvedModel = resolveCostAwareModel({
+    model,
+    promptChars,
+    budgetUsd,
+    taskType,
+    minQuality,
+    enforceBudget,
+    workflowId,
+  });
 
   // Apply auto-tag resolution
   resolvedModel = resolveAutoTag(resolvedModel, getAutoTagOverrides());
@@ -374,53 +335,9 @@ export async function callOmnirouteWithUsage(
   // (CLI-backed models are handled by a separate branch below.)
   const directRoute = resolveDirectProviderRoute(resolvedModel);
 
-  // Fail fast with a precise message when a direct provider's key is missing —
-  // otherwise the request goes out unauthenticated and returns a confusing
-  // "HTTP 401" that reads like an Omniroute problem. (Review finding M2.)
-  if (directRoute && !getDirectProviderApiKey(directRoute)) {
-    throw new Error(
-      `${directRoute.envVar} not set — required for direct provider '${directRoute.providerName}' (model ${resolvedModel})`,
-    );
-  }
-
-  // Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): fail fast on
-  // any unsupported image transport, BEFORE any HTTP request or CLI spawn is
-  // made — same fail-fast posture as the missing-key check above. Silently
-  // dropping the image and sending a text-only prompt would be worse than an
-  // explicit error: the caller would get a plausible-looking response that
-  // never actually looked at the screenshot. See docs/VISION-SPIKE-2026-07-05.md
-  // for the evidence backing each branch below.
-  if (images && images.length > 0) {
-    if (directRoute) {
-      if (!providerSupportsVision(directRoute)) {
-        throw new Error(
-          `Direct provider '${directRoute.providerName}' does not support image/vision input ` +
-            `(model ${resolvedModel}) — use kimi/ or minimax/ instead (verified by the vision ` +
-            'spike, docs/VISION-SPIKE-2026-07-05.md).',
-        );
-      }
-      // vision-capable direct provider — content-parts assembled below.
-    } else if (isCliModel(resolvedModel)) {
-      // Wave 2: CLI-specific support is delegated to callViaCli(). codex-cli
-      // attaches images by mentioning local paths in stdin; claude-cli still
-      // fail-fasts there with a transport-specific explanation because the
-      // spike did not confirm a reliable image mechanism for Claude CLI.
-    } else {
-      throw new Error(
-        `Image attachments are not supported on the legacy Omniroute path (model ${resolvedModel}) — ` +
-          'use a direct HTTP provider with vision support (kimi/, minimax/) instead.',
-      );
-    }
-  }
-
-  // Initialize real-time cost tracking
-  const costTracker = getRealTimeCostTracker();
-  const trackingId = costTracker.startTracking({
-    model: resolvedModel,
-    workflow_id: workflowId,
-    task_id: taskId,
-    task_type: taskType || 'general',
-  });
+  // Fail fast (missing direct-provider key / unsupported image transport)
+  // BEFORE any HTTP request or CLI spawn — see assertCallTransportSupported.
+  assertCallTransportSupported(directRoute, resolvedModel, images);
 
   const url = directRoute
     ? buildDirectProviderUrl(directRoute)
@@ -440,123 +357,44 @@ export async function callOmnirouteWithUsage(
   const supportsTemperature =
     !directRoute && !/claude-opus-4|claude-sonnet-4/i.test(resolvedModel);
 
-  // Wave 2 — exact-match response cache (opt-in via OMNIFORGE_LLM_CACHE). Replays
-  // a byte-identical call at $0. The key hashes the FULL system prompt (which
-  // carries the injected reflection block + active variant), so a newly-learned
-  // lesson MISSES and never silently serves a stale decomposition. Uses the
-  // workflow db from the trace span context; skipped when neither is available.
-  const cacheDb = spanContextStorage.getStore()?.db ?? null;
-  const cacheKey = isLlmCacheEnabled() && cacheDb
-    ? computeLlmCacheKey({
-        model: resolvedModel,
-        systemPrompt,
-        userPrompt,
-        temperature: supportsTemperature ? temperature : null,
-      })
-    : null;
-  if (cacheKey && cacheDb) {
-    const cached = getCachedResponse(cacheDb, cacheKey);
-    if (cached) {
-      // Replay is free — attribute $0 so the ledger reflects true post-cache spend.
-      const replayUsage = {
-        ...((cached.usage as Record<string, unknown> | null) ?? {}),
-        total_cost_usd: 0,
-      } as unknown as OmnirouteUsage;
-      return { content: cached.content, model_used: cached.model, usage: replayUsage };
-    }
-  }
+  // Wave 2 — exact-match response cache (opt-in via OMNIFORGE_LLM_CACHE).
+  // See prepareLlmCacheContext; a hit replays the stored response at $0.
+  const { cacheDb, cacheKey, replay } = prepareLlmCacheContext({
+    resolvedModel,
+    systemPrompt,
+    userPrompt,
+    temperature,
+    supportsTemperature,
+  });
+  if (replay) return replay;
 
-  // Anthropic prompt-prefix cache (B6.1 / AUDIT §6 perf-win 1).
-  // For Anthropic-family models with a sizeable system prompt, we mark
-  // the system block with `cache_control: ephemeral` so Anthropic caches
-  // the prefix for ~5 minutes. Subsequent calls with the same prefix
-  // (e.g. repeated worker invocations sharing WORKER_CLI_SPAWN_PREFIX or
-  // a persona system prompt) skip prefix re-tokenisation — typical wins:
-  //   - ~50% input-token cost on cache hits
-  //   - ~70% latency reduction on cache hits for large prefixes
-  // Anthropic ignores cache_control on prompts smaller than its minimum
-  // (~1024 tokens) so the floor here just avoids serialising it pointlessly.
-  // Disabled by default — opt-in via OMNIFORGE_PROMPT_PREFIX_CACHE=true. Some
-  // Omniroute provider adapters may not pass `cache_control` through; verify
-  // before flipping the flag in production.
-  const cacheEnabled = getPromptPrefixCacheEnabled();
-  const isAnthropicFamily = /^cc\/|claude-/.test(resolvedModel);
-  const useCacheControl =
-    cacheEnabled && isAnthropicFamily && systemPrompt.length >= 4_000;
+  // Initialize real-time cost tracking. Deliberately AFTER the cache-replay
+  // return: a replay never reaches endTracking, so starting tracking earlier
+  // leaked the entry in the tracker's activeTrackings map forever.
+  const costTracker = getRealTimeCostTracker();
+  const trackingId = costTracker.startTracking({
+    model: resolvedModel,
+    workflow_id: workflowId,
+    task_id: taskId,
+    task_type: taskType || 'general',
+  });
 
-  // Omniroute's chat API does not reliably honour a separate `system` field
-  // across all of its provider adapters, so we concatenate the system prompt
-  // into the user message. When prefix caching is enabled for an Anthropic-family
-  // model, the system block is sent as a cache_control'd content part.
-  // (Aurora-parity Wave 0 / GHOST-03: the prior USE_OMNIROUTE_SYSTEM_PROMPT branch
-  // built a `system`-field body, discarded it, and swallowed errors in this hot
-  // path — removed as inert dead code.)
-  //
-  // Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): when `images`
-  // are present on a vision-capable direct HTTP provider, content becomes an
-  // OpenAI-style content-parts array: one text part carrying the EXACT SAME
-  // `${systemPrompt}\n\n${userPrompt}` string the no-image path already sends
-  // (so prompt content is byte-identical either way), followed by one optional
-  // short label part + one image_url part per attachment. By this point the
-  // fail-fast block above has already guaranteed direct providers support
-  // vision. Wave 2 lets CLI image calls pass through too, but those must NOT
-  // build data URLs here: callViaCli() attaches local paths in stdin instead.
-  //
-  // Interaction with `useCacheControl` (cache_control branch, decided here):
-  // `images` takes priority over prompt-prefix caching. Anthropic-family
-  // models are the only ones useCacheControl targets (isAnthropicFamily),
-  // and no Anthropic-family model is currently vision-confirmed on the direct
-  // path (kimi/minimax only) — so in practice the two conditions don't
-  // overlap yet. Should that change, correctness (the model actually seeing
-  // the image) outranks the cache_control perf-win: we build the image
-  // content-parts WITHOUT a cache_control marker on the text part rather than
-  // risk a provider adapter choking on cache_control mixed with image_url
-  // parts (untested combination, out of scope for this wave's spike).
-  const hasDirectProviderImages = directRoute !== null && images !== undefined && images.length > 0;
-  const userContent:
-    | string
-    | Array<{
-        type: string;
-        text?: string;
-        cache_control?: { type: string };
-        image_url?: { url: string };
-      }> = hasDirectProviderImages
-    ? [
-        { type: 'text', text: `${systemPrompt}\n\n${userPrompt}` },
-        ...images!.flatMap((img) => {
-          const { dataUrl } = imageToDataUrl(img.path);
-          const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
-          if (img.label) parts.push({ type: 'text', text: img.label });
-          parts.push({ type: 'image_url', image_url: { url: dataUrl } });
-          return parts;
-        }),
-      ]
-    : useCacheControl
-      ? [
-          { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
-          { type: 'text', text: `\n\n${userPrompt}` },
-        ]
-      : `${systemPrompt}\n\n${userPrompt}`;
-
-  const body = JSON.stringify({
-    // Direct providers only know their native id — strip the routing prefix
-    // (e.g. 'glm/glm-5.2' -> 'glm-5.2'). Omniroute keeps the full id.
-    model: directRoute ? stripRoutePrefix(resolvedModel, directRoute) : resolvedModel,
-    messages: [
-      { role: 'user', content: userContent },
-    ],
-    ...(supportsTemperature ? { temperature } : {}),
-    // Reasoning models consume budget on hidden thinking — set an explicit
-    // ceiling for direct providers so the visible answer isn't truncated.
-    ...(directRoute ? { max_tokens: getDirectProviderMaxTokens() } : {}),
-    stream: false,
+  // Request body (prompt concatenation, optional prefix-cache marker, image
+  // content-parts, direct-provider max_tokens) — see buildChatRequestBody.
+  const body = buildChatRequestBody({
+    systemPrompt,
+    userPrompt,
+    resolvedModel,
+    directRoute,
+    images,
+    supportsTemperature,
+    temperature,
   });
 
   // D-H2.078: scale the per-call timeout by total prompt size so large
   // objectives (the new 200K cap allowed) get proportionally more time
   // before AbortSignal fires. See `computeOmnirouteTimeoutMs` for the
   // formula. Operators can still pin the floor via OMNIROUTE_TIMEOUT_MS.
-  const promptChars = systemPrompt.length + userPrompt.length;
   const effectiveTimeoutMs = computeOmnirouteTimeoutMs(promptChars);
 
   const spanCtx = spanContextStorage.getStore();
@@ -613,9 +451,15 @@ export async function callOmnirouteWithUsage(
     // `externalSignal.aborted` short-circuits before we even open the
     // socket on the next retry attempt.
     if (externalSignal?.aborted) {
+      // NÃO fazer throw direto aqui: pularia o finalize compartilhado (o span
+      // aberto acima ficaria pendurado sem status 'error' e endTracking nunca
+      // rodaria) — o mesmo invariante do branch CLI ("never let the exception
+      // skip finalize", review finding A1). Registrar como lastError e sair do
+      // loop; o rethrow final propaga o AbortError após o finalize.
       const err = new Error('omniroute call aborted by external signal');
       (err as Error & { name: string }).name = 'AbortError';
-      throw err;
+      lastError = err;
+      break;
     }
     const timeoutSignal = AbortSignal.timeout(effectiveTimeoutMs);
     const fetchSignal = externalSignal
@@ -697,6 +541,345 @@ export async function callOmnirouteWithUsage(
     }
   }
 
+  // Shared finalize — trace span close, brain-role ledger row, cost tracking.
+  // Runs for EVERY outcome (HTTP success/failure, CLI branch, external abort);
+  // the invariants live in finalizeOmnirouteCall.
+  await finalizeOmnirouteCall({
+    spanCtx,
+    spanId,
+    callStart,
+    result,
+    lastError,
+    workflowId,
+    taskId,
+    taskType,
+    costTracker,
+    trackingId,
+  });
+
+  if (result) return result;
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * Cost-aware routing (Aurora-parity Wave 2): when the caller threads budget
+ * constraints (opt-in via OMNIFORGE_COST_ROUTER + a budget cap — see
+ * internal-utils.ts), downshift to a cheaper adequate model as the cap is
+ * approached. A router FAILURE degrades to the requested model; the opt-in
+ * enforce gate is the one INTENTIONAL throw and must not be swallowed — it is
+ * thrown as a BudgetExceededError so the retry loop treats it as terminal.
+ */
+function resolveCostAwareModel(args: {
+  model: string;
+  promptChars: number;
+  budgetUsd?: number;
+  taskType?: string;
+  minQuality?: number;
+  enforceBudget?: boolean;
+  workflowId?: string;
+}): string {
+  const { model, promptChars, budgetUsd, taskType, minQuality, enforceBudget, workflowId } = args;
+
+  // Gate on budgetUsd specifically: routing is meaningless without a budget,
+  // and this avoids the branch firing if a future caller threads only
+  // taskType/minQuality. (executeTask threads all-or-nothing today.)
+  if (budgetUsd === undefined) return model;
+
+  let routingDecision: SelectModelResult | undefined;
+  try {
+    routingDecision = getCostAwareRouter().selectModel({
+      requested_model: model,
+      task_type: taskType || 'general',
+      budget_usd: budgetUsd,
+      // `?? 0.7`, NOT `|| 0.7`: a deliberately-configured minQuality of 0
+      // (accept any cheaper model) must NOT be coerced back to the default.
+      min_quality: minQuality ?? 0.7,
+      use_case: taskType || 'general',
+      // Thread the REAL prompt size so the per-call estimate reflects this
+      // actual call rather than a ~13-char "task: <type>" literal. Without
+      // this the downshift/enforce gate stayed inert until the budget
+      // headroom itself went sub-cent (medium-sev correctness bug).
+      prompt_chars: promptChars,
+    });
+  } catch (error) {
+    // Router failure (e.g. cost DB unavailable) must never block a call —
+    // degrade to the requested model. Distinct from the enforce gate below,
+    // which is a deliberate budget decision rather than a failure.
+    console.warn('[CostAwareRouting] Failed to select optimal model, using original:', error);
+    return model;
+  }
+  if (!routingDecision) return model;
+
+  let resolvedModel = model;
+  if (routingDecision.recommended_model !== model) {
+    console.log(
+      `[CostAwareRouting] Switched from ${model} to ${routingDecision.recommended_model} (reason: ${routingDecision.reasoning})`,
+    );
+    resolvedModel = routingDecision.recommended_model;
+  }
+  if (enforceBudget && !routingDecision.within_budget) {
+    // No model fits the remaining budget at the required quality and enforce
+    // is on → gate the call BEFORE any HTTP request (no trace span has been
+    // opened at this point — the span is started further down, after auto-tag
+    // resolution). CostRouterBudgetExceededError subclasses BudgetExceededError
+    // so the retry loop still treats it as terminal (never retried), but its
+    // fields/message are correctly labelled: arg 2 is the upcoming call's
+    // ESTIMATED cost (we have no db handle here to read realized spend) and
+    // arg 3 is the remaining budget HEADROOM (not the cap) — so the audit
+    // message never claims money was spent that wasn't.
+    throw new CostRouterBudgetExceededError(
+      workflowId ?? 'unknown',
+      routingDecision.estimated_cost_usd,
+      budgetUsd,
+    );
+  }
+  return resolvedModel;
+}
+
+/**
+ * Fail-fast transport guards, run BEFORE any HTTP request or CLI spawn:
+ *
+ * - Missing direct-provider key — otherwise the request goes out
+ *   unauthenticated and returns a confusing "HTTP 401" that reads like an
+ *   Omniroute problem. (Review finding M2.)
+ * - Unsupported image transport (Fase A / Wave 1, visual reviewer multimodal,
+ *   2026-07-05). Silently dropping the image and sending a text-only prompt
+ *   would be worse than an explicit error: the caller would get a
+ *   plausible-looking response that never actually looked at the screenshot.
+ *   See docs/VISION-SPIKE-2026-07-05.md for the evidence backing each branch.
+ */
+function assertCallTransportSupported(
+  directRoute: DirectProviderRoute | null,
+  resolvedModel: string,
+  images: ReviewImageAttachment[] | undefined,
+): void {
+  if (directRoute && !getDirectProviderApiKey(directRoute)) {
+    throw new Error(
+      `${directRoute.envVar} not set — required for direct provider '${directRoute.providerName}' (model ${resolvedModel})`,
+    );
+  }
+
+  if (images && images.length > 0) {
+    if (directRoute) {
+      if (!providerSupportsVision(directRoute)) {
+        throw new Error(
+          `Direct provider '${directRoute.providerName}' does not support image/vision input ` +
+            `(model ${resolvedModel}) — use kimi/ or minimax/ instead (verified by the vision ` +
+            'spike, docs/VISION-SPIKE-2026-07-05.md).',
+        );
+      }
+      // vision-capable direct provider — content-parts assembled by
+      // buildChatRequestBody.
+    } else if (isCliModel(resolvedModel)) {
+      // Wave 2: CLI-specific support is delegated to callViaCli(). codex-cli
+      // attaches images by mentioning local paths in stdin; claude-cli still
+      // fail-fasts there with a transport-specific explanation because the
+      // spike did not confirm a reliable image mechanism for Claude CLI.
+    } else {
+      throw new Error(
+        `Image attachments are not supported on the legacy Omniroute path (model ${resolvedModel}) — ` +
+          'use a direct HTTP provider with vision support (kimi/, minimax/) instead.',
+      );
+    }
+  }
+}
+
+/**
+ * Wave 2 — exact-match response cache (opt-in via OMNIFORGE_LLM_CACHE).
+ * Replays a byte-identical call at $0. The key hashes the FULL system prompt
+ * (which carries the injected reflection block + active variant), so a
+ * newly-learned lesson MISSES and never silently serves a stale decomposition.
+ * Uses the workflow db from the trace span context; skipped when neither is
+ * available. `cacheDb`/`cacheKey` are returned for the post-success
+ * putCachedResponse write; `replay` is non-null on a cache hit.
+ */
+function prepareLlmCacheContext(args: {
+  resolvedModel: string;
+  systemPrompt: string;
+  userPrompt: string;
+  temperature: number;
+  supportsTemperature: boolean;
+}): {
+  cacheDb: SpanContext['db'] | null;
+  cacheKey: string | null;
+  replay: OmnirouteCallResult | null;
+} {
+  const cacheDb = spanContextStorage.getStore()?.db ?? null;
+  const cacheKey = isLlmCacheEnabled() && cacheDb
+    ? computeLlmCacheKey({
+        model: args.resolvedModel,
+        systemPrompt: args.systemPrompt,
+        userPrompt: args.userPrompt,
+        temperature: args.supportsTemperature ? args.temperature : null,
+      })
+    : null;
+  if (cacheKey && cacheDb) {
+    const cached = getCachedResponse(cacheDb, cacheKey);
+    if (cached) {
+      // Replay is free — attribute $0 so the ledger reflects true post-cache spend.
+      const replayUsage = {
+        ...((cached.usage as Record<string, unknown> | null) ?? {}),
+        total_cost_usd: 0,
+      } as unknown as OmnirouteUsage;
+      return {
+        cacheDb,
+        cacheKey,
+        replay: { content: cached.content, model_used: cached.model, usage: replayUsage },
+      };
+    }
+  }
+  return { cacheDb, cacheKey, replay: null };
+}
+
+/**
+ * Serialize the chat-completions request body.
+ *
+ * Anthropic prompt-prefix cache (B6.1 / AUDIT §6 perf-win 1): for
+ * Anthropic-family models with a sizeable system prompt, we mark the system
+ * block with `cache_control: ephemeral` so Anthropic caches the prefix for
+ * ~5 minutes. Subsequent calls with the same prefix (e.g. repeated worker
+ * invocations sharing WORKER_CLI_SPAWN_PREFIX or a persona system prompt)
+ * skip prefix re-tokenisation — typical wins:
+ *   - ~50% input-token cost on cache hits
+ *   - ~70% latency reduction on cache hits for large prefixes
+ * Anthropic ignores cache_control on prompts smaller than its minimum
+ * (~1024 tokens) so the floor here just avoids serialising it pointlessly.
+ * Disabled by default — opt-in via OMNIFORGE_PROMPT_PREFIX_CACHE=true. Some
+ * Omniroute provider adapters may not pass `cache_control` through; verify
+ * before flipping the flag in production.
+ *
+ * Omniroute's chat API does not reliably honour a separate `system` field
+ * across all of its provider adapters, so we concatenate the system prompt
+ * into the user message. When prefix caching is enabled for an
+ * Anthropic-family model, the system block is sent as a cache_control'd
+ * content part. (Aurora-parity Wave 0 / GHOST-03: the prior
+ * USE_OMNIROUTE_SYSTEM_PROMPT branch built a `system`-field body, discarded
+ * it, and swallowed errors in this hot path — removed as inert dead code.)
+ *
+ * Fase A / Wave 1 (visual reviewer multimodal, 2026-07-05): when `images`
+ * are present on a vision-capable direct HTTP provider, content becomes an
+ * OpenAI-style content-parts array: one text part carrying the EXACT SAME
+ * `${systemPrompt}\n\n${userPrompt}` string the no-image path already sends
+ * (so prompt content is byte-identical either way), followed by one optional
+ * short label part + one image_url part per attachment. By this point
+ * assertCallTransportSupported has already guaranteed direct providers
+ * support vision. Wave 2 lets CLI image calls pass through too, but those
+ * must NOT build data URLs here: callViaCli() attaches local paths in stdin
+ * instead.
+ *
+ * Interaction with `useCacheControl` (cache_control branch, decided here):
+ * `images` takes priority over prompt-prefix caching. Anthropic-family
+ * models are the only ones useCacheControl targets (isAnthropicFamily),
+ * and no Anthropic-family model is currently vision-confirmed on the direct
+ * path (kimi/minimax only) — so in practice the two conditions don't
+ * overlap yet. Should that change, correctness (the model actually seeing
+ * the image) outranks the cache_control perf-win: we build the image
+ * content-parts WITHOUT a cache_control marker on the text part rather than
+ * risk a provider adapter choking on cache_control mixed with image_url
+ * parts (untested combination, out of scope for this wave's spike).
+ */
+function buildChatRequestBody(args: {
+  systemPrompt: string;
+  userPrompt: string;
+  resolvedModel: string;
+  directRoute: DirectProviderRoute | null;
+  images: ReviewImageAttachment[] | undefined;
+  supportsTemperature: boolean;
+  temperature: number;
+}): string {
+  const { systemPrompt, userPrompt, resolvedModel, directRoute, images, supportsTemperature, temperature } = args;
+
+  const cacheEnabled = getPromptPrefixCacheEnabled();
+  const isAnthropicFamily = /^cc\/|claude-/.test(resolvedModel);
+  const useCacheControl =
+    cacheEnabled && isAnthropicFamily && systemPrompt.length >= 4_000;
+
+  // Narrowed const (instead of a boolean + `images!`) so TS proves presence.
+  const directProviderImages =
+    directRoute !== null && images !== undefined && images.length > 0 ? images : null;
+  const userContent:
+    | string
+    | Array<{
+        type: string;
+        text?: string;
+        cache_control?: { type: string };
+        image_url?: { url: string };
+      }> = directProviderImages
+    ? [
+        { type: 'text', text: `${systemPrompt}\n\n${userPrompt}` },
+        ...directProviderImages.flatMap((img) => {
+          const { dataUrl } = imageToDataUrl(img.path);
+          const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+          if (img.label) parts.push({ type: 'text', text: img.label });
+          parts.push({ type: 'image_url', image_url: { url: dataUrl } });
+          return parts;
+        }),
+      ]
+    : useCacheControl
+      ? [
+          { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: `\n\n${userPrompt}` },
+        ]
+      : `${systemPrompt}\n\n${userPrompt}`;
+
+  return JSON.stringify({
+    // Direct providers only know their native id — strip the routing prefix
+    // (e.g. 'glm/glm-5.2' -> 'glm-5.2'). Omniroute keeps the full id.
+    model: directRoute ? stripRoutePrefix(resolvedModel, directRoute) : resolvedModel,
+    messages: [
+      { role: 'user', content: userContent },
+    ],
+    ...(supportsTemperature ? { temperature } : {}),
+    // Reasoning models consume budget on hidden thinking — set an explicit
+    // ceiling for direct providers so the visible answer isn't truncated.
+    ...(directRoute ? { max_tokens: getDirectProviderMaxTokens() } : {}),
+    stream: false,
+  });
+}
+
+/**
+ * Shared finalize for callOmnirouteWithUsage — MUST run on every outcome
+ * (success, HTTP failure, CLI failure, external abort) so the trace span is
+ * always closed and cost tracking is always ended. This invariant has been a
+ * bug source before (review findings A1, MÉDIO-4); keep every early exit in
+ * the caller routed through here.
+ *
+ *  1. Close the trace span ('ok' with usage attributes, or 'error').
+ *  2. MÉDIO-4 (revisão adversarial 2026-07-04): brain-roles (decomposer /
+ *     reviewer / consolidator) rodam fora do caminho de task do executor,
+ *     então success-finalize nunca grava a linha deles em model_calls —
+ *     reviews via codex-cli eram invisíveis no ledger. Quando o chamador
+ *     optou-in via spanCtx.ledgerSource, gravamos aqui. O executor tem
+ *     spanCtx SEM ledgerSource → pulado → sem double-count.
+ *  3. End real-time cost tracking and register the realized cost in the cost
+ *     database (best-effort; failures are logged + surfaced as a
+ *     `cost_insert_failed` event when a traced db handle is available).
+ */
+async function finalizeOmnirouteCall(args: {
+  spanCtx: SpanContext | undefined;
+  spanId: string | undefined;
+  callStart: number;
+  result: OmnirouteCallResult | undefined;
+  lastError: unknown;
+  workflowId: string | undefined;
+  taskId: string | undefined;
+  taskType: string | undefined;
+  costTracker: ReturnType<typeof getRealTimeCostTracker>;
+  trackingId: string;
+}): Promise<void> {
+  const {
+    spanCtx,
+    spanId,
+    callStart,
+    result,
+    lastError,
+    workflowId,
+    taskId,
+    taskType,
+    costTracker,
+    trackingId,
+  } = args;
+
   if (spanId && spanCtx) {
     try {
       const latencyMs = Date.now() - callStart;
@@ -727,12 +910,6 @@ export async function callOmnirouteWithUsage(
     } catch { /* tracing must not break execution */ }
   }
 
-  // MÉDIO-4 (revisão adversarial 2026-07-04): brain-roles (decomposer /
-  // reviewer / consolidator) rodam fora do caminho de task do executor, então
-  // success-finalize nunca grava a linha deles em model_calls — reviews via
-  // codex-cli eram invisíveis no ledger. Quando o chamador optou-in via
-  // spanCtx.ledgerSource, gravamos aqui. O executor tem spanCtx SEM
-  // ledgerSource → pulado → sem double-count.
   const ledgerWorkflowId = workflowId ?? spanCtx?.workflowId;
   if (result && spanCtx?.db && spanCtx.ledgerSource && ledgerWorkflowId) {
     try {
@@ -760,7 +937,7 @@ export async function callOmnirouteWithUsage(
   if (result && trackingId) {
     try {
       const finalTracking = costTracker.endTracking(trackingId);
-      
+
       // Register cost in database for historical analysis
       if (finalTracking && result.usage) {
         const costDatabase = getCostDatabase();
@@ -774,7 +951,7 @@ export async function callOmnirouteWithUsage(
           task_type: taskType || 'general',
           timestamp: Date.now(),
         });
-        
+
         console.log(`[CostTracking] Recorded cost for ${result.model_used}: $${(result.usage.total_cost_usd || 0).toFixed(6)} (${result.usage.input_tokens} input, ${result.usage.output_tokens} output tokens)`);
       }
     } catch (error) {
@@ -788,11 +965,11 @@ export async function callOmnirouteWithUsage(
       // on workflowId because insertEvent requires a non-null workflow_id
       // (FK → workflows). Untraced calls fall back to the console.warn only.
       console.warn('[CostTracking] Failed to record cost in database:', error);
-      const spanCtx = spanContextStorage.getStore();
-      if (spanCtx?.db && workflowId) {
+      const liveSpanCtx = spanContextStorage.getStore();
+      if (liveSpanCtx?.db && workflowId) {
         try {
           const { insertEvent } = await import('../db/persist.js');
-          insertEvent(spanCtx.db, {
+          insertEvent(liveSpanCtx.db, {
             workflow_id: workflowId,
             task_id: taskId ?? null,
             type: 'cost_insert_failed',
@@ -820,9 +997,6 @@ export async function callOmnirouteWithUsage(
       console.warn('[CostTracking] Failed to clean up tracking after error:', error);
     }
   }
-
-  if (result) return result;
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 interface OmnirouteCallContext {

@@ -27,7 +27,10 @@ vi.mock('../../src/v2/omniroute-bridge/health-cache.js', () => ({
   })),
 }));
 
-vi.mock('../../src/v2/omniroute-bridge/client.js', () => ({
+vi.mock('../../src/v2/omniroute-bridge/client.js', async (importOriginal) => ({
+  // tallyProviderHealth é um helper puro — usa a implementação real; só a
+  // chamada de rede é mockada.
+  tallyProviderHealth: (await importOriginal<typeof import('../../src/v2/omniroute-bridge/client.js')>()).tallyProviderHealth,
   checkDetailedHealth: vi.fn(),
 }));
 

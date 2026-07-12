@@ -14,10 +14,9 @@ import type { Pattern, Workflow } from '../types/index.js';
 import {
   bumpPatternSuccess,
   findPatternByShape,
-  insertPattern,
+  insertEvent,
 } from '../db/persist.js';
 import { saveWorkflowAsPattern } from './store.js';
-import { insertEvent } from '../db/persist.js';
 import { objectiveShape } from './shape.js';
 
 const AUTO_CAPTURE_THRESHOLD = 3;
@@ -79,11 +78,10 @@ export function autoCaptureOnSuccess(
   let pattern: Pattern;
   try {
     pattern = saveWorkflowAsPattern(db, workflow.id, name);
-  } catch (err) {
+  } catch {
     // Most likely cause: UNIQUE(workspace, name) violation if another auto-
     // capture race already minted the row. Bail silently — the next
     // completion will find the row via findPatternByShape and bump it.
-    void err;
     return { outcome: 'matches-similar', matchedShape: shape };
   }
   pattern.source = 'auto-captured';
@@ -165,8 +163,7 @@ export function runAutoCaptureHook(
       }
     }
     return result;
-  } catch (err) {
-    void err;
+  } catch {
     return { outcome: 'no-shape' };
   }
 }

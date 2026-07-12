@@ -6,7 +6,8 @@ import { getDecomposerModel, getUsePersonas, getAutoCompactThreshold } from '../
 import { validateDag } from './dag-validator.js';
 import { getModelGuidance } from '../v2/model-guidance/registry.js';
 import { loadProjectRules, formatRulesForPrompt } from '../v2/rules/loader.js';
-import { runAgent, type AgentInvoker } from '../v2/agents/runner.js';
+import { runAgent } from '../v2/agents/runner.js';
+import { omnirouteInvoker, buildConsoleAgentContext } from './agent-omniroute.js';
 import { insertEvent } from '../db/persist.js';
 import {
   getActiveVersionedDefinition,
@@ -22,11 +23,9 @@ import {
   type DecomposerInput,
   type DecomposerOutput,
 } from '../v2/agents/personas/decomposer.js';
-import type { AgentContext } from '../v2/agents/types.js';
 import { AgentRejectedError, AgentOutputError } from '../v2/agents/types.js';
 import { cliHintForModel, normalizeCliExecutorHintForModel } from '../utils/cli-routing.js';
 import { recallReflections, formatReflectionsForPrompt } from '../v2/reflection/store.js';
-import { trackDecomposerDecision, getDecomposerMetrics } from '../utils/config.js';
 import { spanContextStorage } from '../v2/observability/tracing.js';
 
 const SYSTEM_PROMPT = `You are Omniforge's task decomposer. Given an OBJECTIVE, produce a DAG of tasks as strict JSON.
@@ -914,7 +913,7 @@ export function estimateTaskTimeoutSeconds(
 function backfillTaskTimeouts(dag: Dag, objective: string): void {
   for (const task of dag.tasks) {
     if (!task.timeout_seconds) {
-      (task as Record<string, unknown>).timeout_seconds = estimateTaskTimeoutSeconds(task, objective);
+      task.timeout_seconds = estimateTaskTimeoutSeconds(task, objective);
     }
   }
 }
@@ -1010,19 +1009,6 @@ export interface DecomposeOptions {
    */
   readonly workspace?: string;
 }
-
-/**
- * Omniroute invoker adapter for runAgent. Maps AgentInvokeArgs to
- * callOmnirouteWithUsage and returns the content string.
- */
-const omnirouteInvoker: AgentInvoker = async (args) => {
-  const result = await callOmnirouteWithUsage({
-    systemPrompt: args.systemPrompt,
-    userPrompt: args.userPrompt ?? 'Respond per the system contract above.',
-    model: args.model,
-  });
-  return result.content;
-};
 
 /**
  * MÉDIO-4 (revisão adversarial 2026-07-04): quando o chamador forneceu
@@ -1122,28 +1108,6 @@ function surfaceDagValidationWarnings(dag: Dag, options: DecomposeOptions): void
 }
 
 /**
- * Builds a minimal AgentContext for the decomposer from DecomposeOptions.
- */
-function buildDecomposerAgentContext(options: DecomposeOptions): AgentContext {
-  return {
-    retryCount: 0,
-    workspaceDir: options.cwd ?? process.cwd(),
-    emit(event, payload) {
-      // Events go to console until Bloco 2 instruments with pino.
-      console.debug(`[decomposer:event] ${event}`, payload);
-    },
-    warn(message) {
-      console.warn(`[decomposer:warn] ${message}`);
-    },
-    log(level, message, payload) {
-      if (level === 'error' || level === 'warn') {
-        console.warn(`[decomposer:${level}] ${message}`, payload ?? '');
-      }
-    },
-  };
-}
-
-/**
  * Decomposes an objective via DECOMPOSER_PERSONA + runAgent.
  * Returns the legacy Dag shape by mapping DecomposerOutput.tasks.
  * Throws on AgentRejectedError / AgentOutputError — callers should catch and
@@ -1153,7 +1117,7 @@ async function decomposeViaPersona(
   objective: string,
   options: DecomposeOptions,
 ): Promise<Dag> {
-  const ctx = buildDecomposerAgentContext(options);
+  const ctx = buildConsoleAgentContext('decomposer', options.cwd ?? process.cwd());
 
   const input: DecomposerInput = {
     workspace: options.cwd ?? process.cwd(),
@@ -1180,17 +1144,8 @@ async function decomposeViaPersona(
 
   // Map DecomposerOutput back to the legacy Dag shape the rest of the system expects.
   const dag: Dag = { tasks: output.tasks };
-  normalizeCliSpawnRouting(dag);
   // Re-validate with the existing pipeline (dag-validator + ref-check).
-  assertDependsOnRefs(dag);
-  const validation = validateDag(dag, { objective });
-  if (!validation.valid) {
-    const errorMessages = validation.issues
-      .filter(i => i.severity === 'error')
-      .map(i => `[${i.rule}] ${i.message}`)
-      .join('; ');
-    throw new Error(`Decomposer (persona): DAG failed validation. ${errorMessages}`);
-  }
+  assertDagPassesValidation(dag, objective, 'Decomposer (persona)');
   return dag;
 }
 
@@ -1405,9 +1360,14 @@ export async function decompose(
     options,
     'decomposer_objective',
   );
-  // Tier 0 Wave 3 (ITEM 0.7) — consult the version registry. When a pinned
-  // decomposer spec exists, prefer its system_prompt; otherwise legacy path.
-  const pinnedDecomposer = consumePinnedDecomposer(options);
+
+  // Parse+validate+backfill shared by the first attempt and the retry below.
+  const acceptDag = (rawOutput: string): Dag => {
+    const dag = parseDecomposerOutput(rawOutput);
+    surfaceDagValidationWarnings(dag, options);
+    backfillTaskTimeouts(dag, compactedObjective);
+    return dag;
+  };
 
   // ── Feature-flag path ───────────────────────────────────────────────────────
   if (getUsePersonas()) {
@@ -1429,13 +1389,17 @@ export async function decompose(
   }
 
   // ── Legacy path ─────────────────────────────────────────────────────────────
-  // Tier 0 Wave 3 (ITEM 0.7) — when a pinned decomposer spec provides a
-  // system_prompt, use it verbatim (the operator has explicitly approved
-  // that version's contract). Otherwise build the standard prompt.
+  // Tier 0 Wave 3 (ITEM 0.7) — consult the version registry. When a pinned
+  // decomposer spec provides a system_prompt, use it verbatim (the operator
+  // has explicitly approved that version's contract). Otherwise build the
+  // standard prompt. Consumed HERE (not before the persona branch) so the
+  // versioned_definition_consumed audit row is only written when the pinned
+  // prompt can actually be used — the persona path ignores it.
   //
   // Week 3 / Task 2.2 — if no pinned spec, check for an active prompt
   // variant (eval_active_variants table). Variants are an A/B layer below
   // pinned definitions: an experiment that hasn't been promoted yet.
+  const pinnedDecomposer = consumePinnedDecomposer(options);
   const activeVariant = pinnedDecomposer.systemPrompt
     ? { promptText: null as string | null }
     : consumeActiveDecomposerVariant(options);
@@ -1464,10 +1428,7 @@ export async function decompose(
   }));
   const raw = rawResult.content;
   try {
-    const dag = parseDecomposerOutput(raw);
-    surfaceDagValidationWarnings(dag, options);
-    backfillTaskTimeouts(dag, compactedObjective);
-    return dag;
+    return acceptDag(raw);
   } catch (firstErr) {
     // Example smoke test 2026-04-30: pre-fix the decomposer threw on the
     // first validation failure with no recourse — operators saw raw
@@ -1526,10 +1487,7 @@ export async function decompose(
     }));
     const retryRaw = retryRawResult.content;
     try {
-      const dag = parseDecomposerOutput(retryRaw);
-      surfaceDagValidationWarnings(dag, options);
-      backfillTaskTimeouts(dag, compactedObjective);
-      return dag;
+      return acceptDag(retryRaw);
     } catch (secondErr) {
       // Surface BOTH errors so the operator sees what the model tried twice.
       const secondMessage = secondErr instanceof Error ? secondErr.message : String(secondErr);
@@ -1567,20 +1525,32 @@ export function parseDecomposerOutput(raw: string): Dag {
     );
   }
 
-  normalizeCliSpawnRouting(validated.data);
+  assertDagPassesValidation(validated.data, undefined, 'Decomposer');
 
-  assertDependsOnRefs(validated.data);
+  return validated.data;
+}
 
-  const validation = validateDag(validated.data);
+/**
+ * Final validation gate shared by the legacy and persona paths: normalize
+ * cli_spawn routing, check depends_on refs, then run the DAG validator and
+ * throw a single aggregated `[rule] message; ...` error on 'error' issues.
+ * `objective` is optional — the objective-aware checks skip when absent.
+ */
+function assertDagPassesValidation(
+  dag: Dag,
+  objective: string | undefined,
+  label: string,
+): void {
+  normalizeCliSpawnRouting(dag);
+  assertDependsOnRefs(dag);
+  const validation = validateDag(dag, { objective });
   if (!validation.valid) {
     const errorMessages = validation.issues
       .filter(i => i.severity === 'error')
       .map(i => `[${i.rule}] ${i.message}`)
       .join('; ');
-    throw new Error(`Decomposer: DAG failed validation. ${errorMessages}`);
+    throw new Error(`${label}: DAG failed validation. ${errorMessages}`);
   }
-
-  return validated.data;
 }
 
 function stripFences(text: string): string {

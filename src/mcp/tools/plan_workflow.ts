@@ -7,24 +7,15 @@ import { getDbPath } from '../../utils/config.js';
 import { loadWorkspaceEnv, VALID_WORKSPACE_RE } from '../../utils/workspace.js';
 import type { Dag, DagTask } from '../../types/index.js';
 import { scanForInjection } from '../../v2/injection-scan/index.js';
-import { loadSkillsFromDir } from '../../v2/skills/registry.js';
 import { applyBestSkillExecutionMode } from '../../v2/skills/apply-to-dag.js';
 import {
   applyExistingCodeFeatureModeToDag,
   existingCodePlanningInstruction,
-  type WorkflowMode,
 } from '../../workflow-modes/existing-code-feature.js';
-
-// FASE 1B Bloco A.3 — load SKILL.md files from disk once per process.
-// Mirrors run_workflow.ts so plan_workflow returns a DAG that already
-// reflects the skill's execution_mode (caller sees it before approval).
-let _skillsLoaded = false;
-function ensureSkillsLoaded(): void {
-  if (_skillsLoaded) return;
-  const dir = process.env.OMNIFORGE_SKILLS_DIR ?? 'hermes/skills';
-  loadSkillsFromDir(dir);
-  _skillsLoaded = true;
-}
+// FASE 1B Bloco A.3 — shared with run_workflow.ts so plan_workflow returns a
+// DAG that already reflects the skill's execution_mode (caller sees it before
+// approval).
+import { ensureSkillsLoaded } from './ensure-skills.js';
 
 const PlanWorkflowSchema = z.object({
   workspace: z.string().regex(VALID_WORKSPACE_RE, 'Invalid workspace name (alphanumeric/underscore/hyphen only)'),
@@ -62,8 +53,7 @@ function formatTask(t: DagTask): PlanTask {
 
 export async function planWorkflowTool(raw: unknown): Promise<string> {
   const { workspace, objective, workflow_mode, task_model, max_total_cost_usd } = PlanWorkflowSchema.parse(raw);
-  const workflowMode = workflow_mode as WorkflowMode;
-  const planningObjective = workflowMode === 'existing_code_feature'
+  const planningObjective = workflow_mode === 'existing_code_feature'
     ? existingCodePlanningInstruction(objective)
     : objective;
 
@@ -101,7 +91,7 @@ export async function planWorkflowTool(raw: unknown): Promise<string> {
         db,
       });
     }
-    if (workflowMode === 'existing_code_feature') {
+    if (workflow_mode === 'existing_code_feature') {
       dag = applyExistingCodeFeatureModeToDag(dag);
     }
 
@@ -114,7 +104,7 @@ export async function planWorkflowTool(raw: unknown): Promise<string> {
       status: 'plan_ready',
       workspace,
       objective,
-      workflow_mode: workflowMode,
+      workflow_mode,
       max_total_cost_usd: max_total_cost_usd ?? null,
       task_count: dag.tasks.length,
       pattern_used: patternUsed,

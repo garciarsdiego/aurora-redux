@@ -120,19 +120,8 @@ export async function sendTelegramGateNotification(opts: TelegramGateOpts): Prom
   }
 }
 
-/**
- * Answer Telegram callback query to show feedback to user.
- */
-export async function answerTelegramCallback(
-  botToken: string,
-  callbackQueryId: string,
-  decision: TelegramGateDecision
-): Promise<void> {
+async function postCallbackAnswer(botToken: string, callbackQueryId: string, text: string): Promise<void> {
   const url = `https://api.telegram.org/bot${botToken}/answerCallbackQuery`;
-  const text =
-    decision === 'approve' ? '✅ Gate aprovado' :
-    decision === 'reject' ? '❌ Gate rejeitado' :
-    '✏️ Modificação solicitada';
 
   try {
     await fetch(url, {
@@ -147,4 +136,32 @@ export async function answerTelegramCallback(
   } catch (err) {
     console.warn(`[HITL] Failed to answer Telegram callback: ${(err as Error).message}`);
   }
+}
+
+/**
+ * Answer Telegram callback query to show feedback to user.
+ */
+export async function answerTelegramCallback(
+  botToken: string,
+  callbackQueryId: string,
+  decision: TelegramGateDecision
+): Promise<void> {
+  const text =
+    decision === 'approve' ? '✅ Gate aprovado' :
+    decision === 'reject' ? '❌ Gate rejeitado' :
+    '✏️ Modificação solicitada';
+
+  await postCallbackAnswer(botToken, callbackQueryId, text);
+}
+
+/**
+ * Answer Telegram callback query with a neutral error message. Used when the
+ * webhook handler fails and the gate was NOT resolved — never simulate a
+ * decision outcome in that case.
+ */
+export async function answerTelegramCallbackError(
+  botToken: string,
+  callbackQueryId: string
+): Promise<void> {
+  await postCallbackAnswer(botToken, callbackQueryId, '⚠️ Erro ao processar — gate não resolvido');
 }

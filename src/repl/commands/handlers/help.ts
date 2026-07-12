@@ -1,12 +1,13 @@
 // /help [command_name?] — list all commands grouped by category, or show detail for one.
-import type { SlashCommand, SlashResult, ReplCtx } from '../types.js';
+import type { SlashCommand, SlashResult, ReplCtx, Category } from '../types.js';
 import { listCommands, lookupCommand } from '../registry.js';
 
 interface HelpArgs {
   command?: string;
 }
 
-const CATEGORY_ORDER = [
+// Covers the full (closed) Category union — keep in sync if the union grows.
+const CATEGORY_ORDER: readonly Category[] = [
   'workflow',
   'hitl',
   'patterns',
@@ -14,10 +15,10 @@ const CATEGORY_ORDER = [
   'state',
   'system',
   'debug',
-] as const;
+];
 
 function formatAll(): string {
-  const byCategory = new Map<string, SlashCommand[]>();
+  const byCategory = new Map<Category, SlashCommand[]>();
 
   for (const cmd of listCommands()) {
     const existing = byCategory.get(cmd.category) ?? [];
@@ -37,16 +38,6 @@ function formatAll(): string {
         ? ` (${cmd.aliases.join(', ')})`
         : '';
       lines.push(`  /${cmd.name.padEnd(14)}${cmd.description}${aliases}`);
-    }
-    lines.push('');
-  }
-
-  // Remaining categories not in CATEGORY_ORDER
-  for (const [cat, cmds] of byCategory.entries()) {
-    if ((CATEGORY_ORDER as readonly string[]).includes(cat)) continue;
-    lines.push(cat.toUpperCase());
-    for (const cmd of cmds) {
-      lines.push(`  /${cmd.name.padEnd(14)}${cmd.description}`);
     }
     lines.push('');
   }

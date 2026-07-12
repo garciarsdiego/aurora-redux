@@ -1,11 +1,9 @@
-import { readFile } from 'node:fs/promises';
-import { extname } from 'node:path';
-import { load as yamlLoad } from 'js-yaml';
 import type { Command } from 'commander';
 import { initDb } from '../../db/client.js';
 import { getDbPath } from '../../utils/config.js';
-import { DagSchema } from '../../types/schemas.js';
 import { insertPattern } from '../../db/persist.js';
+import { readAndValidateDag } from './runDag.js';
+import type { Dag } from '../../types/index.js';
 
 export function registerImport(program: Command): void {
   program
@@ -15,38 +13,22 @@ export function registerImport(program: Command): void {
     .requiredOption('-n, --name <name>', 'pattern name (must be unique per workspace)')
     .option('-o, --objective <sample>', 'short objective description used for pattern matching')
     .action(async (file: string, options: { workspace: string; name: string; objective?: string }) => {
-      let raw: string;
+      // Read + parse + Zod-validate shared with `run-dag` (readAndValidateDag)
+      // instead of a near-identical inline copy.
+      let dag: Dag;
       try {
-        raw = await readFile(file, 'utf-8');
-      } catch {
-        console.error(`Error: file not found: ${file}`);
-        process.exit(1);
+        dag = readAndValidateDag(file);
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exitCode = 1;
+        return;
       }
 
-      const ext = extname(file).toLowerCase();
-      if (!['.json', '.yaml', '.yml'].includes(ext)) {
-        console.error(`Error: unsupported file extension '${ext}' — use .json, .yaml, or .yml`);
-        process.exit(1);
-      }
-
-      let parsed: unknown;
-      try {
-        parsed = ext === '.json' ? JSON.parse(raw) : yamlLoad(raw);
-      } catch {
-        console.error(`Error: file is not valid ${ext === '.json' ? 'JSON' : 'YAML'}`);
-        process.exit(1);
-      }
-
-      const result = DagSchema.safeParse(parsed);
-      if (!result.success) {
-        console.error('Error: JSON does not match DAG schema');
-        console.error(result.error.issues.map((i) => `  • ${i.path.join('.')}: ${i.message}`).join('\n'));
-        process.exit(1);
-      }
-
-      const dag = result.data;
       const objectiveSample = options.objective ?? options.name;
 
+      // exitCode (not process.exit) + finally db.close(): same rationale as
+      // run.ts — process.exit() with a better-sqlite3 handle mid-close hits a
+      // libuv assertion on Windows.
       const db = initDb(getDbPath());
       try {
         insertPattern(db, {
@@ -69,7 +51,10 @@ export function registerImport(program: Command): void {
         } else {
           console.error(`Error: ${msg}`);
         }
-        process.exit(1);
+        process.exitCode = 1;
+        return;
+      } finally {
+        db.close();
       }
 
       const taskCount = dag.tasks.length;

@@ -52,6 +52,27 @@ function killPid(pid: number): Promise<void> {
   });
 }
 
+/** Shared error-message extraction used by every log line in this file. */
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Open a short-lived DB handle for a daemon sweep/drain, run `fn`, and always
+ * close the handle. Dynamic imports keep the daemon CLI's startup path light
+ * and avoid potential circular imports between cli/commands and brain/v2.
+ */
+async function withDaemonDb(fn: (db: Database.Database) => Promise<void> | void): Promise<void> {
+  const { initDb } = await import('../../db/client.js');
+  const { getDbPath } = await import('../../utils/config.js');
+  const db = initDb(getDbPath());
+  try {
+    await fn(db);
+  } finally {
+    db.close();
+  }
+}
+
 // F3-7: workflow statuses considered "in flight" for the purposes of
 // shutdown drain. We hard-cancel sub-agents for these so SIGTERM does not
 // leave orphan processes / stale `running` rows in the DB. `executing` is
@@ -63,6 +84,21 @@ const IN_FLIGHT_WORKFLOW_STATUSES = ['executing', 'pending', 'approved', 'paused
 // Task statuses that block a clean shutdown — we wait until every in-flight
 // task of every drained workflow flips to a terminal state before closing.
 const NON_TERMINAL_TASK_STATUSES = new Set(['running', 'pending', 'ready', 'waiting']);
+
+/** Count tasks of the given workflows still in a non-terminal status. */
+function countNonTerminalTasks(db: Database.Database, wfIds: string[]): number {
+  const statuses = [...NON_TERMINAL_TASK_STATUSES];
+  const wfPlaceholders = wfIds.map(() => '?').join(',');
+  const statusPlaceholders = statuses.map(() => '?').join(',');
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM tasks
+        WHERE workflow_id IN (${wfPlaceholders})
+          AND status IN (${statusPlaceholders})`,
+    )
+    .get(...wfIds, ...statuses) as { n: number } | undefined;
+  return row?.n ?? 0;
+}
 
 function resolveDrainTimeoutMs(): number {
   const raw = process.env.OMNIFORGE_SHUTDOWN_DRAIN_MS?.trim();
@@ -79,14 +115,9 @@ async function drainInFlightWorkflows(): Promise<void> {
     return;
   }
 
-  // Dynamic imports keep the daemon CLI's startup path light and avoid
-  // potential circular imports between cli/commands and brain/v2.
-  const { initDb } = await import('../../db/client.js');
-  const { getDbPath } = await import('../../utils/config.js');
   const { broadcastCancelToWorkflow } = await import('../../v2/subagent/control.js');
 
-  const db = initDb(getDbPath());
-  try {
+  await withDaemonDb(async (db) => {
     type WfRow = { id: string; status: string };
     const placeholders = IN_FLIGHT_WORKFLOW_STATUSES.map(() => '?').join(',');
     const inFlight = db
@@ -116,9 +147,7 @@ async function drainInFlightWorkflows(): Promise<void> {
         );
       } catch (err) {
         process.stderr.write(
-          `[daemon] drain: broadcastCancelToWorkflow failed for ${wf.id}: ${
-            err instanceof Error ? err.message : String(err)
-          }\n`,
+          `[daemon] drain: broadcastCancelToWorkflow failed for ${wf.id}: ${errMsg(err)}\n`,
         );
       }
     }
@@ -131,18 +160,10 @@ async function drainInFlightWorkflows(): Promise<void> {
     // state (or until drainTimeoutMs elapses). Polling avoids the need for
     // event-broker subscriptions and keeps the shutdown path dependency-free.
     const wfIds = inFlight.map((row) => row.id);
-    const placeholdersWf = wfIds.map(() => '?').join(',');
     const deadline = Date.now() + drainTimeoutMs;
     let lastRemaining = -1;
     while (Date.now() < deadline) {
-      const row = db
-        .prepare(
-          `SELECT COUNT(*) AS n FROM tasks
-            WHERE workflow_id IN (${placeholdersWf})
-              AND status IN ('running', 'pending', 'ready', 'waiting')`,
-        )
-        .get(...wfIds) as { n: number } | undefined;
-      const remaining = row?.n ?? 0;
+      const remaining = countNonTerminalTasks(db, wfIds);
       if (remaining === 0) {
         process.stderr.write('[daemon] drain: all tasks reached terminal state\n');
         break;
@@ -158,54 +179,36 @@ async function drainInFlightWorkflows(): Promise<void> {
 
     // Final report — even if we hit the deadline, log what is still hanging
     // so operators can investigate orphans on the next start sweep.
-    const finalRow = db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM tasks
-          WHERE workflow_id IN (${placeholdersWf})
-            AND status IN ('running', 'pending', 'ready', 'waiting')`,
-      )
-      .get(...wfIds) as { n: number } | undefined;
-    const finalRemaining = finalRow?.n ?? 0;
+    const finalRemaining = countNonTerminalTasks(db, wfIds);
     if (finalRemaining > 0) {
       process.stderr.write(
         `[daemon] drain: timeout — ${finalRemaining} task(s) still non-terminal after ${drainTimeoutMs}ms (orphan-recovery will clean up on next start)\n`,
       );
     }
-
-    // Note: NON_TERMINAL_TASK_STATUSES is the canonical set used above.
-    // Referenced here so future readers know it's the source of truth.
-    void NON_TERMINAL_TASK_STATUSES;
-  } finally {
-    db.close();
-  }
+  });
 }
 
 async function runOrphanRecoverySweep(): Promise<void> {
   // Wave C Agent O — sweep `runtime_sessions` for `acp-stdio` rows that the
   // previous daemon left behind (kill -9, crash, host reboot, etc.). Marks
   // their rows stale and tree-kills any still-alive child pids.
-  const { initDb } = await import('../../db/client.js');
-  const { getDbPath } = await import('../../utils/config.js');
   const { recoverOrphanAcpSessions } = await import('../../runtime/process-pool.js');
 
-  const db = initDb(getDbPath());
-  try {
-    const result = await recoverOrphanAcpSessions(db);
-    if (result.scanned > 0) {
-      process.stderr.write(
-        `[daemon] orphan-recovery: scanned=${result.scanned} marked_stale=${result.marked_stale} killed=${result.killed_pids} errors=${result.errors.length}\n`,
-      );
-      for (const e of result.errors) {
-        process.stderr.write(`[daemon] orphan-recovery error: ${e.sessionId} → ${e.error}\n`);
+  await withDaemonDb(async (db) => {
+    try {
+      const result = await recoverOrphanAcpSessions(db);
+      if (result.scanned > 0) {
+        process.stderr.write(
+          `[daemon] orphan-recovery: scanned=${result.scanned} marked_stale=${result.marked_stale} killed=${result.killed_pids} errors=${result.errors.length}\n`,
+        );
+        for (const e of result.errors) {
+          process.stderr.write(`[daemon] orphan-recovery error: ${e.sessionId} → ${e.error}\n`);
+        }
       }
+    } catch (err) {
+      process.stderr.write(`[daemon] orphan-recovery failed: ${errMsg(err)}\n`);
     }
-  } catch (err) {
-    process.stderr.write(
-      `[daemon] orphan-recovery failed: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
-  } finally {
-    db.close();
-  }
+  });
 }
 
 async function runHitlOrphanRecoverySweep(): Promise<void> {
@@ -214,28 +217,23 @@ async function runHitlOrphanRecoverySweep(): Promise<void> {
   // auto-resolve. Failure here is logged but MUST NOT block daemon startup
   // (HITL is a soft path — operators can still see and act via /workflows
   // listings even if this sweep dies).
-  const { initDb } = await import('../../db/client.js');
-  const { getDbPath } = await import('../../utils/config.js');
   const { recoverOrphanHitlGates } = await import('../../db/hitl-orphan-recovery.js');
 
-  const db = initDb(getDbPath());
-  try {
-    const result = recoverOrphanHitlGates(db);
-    if (result.scanned > 0 || result.errors.length > 0) {
-      process.stderr.write(
-        `[daemon] hitl-orphan-recovery: scanned=${result.scanned} surfaced=${result.surfaced} skipped=${result.skipped} errors=${result.errors.length}\n`,
-      );
-      for (const e of result.errors) {
-        process.stderr.write(`[daemon] hitl-orphan-recovery error: ${e.gate_id} → ${e.error}\n`);
+  await withDaemonDb((db) => {
+    try {
+      const result = recoverOrphanHitlGates(db);
+      if (result.scanned > 0 || result.errors.length > 0) {
+        process.stderr.write(
+          `[daemon] hitl-orphan-recovery: scanned=${result.scanned} surfaced=${result.surfaced} skipped=${result.skipped} errors=${result.errors.length}\n`,
+        );
+        for (const e of result.errors) {
+          process.stderr.write(`[daemon] hitl-orphan-recovery error: ${e.gate_id} → ${e.error}\n`);
+        }
       }
+    } catch (err) {
+      process.stderr.write(`[daemon] hitl-orphan-recovery failed: ${errMsg(err)}\n`);
     }
-  } catch (err) {
-    process.stderr.write(
-      `[daemon] hitl-orphan-recovery failed: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
-  } finally {
-    db.close();
-  }
+  });
 }
 
 async function runTriggerOrphanRetrySweepStartup(): Promise<void> {
@@ -259,7 +257,7 @@ async function runTriggerOrphanRetrySweepStartup(): Promise<void> {
     }
   } catch (err) {
     process.stderr.write(
-      `[daemon] trigger-orphan-retry failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[daemon] trigger-orphan-retry failed: ${errMsg(err)}\n`,
     );
   }
 }
@@ -340,7 +338,7 @@ export function runStartupSweeps(db: Database.Database): StartupSweepResult {
     }
   } catch (err) {
     process.stderr.write(
-      `[daemon] task-lease-recovery failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[daemon] task-lease-recovery failed: ${errMsg(err)}\n`,
     );
   }
 
@@ -373,7 +371,7 @@ export function runStartupSweeps(db: Database.Database): StartupSweepResult {
     }
   } catch (err) {
     process.stderr.write(
-      `[daemon] subagent-orphan-recovery failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[daemon] subagent-orphan-recovery failed: ${errMsg(err)}\n`,
     );
   }
 
@@ -392,7 +390,7 @@ export function runStartupSweeps(db: Database.Database): StartupSweepResult {
     });
   } catch (err) {
     process.stderr.write(
-      `[daemon] wal_checkpoint scheduling failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[daemon] wal_checkpoint scheduling failed: ${errMsg(err)}\n`,
     );
   }
 
@@ -425,7 +423,7 @@ export function runStartupSweeps(db: Database.Database): StartupSweepResult {
     // can't introspect sqlite_master is in deeper trouble, but startup must
     // not be blocked by an observability probe.
     process.stderr.write(
-      `[daemon] table-self-check failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[daemon] table-self-check failed: ${errMsg(err)}\n`,
     );
   }
 
@@ -481,7 +479,7 @@ export async function runStartupAsyncSweeps(
   } catch (err) {
     // The sweep must NEVER block daemon startup — log and emit a
     // sentinel event so operators can see the failure on the dashboard.
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = errMsg(err);
     process.stderr.write(`[daemon] remediation-pickup failed: ${msg}\n`);
     try {
       insertEvent(db, {
@@ -506,28 +504,23 @@ async function drainAcpProcesses(): Promise<void> {
   // the legacy `drainInFlightWorkflows` runs immediately after and lets the
   // executor's own cleanup chain shut things down. Force-kill of any leftover
   // children happens in `forceKillSurvivingAcpProcesses` at the end.
-  const { initDb } = await import('../../db/client.js');
-  const { getDbPath } = await import('../../utils/config.js');
   const { runtimeProcessPool } = await import('../../runtime/process-pool.js');
 
-  const db = initDb(getDbPath());
-  try {
-    const result = await runtimeProcessPool.drainAcpProcesses(db);
-    if (result.processesTouched > 0) {
-      process.stderr.write(
-        `[daemon] acp-drain: processes=${result.processesTouched} sessions_closed=${result.sessionsClosed} errors=${result.errors.length}\n`,
-      );
-      for (const e of result.errors) {
-        process.stderr.write(`[daemon] acp-drain error: ${e.poolKey} → ${e.error}\n`);
+  await withDaemonDb(async (db) => {
+    try {
+      const result = await runtimeProcessPool.drainAcpProcesses(db);
+      if (result.processesTouched > 0) {
+        process.stderr.write(
+          `[daemon] acp-drain: processes=${result.processesTouched} sessions_closed=${result.sessionsClosed} errors=${result.errors.length}\n`,
+        );
+        for (const e of result.errors) {
+          process.stderr.write(`[daemon] acp-drain error: ${e.poolKey} → ${e.error}\n`);
+        }
       }
+    } catch (err) {
+      process.stderr.write(`[daemon] acp-drain failed: ${errMsg(err)}\n`);
     }
-  } catch (err) {
-    process.stderr.write(
-      `[daemon] acp-drain failed: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
-  } finally {
-    db.close();
-  }
+  });
 }
 
 async function forceKillAcpSurvivors(): Promise<void> {
@@ -543,7 +536,7 @@ async function forceKillAcpSurvivors(): Promise<void> {
     }
   } catch (err) {
     process.stderr.write(
-      `[daemon] acp-force-kill failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[daemon] acp-force-kill failed: ${errMsg(err)}\n`,
     );
   }
 }
@@ -603,7 +596,7 @@ async function runForeground(): Promise<void> {
       }
     } catch (err) {
       process.stderr.write(
-        `[daemon] Model validation skipped (catalog unreachable): ${err instanceof Error ? err.message : String(err)}\n`,
+        `[daemon] Model validation skipped (catalog unreachable): ${errMsg(err)}\n`,
       );
     }
   }
@@ -661,12 +654,12 @@ async function runForeground(): Promise<void> {
       await runStartupAsyncSweeps(sweepDb);
     } catch (err) {
       process.stderr.write(
-        `[daemon] async-startup-sweeps failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[daemon] async-startup-sweeps failed: ${errMsg(err)}\n`,
       );
     }
   } catch (err) {
     process.stderr.write(
-      `[daemon] startup-sweeps failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[daemon] startup-sweeps failed: ${errMsg(err)}\n`,
     );
   }
 
@@ -686,7 +679,7 @@ async function runForeground(): Promise<void> {
       walTickStop();
     } catch (err) {
       process.stderr.write(
-        `[daemon] wal-tick stop failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[daemon] wal-tick stop failed: ${errMsg(err)}\n`,
       );
     }
 
@@ -698,7 +691,7 @@ async function runForeground(): Promise<void> {
       await drainAcpProcesses();
     } catch (err) {
       process.stderr.write(
-        `[daemon] acp-drain wrapper failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[daemon] acp-drain wrapper failed: ${errMsg(err)}\n`,
       );
     }
 
@@ -711,7 +704,7 @@ async function runForeground(): Promise<void> {
       await drainInFlightWorkflows();
     } catch (err) {
       process.stderr.write(
-        `[daemon] drain failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[daemon] drain failed: ${errMsg(err)}\n`,
       );
     }
 
@@ -722,7 +715,7 @@ async function runForeground(): Promise<void> {
       await forceKillAcpSurvivors();
     } catch (err) {
       process.stderr.write(
-        `[daemon] acp-force-kill wrapper failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[daemon] acp-force-kill wrapper failed: ${errMsg(err)}\n`,
       );
     }
 

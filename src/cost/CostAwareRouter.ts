@@ -1,9 +1,10 @@
 import { getCostDatabase } from './CostDatabase.js';
-import { getCatalogQuality } from './catalog-quality.js';
+import { estimateUseCaseQuality } from './catalog-quality.js';
 import { inferCapabilities } from '../v2/models/capability-registry.js';
 import type {
   CostAwareRouteRequest,
   CostAwareRouteResponse,
+  CostRecord,
   ModelCandidate
 } from './types.js';
 
@@ -26,11 +27,23 @@ export class CostAwareRouter {
   async route(request: CostAwareRouteRequest): Promise<CostAwareRouteResponse> {
     // Get all available models
     const allCosts = this.costDatabase.getAllCosts();
-    
+
     // Filter by exclude_models if provided
     let candidates = allCosts;
-    if (request.exclude_models && request.exclude_models.length > 0) {
-      candidates = candidates.filter(c => !request.exclude_models!.includes(c.model));
+    const excludeModels = request.exclude_models;
+    if (excludeModels && excludeModels.length > 0) {
+      candidates = candidates.filter(c => !excludeModels.includes(c.model));
+    }
+
+    // Fail loudly with a clear message instead of letting reduce()/sort()[0]
+    // blow up downstream when the cost DB is empty (fresh deploy) or every
+    // model was excluded.
+    if (candidates.length === 0) {
+      throw new Error(
+        allCosts.length === 0
+          ? 'Cost-aware routing failed: no models in the cost database (model_costs is empty).'
+          : 'Cost-aware routing failed: exclude_models filtered out every available model.'
+      );
     }
 
     // Quality from the live provider matrix; latency from the real model_calls
@@ -45,9 +58,10 @@ export class CostAwareRouter {
     }));
 
     // Filter by budget if specified
-    if (request.budget_usd) {
-      modelCandidates = modelCandidates.filter(c => c.estimated_cost_usd <= request.budget_usd!);
-      
+    const budgetUsd = request.budget_usd;
+    if (budgetUsd) {
+      modelCandidates = modelCandidates.filter(c => c.estimated_cost_usd <= budgetUsd);
+
       // If no candidates within budget, issue warning
       if (modelCandidates.length === 0) {
         // Get cheapest option anyway for warning
@@ -64,26 +78,26 @@ export class CostAwareRouter {
           selected_provider: cheapest.provider,
           estimated_cost_usd: cheapest.estimated_cost_usd,
           estimated_quality: this.estimateQuality(cheapest.model, request.use_case),
-          reasoning: `No models within budget $${request.budget_usd.toFixed(4)}. Selected cheapest option.`,
+          reasoning: `No models within budget $${budgetUsd.toFixed(4)}. Selected cheapest option.`,
           alternatives: [],
           budget_warning: {
             current_cost: cheapest.estimated_cost_usd,
-            budget: request.budget_usd,
-            percentage: (cheapest.estimated_cost_usd / request.budget_usd) * 100
+            budget: budgetUsd,
+            percentage: (cheapest.estimated_cost_usd / budgetUsd) * 100
           }
         };
       }
     }
 
     // Filter by quality threshold if specified
-    if (request.quality_threshold) {
+    const qualityThreshold = request.quality_threshold;
+    if (qualityThreshold) {
       const qualityFiltered = modelCandidates.filter(
-        c => c.estimated_quality >= request.quality_threshold!
+        c => c.estimated_quality >= qualityThreshold
       );
-      
+
       if (qualityFiltered.length > 0) {
-        modelCandidates.length = 0;
-        modelCandidates.push(...qualityFiltered);
+        modelCandidates = qualityFiltered;
       }
     }
 
@@ -143,7 +157,7 @@ export class CostAwareRouter {
    * and neither the downshift nor the enforce gate ever fired.
    */
   private estimateRequestCost(
-    cost: any,
+    cost: CostRecord,
     objective: string,
     inputTokensOverride?: number,
   ): number {
@@ -164,23 +178,11 @@ export class CostAwareRouter {
   /**
    * Estimate quality for a model (0-1).
    *
-   * De-mock (OPS-08): base quality is sourced from the live provider matrix
-   * (capability registry) instead of a stale hardcoded map. The use-case
-   * multiplier remains a deliberate routing heuristic (not a quality table).
+   * Delegates to the shared catalog-quality helper so this heuristic stays in
+   * sync with CostOptimizer (same base quality source, same use-case table).
    */
   private estimateQuality(model: string, use_case: string): number {
-    const baseQuality = getCatalogQuality(model);
-
-    // Adjust based on use case (routing heuristic, not a quality measurement)
-    const useCaseMultiplier: Record<string, number> = {
-      'code': 1.0,
-      'debug': 0.95,
-      'planning': 1.05,
-      'review': 1.0,
-      'chat': 0.9
-    };
-
-    return Math.min(1.0, baseQuality * (useCaseMultiplier[use_case] || 1.0));
+    return estimateUseCaseQuality(model, use_case);
   }
 
   /**
@@ -355,18 +357,16 @@ export class CostAwareRouter {
     };
 
     // Find cheaper alternative that meets the quality threshold AND preserves
-    // the requested model's capabilities.
+    // the requested model's capabilities. Compute cost/quality once per
+    // candidate (each estimate hits the cost DB / catalog), then filter over
+    // the precomputed values.
     const alternatives = allCosts
-      .filter(cost => {
-        const estCost = this.estimateRequestCost(cost, `task: ${task_type}`, inputTokens);
-        const quality = this.estimateQuality(cost.model, use_case);
-        return estCost <= budget_usd && quality >= min_quality && preservesCapabilities(cost.model);
-      })
       .map(cost => ({
         model: cost.model,
         cost: this.estimateRequestCost(cost, `task: ${task_type}`, inputTokens),
         quality: this.estimateQuality(cost.model, use_case)
       }))
+      .filter(c => c.cost <= budget_usd && c.quality >= min_quality && preservesCapabilities(c.model))
       .sort((a, b) => b.quality - a.quality); // Prefer higher quality within budget
 
     if (alternatives.length > 0) {

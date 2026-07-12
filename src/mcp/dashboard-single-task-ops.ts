@@ -33,7 +33,6 @@
 //     later to support more modes (Test / Review / etc) without
 //     bloating the existing module.
 
-import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Dag } from '../types/index.js';
 import { VALID_WORKSPACE_RE } from '../utils/workspace.js';
@@ -269,9 +268,8 @@ function resolveWorkspace(input: RunSingleTaskInput): string {
  * back to the dashboard.
  *
  * Errors propagate as Error throws — the HTTP handler catches and
- * surfaces as 4xx. We use randomUUID() for nothing here directly, but
- * the runDashboardDag → runWorkflowTool path mints the workflow id;
- * we just receive it back in the result.
+ * surfaces as 4xx. The runDashboardDag → runWorkflowTool path mints
+ * the workflow id; we just receive it back in the result.
  */
 export async function runDashboardSingleTask(
   raw: unknown,
@@ -294,9 +292,12 @@ export async function runDashboardSingleTask(
     cli_permission_mode: cliPermissionMode,
   });
 
-  const workflowId = typeof result['workflow_id'] === 'string'
-    ? result['workflow_id']
-    : `wf_${randomUUID()}`;
+  // A missing workflow_id means the run was never persisted — surface that
+  // instead of fabricating an id the dashboard could never resolve.
+  const workflowId = result['workflow_id'];
+  if (typeof workflowId !== 'string' || workflowId.length === 0) {
+    throw new Error('runDashboardDag returned no workflow_id');
+  }
   const status = typeof result['status'] === 'string'
     ? result['status']
     : 'started';
