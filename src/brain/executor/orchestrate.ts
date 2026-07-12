@@ -90,6 +90,20 @@ function fireWorkflowNotification(
   }
 }
 
+// Tier 0 Wave 3 (ITEM 0.2) / Wave 5B fix — a rejection reflects a deliberate
+// cancel (not a failure) when it carries AbortError's name (see
+// run-task/cancel.ts:checkAborted), or its message matches the 'cancel'
+// family of wordings surfaced across the codebase ('cancel', 'canceled',
+// 'cancelled' — including workflow-control.ts's plain-Error 'canceled by
+// operator'). Single unified regex shared by both call sites below — they
+// previously diverged: one had a typo'd duplicated alternation
+// `(led|led)` that silently failed to match the US spelling 'canceled',
+// which could downgrade a cancelled workflow's terminal status to 'failed'.
+function isCancellationError(err: unknown): boolean {
+  if ((err as Error & { name?: string })?.name === 'AbortError') return true;
+  return /\bcancel(?:l?ed)?\b/i.test((err as Error)?.message ?? '');
+}
+
 function shouldInjectExecutionPlan(task: { name: string; acceptance_criteria?: string | null }): boolean {
   const combined = `${task.name}\n${task.acceptance_criteria ?? ''}`.toLowerCase();
   return combined.includes('execution plan') || (
@@ -715,9 +729,7 @@ export async function runTaskLoop(
       // signal, the workflow status is already 'cancelled' (set by
       // requestWorkflowControl / broadcastCancelToWorkflow). Do NOT downgrade
       // it to 'failed' here, or the operator-visible state regresses.
-      const isAbort = (cause as Error & { name?: string })?.name === 'AbortError'
-        || /\bcancel(led|led)?\b/i.test(cause?.message ?? '')
-        || /canceled by operator/i.test(cause?.message ?? '');
+      const isAbort = isCancellationError(cause);
       if (!isAbort) {
         setWorkflowDone(db, wfId, 'failed');
       }
@@ -1013,9 +1025,7 @@ export async function executeWorkflow(
     // rethrow unchanged so the caller's error handling is untouched. Aborts
     // (operator cancel) are NOT a failure for notification purposes — the
     // workflow status is 'cancelled', not 'failed', so skip the bell.
-    const isAbort = (err as Error & { name?: string })?.name === 'AbortError'
-      || /\bcancel(?:l)?ed\b/i.test((err as Error)?.message ?? '')
-      || /canceled by operator/i.test((err as Error)?.message ?? '');
+    const isAbort = isCancellationError(err);
     if (!isAbort) {
       fireWorkflowNotification(
         'failed',

@@ -521,20 +521,21 @@ export function setDashboardScheduleActive(
   now = Date.now(),
 ): DashboardSchedule {
   const input = patchActiveSchema.parse(raw);
-  if (input.is_active && activeCount(db, 'dashboard_schedules') >= MAX_ACTIVE_SCHEDULES) {
-    const existing = db.prepare(`SELECT is_active FROM dashboard_schedules WHERE id = ?`).get(id) as { is_active: 0 | 1 } | undefined;
-    if (existing?.is_active !== 1) throw new Error('max 50 active schedules reached');
-  }
   const existing = db.prepare(`SELECT * FROM dashboard_schedules WHERE id = ?`).get(id) as ScheduleRow | undefined;
   if (!existing) throw new Error('schedule not found');
+  // Only re-check the cap when actually activating a schedule that wasn't
+  // already active — re-saving an already-active schedule must not count
+  // against the limit twice.
+  if (input.is_active && existing.is_active !== 1 && activeCount(db, 'dashboard_schedules') >= MAX_ACTIVE_SCHEDULES) {
+    throw new Error('max 50 active schedules reached');
+  }
   const nextRunAt = input.is_active ? computeNextRunAt(existing.cron_expression, now) : existing.next_run_at;
   db.prepare(
     `UPDATE dashboard_schedules
         SET is_active = ?, next_run_at = ?, updated_at = ?
       WHERE id = ?`,
   ).run(input.is_active ? 1 : 0, nextRunAt, now, id);
-  const updated = db.prepare(`SELECT * FROM dashboard_schedules WHERE id = ?`).get(id) as ScheduleRow;
-  return toSchedule(updated);
+  return toSchedule({ ...existing, is_active: input.is_active ? 1 : 0, next_run_at: nextRunAt, updated_at: now });
 }
 
 export function dueDashboardSchedules(db: Database.Database, now = Date.now()): DashboardSchedule[] {
@@ -670,18 +671,19 @@ export function setDashboardWebhookActive(
   now = Date.now(),
 ): DashboardWebhookTrigger {
   const input = patchActiveSchema.parse(raw);
-  if (input.is_active && activeCount(db, 'dashboard_webhook_triggers') >= MAX_ACTIVE_WEBHOOKS) {
-    const existing = db.prepare(`SELECT is_active FROM dashboard_webhook_triggers WHERE id = ?`).get(id) as { is_active: 0 | 1 } | undefined;
-    if (existing?.is_active !== 1) throw new Error('max 50 active webhooks reached');
+  const existing = db.prepare(`SELECT * FROM dashboard_webhook_triggers WHERE id = ?`).get(id) as WebhookRow | undefined;
+  if (!existing) throw new Error('webhook not found');
+  // Same reasoning as setDashboardScheduleActive: only count against the cap
+  // when actually flipping an inactive webhook to active.
+  if (input.is_active && existing.is_active !== 1 && activeCount(db, 'dashboard_webhook_triggers') >= MAX_ACTIVE_WEBHOOKS) {
+    throw new Error('max 50 active webhooks reached');
   }
-  const result = db.prepare(
+  db.prepare(
     `UPDATE dashboard_webhook_triggers
         SET is_active = ?, updated_at = ?
       WHERE id = ?`,
   ).run(input.is_active ? 1 : 0, now, id);
-  if (result.changes === 0) throw new Error('webhook not found');
-  const row = db.prepare(`SELECT * FROM dashboard_webhook_triggers WHERE id = ?`).get(id) as WebhookRow;
-  return toWebhook(row);
+  return toWebhook({ ...existing, is_active: input.is_active ? 1 : 0, updated_at: now });
 }
 
 export function rotateDashboardWebhookSecret(

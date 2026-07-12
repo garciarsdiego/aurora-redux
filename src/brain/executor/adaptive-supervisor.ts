@@ -44,7 +44,7 @@ import {
   unregisterAbortController,
 } from '../../v2/subagent/control.js';
 import { insertEvent, loadWorkflowById } from '../../db/persist.js';
-import { withTimeout, sleep } from './internal-utils.js';
+import { withTimeout, sleep, composeAbortSignals } from './internal-utils.js';
 import { runOmniRouteTask } from '../../executors/omniroute.js';
 import { safeParseJson } from '../../utils/safe-parse-json.js';
 import { isAbortError } from './run-task/cancel.js';
@@ -481,16 +481,11 @@ async function processOneTurn(
   let output: string;
   try {
     output = await withTimeout(
-      (timeoutSignal) => {
-        // Forward the timeout abort onto the task's controller so the
-        // executor sees a single signal regardless of which fired first.
-        if (timeoutSignal.aborted) {
-          ac.abort();
-        } else {
-          timeoutSignal.addEventListener('abort', () => ac.abort(), { once: true });
-        }
-        return doExecute(task, fenced, ac.signal);
-      },
+      // Bridge the timeout signal with the task's registered AbortController
+      // (kill()/steer() abort `ac` directly via the control registry) so
+      // doExecute sees a single aborting signal regardless of which fired
+      // first (Wave 5A #2 — composeAbortSignals owns the listener cleanup).
+      (timeoutSignal) => doExecute(task, fenced, composeAbortSignals(timeoutSignal, ac.signal)),
       resolveTimeoutMs(task),
       `adaptive-turn:${task.id}`,
     );

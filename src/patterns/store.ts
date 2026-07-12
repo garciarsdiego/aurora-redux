@@ -1,6 +1,5 @@
 import type Database from 'better-sqlite3';
-import type { Pattern, Task } from '../types/index.js';
-import type { DagTask } from '../types/index.js';
+import type { DagTask, Pattern, Task } from '../types/index.js';
 import {
   insertPattern,
   loadPatternById,

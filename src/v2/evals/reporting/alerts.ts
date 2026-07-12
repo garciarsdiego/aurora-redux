@@ -30,6 +30,36 @@ export interface RegressionDetectionConfig {
   metrics?: string[];
 }
 
+/** Mean score / sample count per metric, for a single eval run. */
+type MetricMeanMap = Map<string, { mean_score: number; sample_count: number }>;
+
+/**
+ * Fetch per-metric mean score and sample count for a run.
+ * Shared by the baseline and current-run lookups in checkRegression.
+ */
+function fetchMetricMeans(db: Database, runId: string): MetricMeanMap {
+  const rows = db.prepare(`
+    SELECT
+      ems.metric_name,
+      AVG(ems.score) as mean_score,
+      COUNT(*) as sample_count
+    FROM eval_metric_scores ems
+    INNER JOIN eval_results er ON ems.result_id = er.id
+    WHERE er.run_id = ?
+    GROUP BY ems.metric_name
+  `).all(runId) as Array<{
+    metric_name: string;
+    mean_score: number;
+    sample_count: number;
+  }>;
+
+  const map: MetricMeanMap = new Map();
+  for (const row of rows) {
+    map.set(row.metric_name, { mean_score: row.mean_score, sample_count: row.sample_count });
+  }
+  return map;
+}
+
 /**
  * Check for score regression by comparing current run against baseline.
  * Returns array of regression alerts (empty if no regression detected).
@@ -46,72 +76,17 @@ export function checkRegression(
     metrics: metricsToCheck = [],
   } = config;
 
-  // Fetch baseline run details
-  const baselineRun = db.prepare(`
-    SELECT
-      er.id, er.workspace, er.suite_name, er.status, er.score, er.case_count,
-      er.created_at, er.completed_at
-    FROM eval_runs er
-    WHERE er.id = ?
-  `).get(baselineRunId) as {
-    id: string;
-    workspace: string;
-    suite_name: string;
-    status: string;
-    score: number;
-    case_count: number;
-    created_at: number;
-    completed_at: number | null;
-  } | undefined;
+  // Fetch baseline run (existence check only — no other column is read).
+  const baselineRun = db.prepare(`SELECT id FROM eval_runs WHERE id = ?`).get(baselineRunId) as
+    { id: string } | undefined;
 
   if (!baselineRun) {
     console.warn(`[checkRegression] Baseline run ${baselineRunId} not found`);
     return [];
   }
 
-  // Fetch baseline metric scores
-  const baselineMetrics = db.prepare(`
-    SELECT
-      ems.metric_name,
-      AVG(ems.score) as mean_score,
-      COUNT(*) as sample_count
-    FROM eval_metric_scores ems
-    INNER JOIN eval_results er ON ems.result_id = er.id
-    WHERE er.run_id = ?
-    GROUP BY ems.metric_name
-  `).all(baselineRunId) as Array<{
-    metric_name: string;
-    mean_score: number;
-    sample_count: number;
-  }>;
-
-  // Build baseline metric map
-  const baselineMetricMap = new Map<string, { mean_score: number; sample_count: number }>();
-  for (const m of baselineMetrics) {
-    baselineMetricMap.set(m.metric_name, { mean_score: m.mean_score, sample_count: m.sample_count });
-  }
-
-  // Fetch current metric scores
-  const currentMetrics = db.prepare(`
-    SELECT
-      ems.metric_name,
-      AVG(ems.score) as mean_score,
-      COUNT(*) as sample_count
-    FROM eval_metric_scores ems
-    INNER JOIN eval_results er ON ems.result_id = er.id
-    WHERE er.run_id = ?
-    GROUP BY ems.metric_name
-  `).all(currentRun.run.id) as Array<{
-    metric_name: string;
-    mean_score: number;
-    sample_count: number;
-  }>;
-
-  // Build current metric map
-  const currentMetricMap = new Map<string, { mean_score: number; sample_count: number }>();
-  for (const m of currentMetrics) {
-    currentMetricMap.set(m.metric_name, { mean_score: m.mean_score, sample_count: m.sample_count });
-  }
+  const baselineMetricMap = fetchMetricMeans(db, baselineRunId);
+  const currentMetricMap = fetchMetricMeans(db, currentRun.run.id);
 
   // Check for regressions
   const regressions: RegressionAlert[] = [];
@@ -321,7 +296,10 @@ export async function detectAndAlertRegressions(
   if (regressions.length > 0) {
     console.warn(`[detectAndAlertRegressions] Detected ${regressions.length} regression(s) for run ${currentRun.run.id}`);
     for (const regression of regressions) {
-      await sendRegressionAlert(regression);
+      const { sent, error } = await sendRegressionAlert(regression);
+      if (!sent) {
+        process.stderr.write(`[detectAndAlertRegressions] Telegram alert for run ${currentRun.run.id} not sent: ${error}\n`);
+      }
     }
   }
 }
@@ -344,7 +322,10 @@ export async function processABTestCompletion(
     timestamp: Date.now(),
   };
 
-  await sendABTestWinnerAlert(alert);
+  const { sent, error } = await sendABTestWinnerAlert(alert);
+  if (!sent) {
+    process.stderr.write(`[processABTestCompletion] Telegram alert for test ${alert.test_id} not sent: ${error}\n`);
+  }
 }
 
 /**
@@ -368,5 +349,8 @@ export async function processOptimizationCompletion(
     timestamp: Date.now(),
   };
 
-  await sendOptimizationCompleteAlert(alert);
+  const { sent, error } = await sendOptimizationCompleteAlert(alert);
+  if (!sent) {
+    process.stderr.write(`[processOptimizationCompletion] Telegram alert for optimization ${alert.optimization_id} not sent: ${error}\n`);
+  }
 }

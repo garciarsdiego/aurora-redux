@@ -8,7 +8,7 @@
 import type { TestCase } from './framework.js';
 import type { EvaluationOutput, AgentEvaluator } from './framework.js';
 import type { Dag } from '../../../types/index.js';
-import { validateDag } from '../../../brain/dag-validator.js';
+import { validateDag, type ValidationResult } from '../../../brain/dag-validator.js';
 
 /**
  * Result shape produced by simulateOrchestration (local typing only —
@@ -35,6 +35,11 @@ interface ExpectedExecution {
     detectedFailure?: boolean;
     retryAttempted?: boolean;
   };
+}
+
+/** Local typing for `testCase.expectedOutput` (TestCase.expectedOutput remains `any` in the exported type). */
+interface ExpectedOutput {
+  execution?: ExpectedExecution;
 }
 
 export class OrchestratorEvaluator implements AgentEvaluator {
@@ -330,8 +335,8 @@ export class OrchestratorEvaluator implements AgentEvaluator {
    */
   private validateAgainstExpected(
     orchestration: OrchestrationResult,
-    dagValidation: any,
-    expected: any
+    dagValidation: ValidationResult,
+    expected: ExpectedOutput
   ): {
     isValid: boolean;
     error?: string;
@@ -341,7 +346,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
       if (!dagValidation.valid) {
         return {
           isValid: false,
-          error: `DAG validation failed: ${dagValidation.issues?.map((i: any) => i.message).join(', ')}`
+          error: `DAG validation failed: ${dagValidation.issues?.map((i) => i.message).join(', ')}`
         };
       }
 
@@ -410,6 +415,15 @@ export class OrchestratorEvaluator implements AgentEvaluator {
 
   /**
    * Calculate dependency resolution score
+   *
+   * NOTE: this now takes `dag` as an explicit parameter. Previously it read
+   * `orchestration.dag`, a field `simulateOrchestration()` never actually sets
+   * (see the OrchestrationResult shape above), so `dag` was always undefined
+   * and this score was always 0 — 25% of the orchestrator qualityScore was
+   * permanently zeroed. Passing the real DAG in fixes that, which is a real
+   * behavior change: scores (and the checkRegression() baseline comparisons
+   * in reporting/alerts.ts that consume them) will shift upward on the next
+   * eval run even though nothing about the evaluated orchestrator changed.
    */
   private calculateDependencyResolution(orchestration: OrchestrationResult, dag: Dag): number {
     // Check if all dependencies are satisfied
@@ -591,7 +605,7 @@ export class OrchestratorEvaluator implements AgentEvaluator {
   /**
    * Calculate correctness score
    */
-  private calculateCorrectness(orchestration: OrchestrationResult, expected: any): number {
+  private calculateCorrectness(orchestration: OrchestrationResult, expected: ExpectedOutput): number {
     let score = 0;
     let checks = 0;
 

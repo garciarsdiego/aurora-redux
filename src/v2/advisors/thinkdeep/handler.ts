@@ -13,7 +13,11 @@ import type {
   StepwiseAdvisorResult,
 } from '../types.js';
 import { shouldUseStepwiseMemory } from '../shared/mode.js';
-import { runStepwiseAdvisor, type StepwisePromptExtras } from '../shared/stepwisePrompt.js';
+import {
+  formatIssueLine,
+  runStepwiseAdvisor,
+  type StepwisePromptExtras,
+} from '../shared/stepwisePrompt.js';
 import { ThinkDeepInputSchema, type ThinkDeepInput } from './schema.js';
 import { THINKDEEP_SYSTEM_PROMPT } from './prompt.js';
 
@@ -92,11 +96,7 @@ function buildUserPrompt(parsed: ThinkDeepInput, extras?: ThinkDeepPromptExtras)
   if (parsed.issues_found.length > 0) {
     lines.push('');
     lines.push('=== ISSUES FOUND ===');
-    parsed.issues_found.forEach((issue) => {
-      const severity = issue['severity'] ?? 'unknown';
-      const description = issue['description'] ?? JSON.stringify(issue);
-      lines.push(`- [${severity}] ${description}`);
-    });
+    parsed.issues_found.forEach((issue) => lines.push(formatIssueLine(issue)));
   }
 
   return lines.join('\n');

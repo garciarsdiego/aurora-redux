@@ -8,6 +8,8 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
+import { initDb } from '../../db/client.js';
+import { getDbPath } from '../../utils/config.js';
 
 export const API_VERSION = 1;
 
@@ -271,6 +273,41 @@ export function safeEndSse(res: ServerResponse): void {
       process.stderr.write(`[daemon] SSE res.end failed: ${endErr instanceof Error ? endErr.message : String(endErr)}\n`);
       try { res.destroy(); } catch { /* destroy on already-destroyed is fine */ }
     }
+  }
+}
+
+// ── DB lifecycle helper ───────────────────────────────────────────────────
+//
+// The 'const db = initDb(getDbPath()); try { ... } catch (err) {
+// badRequest(...) } finally { db.close() }' shape is repeated throughout the
+// router package. withDb / withDbAsync centralize it: open the db, run `fn`,
+// report any thrown error via badRequest (same
+// `err instanceof Error ? err.message : String(err)` idiom every call site
+// already used), and always close the db in a finally. Behavior-preserving —
+// callers just move their try-body into the callback.
+
+export function withDb(res: ServerResponse, fn: (db: ReturnType<typeof initDb>) => void): void {
+  const db = initDb(getDbPath());
+  try {
+    fn(db);
+  } catch (err) {
+    badRequest(res, err instanceof Error ? err.message : String(err));
+  } finally {
+    db.close();
+  }
+}
+
+export async function withDbAsync(
+  res: ServerResponse,
+  fn: (db: ReturnType<typeof initDb>) => Promise<void>,
+): Promise<void> {
+  const db = initDb(getDbPath());
+  try {
+    await fn(db);
+  } catch (err) {
+    badRequest(res, err instanceof Error ? err.message : String(err));
+  } finally {
+    db.close();
   }
 }
 

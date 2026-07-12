@@ -12,9 +12,9 @@ import { spawn } from 'node:child_process';
 import { writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { z } from 'zod';
 import { registerTool, type ToolResult, type ToolContext } from '../registry.js';
+import { pathEscapesWorkspace } from './sandbox-path.js';
 
 export const ApplyPatchInputSchema = z.object({
   patch: z.string().min(1).describe('Unified diff (git-style) to apply'),
@@ -75,15 +75,6 @@ export function parsePatchPaths(patch: string): string[] {
     }
   }
   return [...paths];
-}
-
-function pathEscapesWorkspace(rawPath: string, workspaceRoot: string): boolean {
-  const root = path.resolve(workspaceRoot);
-  const candidate = path.isAbsolute(rawPath) || /^[A-Za-z]:[/\\]/.test(rawPath)
-    ? path.resolve(rawPath)
-    : path.resolve(root, rawPath);
-  const rel = path.relative(root, candidate);
-  return rel.startsWith('..') || path.isAbsolute(rel);
 }
 
 export async function applyPatch(

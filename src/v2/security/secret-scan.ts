@@ -172,9 +172,7 @@ export function scanTextForSecrets(text: string, filePath: string): SecretFindin
       if (!rule.dedupeWhenNamed) namedLines.add(position.line);
     }
   }
-  return findings.sort((a, b) =>
-    a.filePath.localeCompare(b.filePath) || a.line - b.line || a.column - b.column,
-  );
+  return findings.sort(compareFindings);
 }
 
 export function scanDirectory(rootDir: string, options: SecretScanOptions = {}): SecretFinding[] {
@@ -204,9 +202,12 @@ export function scanDirectory(rootDir: string, options: SecretScanOptions = {}):
   }
 
   walk(rootDir);
-  return findings.sort((a, b) =>
-    a.filePath.localeCompare(b.filePath) || a.line - b.line || a.column - b.column,
-  );
+  return findings.sort(compareFindings);
+}
+
+/** Shared ordering for findings: by file, then line, then column. */
+function compareFindings(a: SecretFinding, b: SecretFinding): number {
+  return a.filePath.localeCompare(b.filePath) || a.line - b.line || a.column - b.column;
 }
 
 // Re-export so callers can import the redactor alongside the scanner.

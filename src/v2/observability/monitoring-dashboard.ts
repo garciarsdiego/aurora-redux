@@ -18,8 +18,7 @@ import { initDb } from '../../db/client.js';
 import { getDaemonState } from '../../db/persist.js';
 import { readDaemonHeartbeat } from '../../db/daemon-heartbeat.js';
 import { getPersonaMetrics, getPersonaVsLegacyShare } from './persona-metrics.js';
-import { exportTraceSpans } from './tracing.js';
-import { getAnalyticsReport } from './analytics.js';
+import { getAnalyticsReport, calculateCacheHitRatePct, type PerformanceTrend, type CostAnalytics, type RoutingAnalytics, type Insight } from './analytics.js';
 
 export interface SystemHealthMetrics {
   status: 'healthy' | 'degraded' | 'unhealthy';
@@ -90,10 +89,10 @@ export interface MonitoringDashboardData {
   };
   // Sprint 8: Advanced Analytics
   analytics?: {
-    performance_trends: Record<string, any>;
-    cost_analytics: any;
-    routing_analytics: any;
-    insights: any[];
+    performance_trends: Record<string, PerformanceTrend>;
+    cost_analytics: CostAnalytics;
+    routing_analytics: RoutingAnalytics;
+    insights: Insight[];
   };
 }
 
@@ -234,28 +233,9 @@ export function getLLMUsageMetrics(db: Database.Database): LLMUsageMetrics {
 
     const avgTokens = totalCalls > 0 ? Math.round(totalTokens / totalCalls) : null;
 
-    // Cache hit rate from trace spans
-    let cacheHits = 0;
-    let totalCacheLookups = 0;
-    try {
-      const spans = db.prepare("SELECT attributes_json FROM trace_spans WHERE kind = 'llm_call'").all() as Array<{ attributes_json: string | null }>;
-      for (const span of spans) {
-        if (!span.attributes_json) continue;
-        try {
-          const attrs = JSON.parse(span.attributes_json) as { cache_read_input_tokens?: number };
-          totalCacheLookups++;
-          if (attrs.cache_read_input_tokens && attrs.cache_read_input_tokens > 0) {
-            cacheHits++;
-          }
-        } catch {
-          // Skip malformed attributes
-        }
-      }
-    } catch {
-      // trace_spans might not exist yet
-    }
-
-    const cacheHitRate = totalCacheLookups > 0 ? Math.round((cacheHits / totalCacheLookups) * 100) : null;
+    // Cache hit rate from trace spans (shared with AnalyticsEngine.getCacheHitRate)
+    const rawCacheHitRate = calculateCacheHitRatePct(db);
+    const cacheHitRate = rawCacheHitRate !== null ? Math.round(rawCacheHitRate) : null;
 
     return {
       total_tokens: totalTokens,
@@ -277,6 +257,12 @@ export function getLLMUsageMetrics(db: Database.Database): LLMUsageMetrics {
   }
 }
 
+/** Minimal shape of a provider entry from the omniroute-bridge health cache. */
+interface ProviderHealthEntry {
+  status: string;
+  latency_ms: number | null;
+}
+
 /**
  * Fetch OmniRoute metrics from health cache (Sprint 3 integration).
  * Enhanced with cost sync metrics (Sprint 4).
@@ -286,15 +272,11 @@ export function getOmniRouteMetrics(): OmniRouteMetrics {
     // Import dynamically to avoid circular dependencies
     const { getCachedHealth, getCacheStats } = require('../../v2/omniroute-bridge/health-cache.js');
     const { getFailoverState } = require('../../v2/omniroute-bridge/failover.js');
-    const { getHealthMonitorStats } = require('../../v2/omniroute-bridge/health-monitor.js');
-    const { getHealthMetrics } = require('../../v2/omniroute-bridge/health-observability.js');
     const { isAutoCostSyncEnabled, getInProgressSyncs, getSyncStatusCacheStats } = require('../../v2/omniroute-bridge/cost-integration.js');
 
     const cachedHealth = getCachedHealth();
     const cacheStats = getCacheStats();
     const failoverState = getFailoverState();
-    const monitorStats = getHealthMonitorStats();
-    const healthMetrics = getHealthMetrics();
 
     // Cost sync metrics
     const costSyncEnabled = isAutoCostSyncEnabled();
@@ -313,6 +295,13 @@ export function getOmniRouteMetrics(): OmniRouteMetrics {
       costSyncStatus = 'ok';
     }
 
+    const costSyncFields = {
+      cost_sync_enabled: costSyncEnabled,
+      cost_sync_status: costSyncStatus,
+      pending_syncs: pendingSyncs,
+      failed_syncs: failedSyncs,
+    };
+
     if (!cachedHealth) {
       return {
         health_status: 'unknown',
@@ -320,22 +309,19 @@ export function getOmniRouteMetrics(): OmniRouteMetrics {
         active_providers: 0,
         avg_latency_ms: null,
         last_sync_age_ms: null,
-        cost_sync_enabled: costSyncEnabled,
-        cost_sync_status: costSyncStatus,
-        pending_syncs: pendingSyncs,
-        failed_syncs: failedSyncs,
+        ...costSyncFields,
       };
     }
 
-    const providers = cachedHealth.providers || {};
+    const providers = (cachedHealth.providers || {}) as Record<string, ProviderHealthEntry>;
     const providerEntries = Object.entries(providers);
-    const healthyProviders = providerEntries.filter(([, p]: [string, any]) => p.status === 'healthy').length;
-    const degradedProviders = providerEntries.filter(([, p]: [string, any]) => p.status === 'degraded').length;
+    const healthyProviders = providerEntries.filter(([, p]) => p.status === 'healthy').length;
+    const degradedProviders = providerEntries.filter(([, p]) => p.status === 'degraded').length;
     const activeProviders = healthyProviders + degradedProviders;
 
     const latencies = providerEntries
-      .map(([, p]: [string, any]) => p.latency_ms)
-      .filter((l: number | null) => l != null);
+      .map(([, p]) => p.latency_ms)
+      .filter((l): l is number => l != null);
     const avgLatency = latencies.length > 0
       ? latencies.reduce((sum: number, l: number) => sum + l, 0) / latencies.length
       : null;
@@ -352,8 +338,7 @@ export function getOmniRouteMetrics(): OmniRouteMetrics {
       healthStatus = 'degraded';
     }
 
-    // Use health metrics if available, otherwise fall back to cache stats
-    const lastSyncAge = healthMetrics ? cacheStats.cacheAge : cacheStats.cacheAge;
+    const lastSyncAge = cacheStats.cacheAge;
 
     return {
       health_status: healthStatus,
@@ -361,10 +346,7 @@ export function getOmniRouteMetrics(): OmniRouteMetrics {
       active_providers: activeProviders,
       avg_latency_ms: avgLatency ? Math.round(avgLatency) : null,
       last_sync_age_ms: lastSyncAge,
-      cost_sync_enabled: costSyncEnabled,
-      cost_sync_status: costSyncStatus,
-      pending_syncs: pendingSyncs,
-      failed_syncs: failedSyncs,
+      ...costSyncFields,
     };
   } catch (err) {
     // If modules are not available, return unknown status

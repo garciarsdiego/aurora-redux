@@ -420,8 +420,8 @@ export function runCliTask(
     };
 
     // Sprint 3.8 (D-H2.066, F-REL-7): use `once` for terminal events to
-     // prevent listener accumulation if abort fires after rapid retries.
-     // 'close' and 'error' fire exactly once per child lifecycle.
+    // prevent listener accumulation if abort fires after rapid retries.
+    // 'close' and 'error' fire exactly once per child lifecycle.
     child.once('close', (code) => {
       const durationMs = Date.now() - startedAt;
       void opts.onEvent?.({

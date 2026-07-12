@@ -66,6 +66,29 @@ export const SubagentMessageRowSchema = z.object({
 });
 export type SubagentMessageRow = z.infer<typeof SubagentMessageRowSchema>;
 
+/**
+ * Column list for `SELECT ... FROM subagent_messages`, unprefixed. Shared
+ * by outbox.ts (plain SELECT) and inbox.ts (which prefixes each column
+ * with the `m.` JOIN alias) so the two call sites can't silently diverge.
+ */
+export const MESSAGE_COLUMNS =
+  'id, workflow_id, from_task_id, to_task_id, message_type, payload_json, status, created_at, delivered_at';
+
+/**
+ * Validate a raw DB row against SubagentMessageRowSchema. Returns the typed
+ * row or null on validation failure, logging a stderr diagnostic tagged
+ * with `context` (e.g. 'inbox' or 'outbox.getMessageById(id=...)') so
+ * failures can be traced back to the caller.
+ */
+export function parseMessageRow(row: unknown, context: string): SubagentMessageRow | null {
+  const result = SubagentMessageRowSchema.safeParse(row);
+  if (!result.success) {
+    process.stderr.write(`[${context}] row schema mismatch: ${result.error.message}\n`);
+    return null;
+  }
+  return result.data;
+}
+
 // ─── Input contract for outbox.enqueue ─────────────────────────────────
 
 export interface SubagentMessageInput {

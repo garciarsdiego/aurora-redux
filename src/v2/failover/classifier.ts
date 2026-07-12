@@ -153,20 +153,14 @@ interface ErrContext {
 }
 
 function extractContext(err: unknown): ErrContext {
-  if (err instanceof Error) {
+  if (err instanceof Error || (typeof err === 'object' && err !== null)) {
     const anyErr = err as unknown as Record<string, unknown>;
-    const status = typeof anyErr['status'] === 'number' ? (anyErr['status'] as number) : undefined;
-    return {
-      message: err.message,
-      status,
-      bodyCode: extractBodyCode(anyErr),
-      retryAfterMs: extractRetryAfterMs(anyErr),
-    };
-  }
-  if (typeof err === 'object' && err !== null) {
-    const anyErr = err as Record<string, unknown>;
+    // Error instances use their own .message; plain objects fall back to a
+    // string `message` prop, then to a JSON dump so nothing is lost.
     const rawMessage = anyErr['message'];
-    const message = typeof rawMessage === 'string' ? rawMessage : JSON.stringify(anyErr);
+    const message = err instanceof Error
+      ? err.message
+      : typeof rawMessage === 'string' ? rawMessage : JSON.stringify(anyErr);
     const status = typeof anyErr['status'] === 'number' ? (anyErr['status'] as number) : undefined;
     return {
       message,
@@ -283,6 +277,19 @@ function anyMatch(patterns: RegExp[], text: string): boolean {
   return patterns.some((p) => p.test(text));
 }
 
+/**
+ * Shared usage/transient signal detection used by the message-pattern step
+ * and the 429/402 status refinements. Callers apply their own decision logic
+ * on top — the transient default differs between 429 (rate_limit) and 402
+ * (billing) — this just centralizes the two anyMatch() calls.
+ */
+function classifyUsageSignals(message: string): { usage: boolean; transient: boolean } {
+  return {
+    usage: anyMatch(USAGE_LIMIT_PATTERNS, message),
+    transient: anyMatch(USAGE_LIMIT_TRANSIENT_SIGNALS, message),
+  };
+}
+
 // --- 7-step pipeline ------------------------------------------------------
 
 export function classifyError(err: unknown): FailoverError {
@@ -328,10 +335,11 @@ export function classifyError(err: unknown): FailoverError {
   if (anyMatch(MODEL_NOT_FOUND_MESSAGE_PATTERNS, message)) {
     return make('model_not_found', ctx);
   }
-  if (anyMatch(USAGE_LIMIT_PATTERNS, message)) {
-    return anyMatch(USAGE_LIMIT_TRANSIENT_SIGNALS, message)
-      ? make('rate_limit', ctx)
-      : make('billing', ctx);
+  {
+    const { usage, transient } = classifyUsageSignals(message);
+    if (usage) {
+      return transient ? make('rate_limit', ctx) : make('billing', ctx);
+    }
   }
 
   // Step 5 — Server disconnect + large-session hint → context_overflow
@@ -364,14 +372,12 @@ function classifyByStatus(status: number, ctx: ErrContext): FailoverError | unde
     return make('auth_permanent', ctx);
   }
   if (status === 429) {
-    const usage = anyMatch(USAGE_LIMIT_PATTERNS, message);
-    const transient = anyMatch(USAGE_LIMIT_TRANSIENT_SIGNALS, message);
+    const { usage, transient } = classifyUsageSignals(message);
     if (usage && !transient) return make('billing', ctx);
     return make('rate_limit', ctx);
   }
   if (status === 402) {
-    const usage = anyMatch(USAGE_LIMIT_PATTERNS, message);
-    const transient = anyMatch(USAGE_LIMIT_TRANSIENT_SIGNALS, message);
+    const { usage, transient } = classifyUsageSignals(message);
     if (usage && transient) return make('rate_limit', ctx);
     return make('billing', ctx);
   }

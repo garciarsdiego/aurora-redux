@@ -35,6 +35,8 @@ class AnalyticsCache {
   private config: AnalyticsCacheConfig;
   private cache: Map<string, CacheEntry<unknown>>;
   private refreshTimers: Map<string, NodeJS.Timeout>;
+  private hitCount = 0;
+  private missCount = 0;
 
   constructor(config: Partial<AnalyticsCacheConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -58,8 +60,11 @@ class AnalyticsCache {
 
     // Check if cache entry exists and is valid
     if (entry && Date.now() - entry.timestamp < entry.ttl) {
+      this.hitCount++;
       return entry.data as T;
     }
+
+    this.missCount++;
 
     // Compute new value
     const data = await computeFn();
@@ -135,11 +140,12 @@ class AnalyticsCache {
     missCount: number;
     hitCount: number;
   } {
+    const total = this.hitCount + this.missCount;
     return {
       size: this.cache.size,
-      hitRate: 0, // TODO: Implement hit/miss tracking
-      missCount: 0,
-      hitCount: 0,
+      hitRate: total > 0 ? this.hitCount / total : 0,
+      missCount: this.missCount,
+      hitCount: this.hitCount,
     };
   }
 
@@ -160,34 +166,6 @@ class AnalyticsCache {
     if (oldestKey) {
       this.invalidate(oldestKey);
     }
-  }
-
-  /**
-   * Schedule background refresh
-   */
-  private scheduleBackgroundRefresh<T>(
-    key: string,
-    computeFn: () => Promise<T> | T,
-    delayMs: number
-  ): void {
-    // Clear existing timer if any
-    const existingTimer = this.refreshTimers.get(key);
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-    }
-
-    // Schedule new refresh
-    const timer = setTimeout(async () => {
-      try {
-        const data = await computeFn();
-        this.set(key, data);
-      } catch (err) {
-        // Silent failure on background refresh
-        console.error(`Background refresh failed for key ${key}:`, err);
-      }
-    }, delayMs);
-
-    this.refreshTimers.set(key, timer);
   }
 
   public updateConfig(config: Partial<AnalyticsCacheConfig>): void {
@@ -336,7 +314,7 @@ class AsyncProcessor {
     jobFn: () => Promise<T> | T,
     jobId?: string
   ): Promise<string> {
-    const id = jobId || `job-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const id = jobId || `job-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
     const job: AsyncJob<T> = {
       id,
@@ -361,7 +339,8 @@ class AsyncProcessor {
    * Get job status
    */
   getJobStatus<T>(jobId: string): AsyncJob<T> | null {
-    return this.jobs.get(jobId) as AsyncJob<T> | null;
+    const job = this.jobs.get(jobId);
+    return job ? (job as AsyncJob<T>) : null;
   }
 
   /**

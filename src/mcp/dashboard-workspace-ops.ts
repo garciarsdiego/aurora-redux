@@ -11,6 +11,7 @@ import {
   type WorkspaceProfile,
 } from '../utils/workspace-profile.js';
 import { ensureGitInitialized } from '../utils/git-worktree.js';
+import { safeJsonObject } from './_json-utils.js';
 
 const CreateWorkspaceSchema = z.object({
   name: z.string().trim().min(1).max(64).regex(VALID_WORKSPACE_RE),
@@ -85,17 +86,7 @@ export function updateDashboardWorkspace(
        FROM dashboard_workspaces
       WHERE name = ?`,
   ).get(workspace) as { metadata_json: string | null } | undefined;
-  let metadata: Record<string, unknown> = {};
-  if (existing?.metadata_json) {
-    try {
-      const parsed = JSON.parse(existing.metadata_json) as unknown;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        metadata = parsed as Record<string, unknown>;
-      }
-    } catch {
-      metadata = {};
-    }
-  }
+  const metadata: Record<string, unknown> = safeJsonObject(existing?.metadata_json ?? null);
 
   if (input.software_target !== undefined) {
     if (input.software_target === null) delete metadata['software_target'];

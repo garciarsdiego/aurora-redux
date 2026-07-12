@@ -67,6 +67,15 @@ export function postEvalRun(
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
+  // Insert metric scores — hoisted out of the loop below so the statement is
+  // compiled once instead of once per result.
+  const insertMetric = db.prepare(`
+    INSERT OR REPLACE INTO eval_metric_scores (
+      id, result_id, metric_name, score, threshold, passed, reason,
+      cost_usd, latency_ms, meta_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
   for (const result of results) {
     insertResult.run(
       result.id,
@@ -79,14 +88,6 @@ export function postEvalRun(
       result.error,
       result.created_at,
     );
-
-    // Insert metric scores
-    const insertMetric = db.prepare(`
-      INSERT OR REPLACE INTO eval_metric_scores (
-        id, result_id, metric_name, score, threshold, passed, reason,
-        cost_usd, latency_ms, meta_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
 
     for (const metric of result.metric_scores) {
       insertMetric.run(

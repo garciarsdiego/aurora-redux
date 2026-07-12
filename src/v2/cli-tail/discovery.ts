@@ -16,6 +16,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
+import { isDir, isFile } from "./parsers/shared.js";
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -38,22 +40,15 @@ function safeMtime(p: string): number {
   }
 }
 
-/** Return true if path exists and is a file. */
-function isFile(p: string): boolean {
-  try {
-    return fs.statSync(p).isFile();
-  } catch {
-    return false;
-  }
-}
-
-/** Return true if path exists and is a directory. */
-function isDir(p: string): boolean {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
+/**
+ * Given accumulated {p, mtime} candidates (mtime already filtered by taskStartedAt),
+ * return the path with the largest mtime, or null when there are no candidates.
+ * Shared epilogue for every per-CLI finder below.
+ */
+function pickNewest(candidates: { p: string; mtime: number }[]): string | null {
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates[0].p;
 }
 
 /**
@@ -93,10 +88,10 @@ function findCodexSession(taskStartedAt: number): string | null {
       const monthDir = path.join(yearDir, month);
       if (!isDir(monthDir)) continue;
       for (const day of safeReaddir(monthDir)) {
-        const dayDir1 = path.join(yearDir, month, day);
-        for (const entry of safeReaddir(dayDir1)) {
+        const dayDir = path.join(monthDir, day);
+        for (const entry of safeReaddir(dayDir)) {
           if (!entry.startsWith("rollout-") || !entry.endsWith(".jsonl")) continue;
-          const full = path.join(dayDir1, entry);
+          const full = path.join(dayDir, entry);
           const mtime = safeMtime(full);
           if (mtime >= taskStartedAt) {
             candidates.push({ p: full, mtime });
@@ -106,9 +101,7 @@ function findCodexSession(taskStartedAt: number): string | null {
     }
   }
 
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  return candidates[0].p;
+  return pickNewest(candidates);
 }
 
 /**
@@ -151,9 +144,7 @@ function findClaudeCodeSession(taskStartedAt: number, cwd?: string): string | nu
     }
   }
 
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  return candidates[0].p;
+  return pickNewest(candidates);
 }
 
 /**
@@ -182,9 +173,7 @@ function findGeminiSession(taskStartedAt: number): string | null {
     }
   }
 
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  return candidates[0].p;
+  return pickNewest(candidates);
 }
 
 /**
@@ -210,9 +199,7 @@ function findKimiSession(taskStartedAt: number): string | null {
     }
   }
 
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  return candidates[0].p;
+  return pickNewest(candidates);
 }
 
 /**
@@ -234,19 +221,7 @@ function findCursorSession(taskStartedAt: number): string | null {
     }
   }
 
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  return candidates[0].p;
-}
-
-/**
- * opencode: returns null.
- * opencode does not currently produce a stable, discoverable session log path.
- * TODO: revisit when opencode session log format is documented.
- */
-function findOpencodeSession(_taskStartedAt: number): null {
-  // opencode does not expose a stable session log path — return null intentionally.
-  return null;
+  return pickNewest(candidates);
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +254,9 @@ export function findActiveSession(
     case "cursor":
       return findCursorSession(taskStartedAt);
     case "opencode":
-      return findOpencodeSession(taskStartedAt);
+      // opencode does not currently produce a stable, discoverable session log path.
+      // TODO: revisit when opencode session log format is documented.
+      return null;
     default:
       return null;
   }

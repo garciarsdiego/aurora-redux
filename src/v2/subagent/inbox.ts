@@ -10,9 +10,14 @@
 import type Database from 'better-sqlite3';
 import { withSqliteRetrySync } from '../../db/sqlite-retry.js';
 import {
-  SubagentMessageRowSchema,
+  MESSAGE_COLUMNS,
+  parseMessageRow,
   type SubagentMessageRow,
 } from './messages.js';
+
+// Aliased column list for the JOIN queries below (`m.` prefix). Derived
+// from the shared MESSAGE_COLUMNS so the two lists can't drift apart.
+const MESSAGE_COLUMNS_ALIASED = MESSAGE_COLUMNS.split(', ').map((c) => `m.${c}`).join(', ');
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -87,21 +92,6 @@ function parsePayloadJson(
   return { fenced, raw: obj.raw };
 }
 
-/**
- * Validate a raw DB row against SubagentMessageRowSchema.
- * Returns the typed row or null on validation failure (with stderr log).
- */
-function parseRow(row: unknown): SubagentMessageRow | null {
-  const result = SubagentMessageRowSchema.safeParse(row);
-  if (!result.success) {
-    process.stderr.write(
-      `[inbox] row schema mismatch: ${result.error.message}\n`,
-    );
-    return null;
-  }
-  return result.data;
-}
-
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -133,8 +123,7 @@ export function dequeueFor(
     results = [];
 
     const rawRows = db.prepare(
-      `SELECT m.id, m.workflow_id, m.from_task_id, m.to_task_id,
-              m.message_type, m.payload_json, m.status, m.created_at, m.delivered_at
+      `SELECT ${MESSAGE_COLUMNS_ALIASED}
        ${PENDING_FOR_SQL}`,
     ).all({ taskId, workflowId }) as unknown[];
 
@@ -151,7 +140,7 @@ export function dequeueFor(
     );
 
     for (const rawRow of rawRows) {
-      const row = parseRow(rawRow);
+      const row = parseMessageRow(rawRow, 'inbox');
       if (row === null) continue;
 
       // Write delivery tracking row (idempotent via INSERT OR IGNORE).
@@ -196,14 +185,13 @@ export function peekFor(
   workflowId: string,
 ): SubagentMessageRow[] {
   const rawRows = db.prepare(
-    `SELECT m.id, m.workflow_id, m.from_task_id, m.to_task_id,
-            m.message_type, m.payload_json, m.status, m.created_at, m.delivered_at
+    `SELECT ${MESSAGE_COLUMNS_ALIASED}
      ${PENDING_FOR_SQL}`,
   ).all({ taskId, workflowId }) as unknown[];
 
   const rows: SubagentMessageRow[] = [];
   for (const rawRow of rawRows) {
-    const row = parseRow(rawRow);
+    const row = parseMessageRow(rawRow, 'inbox');
     if (row !== null) rows.push(row);
   }
   return rows;

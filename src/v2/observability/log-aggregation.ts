@@ -6,11 +6,8 @@
  */
 
 import pino from 'pino';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface LogEntry {
   timestamp: number;
@@ -250,7 +247,7 @@ class LogAggregator {
       case 'json':
         return JSON.stringify(logs, null, 2);
 
-      case 'csv':
+      case 'csv': {
         if (logs.length === 0) return '';
         const headers = ['timestamp', 'level', 'context', 'workflowId', 'taskId', 'message', 'metadata'];
         const rows = logs.map(log => [
@@ -263,6 +260,7 @@ class LogAggregator {
           `"${JSON.stringify(log.metadata || {}).replace(/"/g, '""')}"`,
         ].join(','));
         return [headers.join(','), ...rows].join('\n');
+      }
 
       case 'syslog':
         return logs.map(log => {
@@ -359,52 +357,35 @@ class LogAggregator {
 export const logAggregator = new LogAggregator();
 
 /**
+ * Shared implementation for the logDebug/logInfo/logWarn/logError convenience functions below.
+ */
+function log(level: LogEntry['level'], message: string, metadata?: Record<string, unknown>, context?: string): void {
+  const entry: LogEntry = {
+    timestamp: Date.now(),
+    level,
+    message,
+    context,
+    metadata,
+  };
+  logAggregator.addLog(entry);
+  logger[level](metadata || {}, message);
+}
+
+/**
  * Convenience functions for logging with aggregation
  */
 export function logDebug(message: string, metadata?: Record<string, unknown>, context?: string): void {
-  const entry: LogEntry = {
-    timestamp: Date.now(),
-    level: 'debug',
-    message,
-    context,
-    metadata,
-  };
-  logAggregator.addLog(entry);
-  logger.debug(metadata || {}, message);
+  log('debug', message, metadata, context);
 }
 
 export function logInfo(message: string, metadata?: Record<string, unknown>, context?: string): void {
-  const entry: LogEntry = {
-    timestamp: Date.now(),
-    level: 'info',
-    message,
-    context,
-    metadata,
-  };
-  logAggregator.addLog(entry);
-  logger.info(metadata || {}, message);
+  log('info', message, metadata, context);
 }
 
 export function logWarn(message: string, metadata?: Record<string, unknown>, context?: string): void {
-  const entry: LogEntry = {
-    timestamp: Date.now(),
-    level: 'warn',
-    message,
-    context,
-    metadata,
-  };
-  logAggregator.addLog(entry);
-  logger.warn(metadata || {}, message);
+  log('warn', message, metadata, context);
 }
 
 export function logError(message: string, metadata?: Record<string, unknown>, context?: string): void {
-  const entry: LogEntry = {
-    timestamp: Date.now(),
-    level: 'error',
-    message,
-    context,
-    metadata,
-  };
-  logAggregator.addLog(entry);
-  logger.error(metadata || {}, message);
+  log('error', message, metadata, context);
 }

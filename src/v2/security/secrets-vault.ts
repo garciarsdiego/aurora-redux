@@ -1,7 +1,14 @@
 import type Database from 'better-sqlite3';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
+
+// The repo is "type": "module" — bare `require()` isn't defined when the
+// source runs under ESM (tsx, vitest). It only worked in the shipped bundle
+// because tsup injects a require shim. createRequire keeps the lazy,
+// synchronous require() semantics without relying on that shim.
+const require = createRequire(import.meta.url);
 
 const AES_ALGORITHM = 'aes-256-gcm';
 const MASTER_KEY_BYTES = 32;
@@ -188,25 +195,42 @@ function deepResolveSecrets(value: unknown, workspace: string, db: Database.Data
 }
 
 /**
+ * Run `fn` against a db connection: reuses the caller-supplied `db` when
+ * given, otherwise opens a short-lived connection and closes it afterwards.
+ * Shared by resolveSecrets() here and redactSecrets() in redact.ts so the
+ * "own a connection or borrow one" bookkeeping lives in one place.
+ */
+export function withDbConnection<T>(
+  db: Database.Database | undefined,
+  fn: (conn: Database.Database) => T,
+): T {
+  if (db !== undefined) {
+    return fn(db);
+  }
+  const { initDb } = require('../../db/client.js') as typeof import('../../db/client.js');
+  const { getDbPath } = require('../../utils/config.js') as typeof import('../../utils/config.js');
+  const conn = initDb(getDbPath());
+  try {
+    return fn(conn);
+  } finally {
+    conn.close();
+  }
+}
+
+/**
  * Replace {{secret:KEY}} placeholders in a prompt (JSON or plain text) with
  * decrypted values from the vault.  If the prompt is valid JSON the replacement
  * is done recursively inside string values so secret values containing quotes
  * or newlines are safely re-encoded.
  */
 export function resolveSecrets(prompt: string, workspace: string, db?: Database.Database): string {
-  const ownDb = db === undefined;
-  const conn = ownDb ? (() => {
-    const { initDb } = require('../../db/client.js') as typeof import('../../db/client.js');
-    const { getDbPath } = require('../../utils/config.js') as typeof import('../../utils/config.js');
-    return initDb(getDbPath());
-  })() : db!;
-  try {
-    const parsed = JSON.parse(prompt);
-    const resolved = deepResolveSecrets(parsed, workspace, conn);
-    return JSON.stringify(resolved);
-  } catch {
-    return resolveSecretsInString(prompt, workspace, conn);
-  } finally {
-    if (ownDb) conn.close();
-  }
+  return withDbConnection(db, (conn) => {
+    try {
+      const parsed = JSON.parse(prompt);
+      const resolved = deepResolveSecrets(parsed, workspace, conn);
+      return JSON.stringify(resolved);
+    } catch {
+      return resolveSecretsInString(prompt, workspace, conn);
+    }
+  });
 }

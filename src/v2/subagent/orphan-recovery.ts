@@ -50,28 +50,20 @@ export function findOrphans(
 ): OrphanRunSummary[] {
   const cutoff = Date.now() - ORPHAN_CEILING_MS;
 
-  let rows: SubagentRunQueryRow[];
+  // Same predicate either way — only the optional workflow_id scoping
+  // fragment and its param differ, kept in sync by construction instead of
+  // two independently-maintained SQL strings.
+  const workflowFilter = workflowId !== undefined ? 'workflow_id = ? AND ' : '';
+  const params = workflowId !== undefined ? [workflowId, cutoff] : [cutoff];
 
-  if (workflowId !== undefined) {
-    rows = db
-      .prepare(
-        `SELECT run_id, task_id, workflow_id, status, started_at, created_at
-         FROM subagent_runs
-         WHERE workflow_id = ?
-           AND status IN ('pending', 'running')
-           AND COALESCE(started_at, created_at) < ?`,
-      )
-      .all(workflowId, cutoff) as SubagentRunQueryRow[];
-  } else {
-    rows = db
-      .prepare(
-        `SELECT run_id, task_id, workflow_id, status, started_at, created_at
-         FROM subagent_runs
-         WHERE status IN ('pending', 'running')
-           AND COALESCE(started_at, created_at) < ?`,
-      )
-      .all(cutoff) as SubagentRunQueryRow[];
-  }
+  const rows = db
+    .prepare(
+      `SELECT run_id, task_id, workflow_id, status, started_at, created_at
+       FROM subagent_runs
+       WHERE ${workflowFilter}status IN ('pending', 'running')
+         AND COALESCE(started_at, created_at) < ?`,
+    )
+    .all(...params) as SubagentRunQueryRow[];
 
   const now = Date.now();
 

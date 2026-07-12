@@ -8,14 +8,17 @@
 
 export type ModelTier = 'premium' | 'balanced' | 'cost' | 'alternative';
 
-const COST_PER_SECOND: Record<ModelTier, number> = {
+// Exported so evaluators with non-standard cost/token formulas (e.g. the
+// reviewer's llmCalled short-circuit) can reuse the same rate tables instead
+// of re-declaring them.
+export const COST_PER_SECOND: Record<ModelTier, number> = {
   premium: 0.0001,      // ~$0.36/hour
   balanced: 0.00005,    // ~$0.18/hour
   cost: 0.00001,        // ~$0.036/hour
   alternative: 0.000008 // ~$0.029/hour
 };
 
-const COMPLEXITY_MULTIPLIER = {
+export const COMPLEXITY_MULTIPLIER = {
   simple: 1.0,
   medium: 2.0,
   complex: 4.0

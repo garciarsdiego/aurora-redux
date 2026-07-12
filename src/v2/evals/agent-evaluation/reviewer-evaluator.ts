@@ -9,7 +9,7 @@ import type { EvaluationOutput, AgentEvaluator } from './framework.js';
 import { REVIEWER_PERSONA, type ReviewerInput, type ReviewerOutput } from '../../agents/personas/reviewer.js';
 import { runAgent, type AgentInvoker, createInMemoryContext } from '../../agents/runner.js';
 import { callOmniroute } from '../../../utils/omniroute-call.js';
-import type { AgentContext } from '../../agents/types.js';
+import { getModelTier, COST_PER_SECOND, COMPLEXITY_MULTIPLIER } from './cost-estimation.js';
 
 export class ReviewerEvaluator implements AgentEvaluator {
   /**
@@ -78,15 +78,13 @@ export class ReviewerEvaluator implements AgentEvaluator {
         error: validation.isValid ? undefined : validation.error
       };
 
-    } catch (error: any) {
-      const duration = Date.now() - startTime;
-
+    } catch (error) {
       return {
         success: false,
         output: null,
         cost: 0,
         tokenUsage: 0,
-        error: error.message
+        error: error instanceof Error ? error.message : String(error)
       };
     }
   }
@@ -246,10 +244,10 @@ export class ReviewerEvaluator implements AgentEvaluator {
 
       return { isValid: true };
 
-    } catch (error: any) {
+    } catch (error) {
       return {
         isValid: false,
-        error: `Validation error: ${error.message}`
+        error: `Validation error: ${error instanceof Error ? error.message : String(error)}`
       };
     }
   }
@@ -484,16 +482,7 @@ export class ReviewerEvaluator implements AgentEvaluator {
    * Estimate cost based on model, duration, and LLM usage
    */
   private estimateCost(model: string, duration: number, llmCalled: boolean): number {
-    const tier = this.getModelTier(model);
-
-    const costPerSecond = {
-      premium: 0.0001,
-      balanced: 0.00005,
-      cost: 0.00001,
-      alternative: 0.000008
-    };
-
-    const rate = costPerSecond[tier] || 0.00005;
+    const rate = COST_PER_SECOND[getModelTier(model)];
     const effectiveDuration = llmCalled ? duration : 0; // No LLM cost if short-circuited
     return (effectiveDuration / 1000) * rate;
   }
@@ -504,23 +493,7 @@ export class ReviewerEvaluator implements AgentEvaluator {
   private estimateTokens(model: string, complexity: string, llmCalled: boolean): number {
     if (!llmCalled) return 0; // No tokens if short-circuited
 
-    const complexityMultiplier = {
-      simple: 1.0,
-      medium: 2.0,
-      complex: 4.0
-    };
-
     const baseTokens = 1500; // Reviewer typically uses more tokens
-    return baseTokens * complexityMultiplier[complexity as keyof typeof complexityMultiplier];
-  }
-
-  /**
-   * Get model tier for cost estimation
-   */
-  private getModelTier(model: string): 'premium' | 'balanced' | 'cost' | 'alternative' {
-    if (model.includes('claude-opus') || model.includes('gpt-5.5')) return 'premium';
-    if (model.includes('claude-sonnet') || model.includes('kimi') || model.includes('opencode')) return 'balanced';
-    if (model.includes('gemini') || model.includes('deepseek') || model.includes('minimax')) return 'cost';
-    return 'alternative';
+    return baseTokens * COMPLEXITY_MULTIPLIER[complexity as keyof typeof COMPLEXITY_MULTIPLIER];
   }
 }

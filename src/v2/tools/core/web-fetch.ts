@@ -27,9 +27,7 @@ function ipv4ToU32(ip: string): number {
   if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
     throw new Error(`Invalid IPv4: ${ip}`);
   }
-  return (
-    ((((octets[0]! << 24) | (octets[1]! << 16) | (octets[2]! << 8) | octets[3]!) >>> 0) as number)
-  );
+  return (((octets[0]! << 24) | (octets[1]! << 16) | (octets[2]! << 8) | octets[3]!) >>> 0);
 }
 
 /** True if IPv4 is loopback / RFC1918 / link-local / unspecified 0.0.0.0. */
@@ -52,24 +50,20 @@ function isBlockedIPv4Address(ip: string): boolean {
 function normalizeIPv6Hextets(ip: string): string[] | null {
   const lower = ip.toLowerCase();
   if (lower.includes('.')) return null;
-  try {
-    if (lower.includes('::')) {
-      const [lhs, rhs = ''] = lower.split('::');
-      const left = lhs ? lhs.split(':').filter(Boolean) : [];
-      const right = rhs ? rhs.split(':').filter(Boolean) : [];
-      const missing = 8 - left.length - right.length;
-      if (missing < 0) return null;
-      const mid = Array<string>(missing).fill('0000');
-      const all = [...left, ...mid, ...right];
-      if (all.length !== 8) return null;
-      return all.map((h) => h.padStart(4, '0'));
-    }
-    const parts = lower.split(':');
-    if (parts.length !== 8) return null;
-    return parts.map((h) => h.padStart(4, '0'));
-  } catch {
-    return null;
+  if (lower.includes('::')) {
+    const [lhs, rhs = ''] = lower.split('::');
+    const left = lhs ? lhs.split(':').filter(Boolean) : [];
+    const right = rhs ? rhs.split(':').filter(Boolean) : [];
+    const missing = 8 - left.length - right.length;
+    if (missing < 0) return null;
+    const mid = Array<string>(missing).fill('0000');
+    const all = [...left, ...mid, ...right];
+    if (all.length !== 8) return null;
+    return all.map((h) => h.padStart(4, '0'));
   }
+  const parts = lower.split(':');
+  if (parts.length !== 8) return null;
+  return parts.map((h) => h.padStart(4, '0'));
 }
 
 /** True for ::1/128, fc00::/7, fe80::/10, plus IPv4-mapped private addresses. */
@@ -103,7 +97,13 @@ function isBlockedIPv6Address(ip: string): boolean {
   return false;
 }
 
-function isBlockedResolvedAddress(ip: string): boolean {
+/**
+ * True when `ip` (a literal IPv4/IPv6 address — not a hostname) falls in a
+ * blocked range (loopback / RFC1918 / link-local / unique-local / etc).
+ * Exported so other SSRF guards in this package (index.ts's http-request
+ * tool) can reuse this address-range logic instead of a hand-rolled regex.
+ */
+export function isBlockedResolvedAddress(ip: string): boolean {
   if (isIPv4(ip)) {
     try {
       return isBlockedIPv4Address(ip);
@@ -127,7 +127,10 @@ async function assertSsrfAllows(urlLike: URL): Promise<void> {
   let host = urlLike.hostname.toLowerCase();
   if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
 
-  if (BLOCKED_LITERAL_HOSTS.has(urlLike.hostname.toLowerCase()) || BLOCKED_LITERAL_HOSTS.has(host)) {
+  // BLOCKED_LITERAL_HOSTS carries both the bracketed and bare IPv6 forms
+  // ('[::1]' and '::1'), so checking the bracket-stripped `host` alone is
+  // sufficient — it matches whichever form was actually blocked.
+  if (BLOCKED_LITERAL_HOSTS.has(host)) {
     throw new Error(`web-fetch: blocked host '${urlLike.hostname}'`);
   }
 
@@ -144,10 +147,9 @@ async function assertSsrfAllows(urlLike: URL): Promise<void> {
     const records = await lookup(host, { all: true, verbatim: true });
     if (!records.length) throw new Error('web-fetch: DNS returned no addresses');
     for (const record of records) {
-      const addr =
-        typeof record === 'object' && record !== null && 'address' in record
-          ? (record as { address: string }).address
-          : String(record);
+      // lookup() with {all: true} always resolves LookupAddress[], so
+      // record.address is directly typed — no runtime shape guard needed.
+      const addr = record.address;
       if (isBlockedResolvedAddress(addr)) {
         throw new Error(`web-fetch: DNS resolves '${host}' to blocked address '${addr}'`);
       }

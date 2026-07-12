@@ -21,7 +21,7 @@ import {
   calculateSuspicion,
 } from '../validators/suspicion.js';
 import { hasWriteTool, requiresWrite } from '../validators/tool_trace.js';
-import type { AgentContext, AgentPersona, FailureMode, PostHookResult } from '../types.js';
+import type { AgentPersona, FailureMode, PostHookResult } from '../types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IO contracts

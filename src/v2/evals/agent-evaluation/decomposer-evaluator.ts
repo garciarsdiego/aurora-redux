@@ -13,12 +13,22 @@ import { estimateCost, estimateTokens } from './cost-estimation.js';
 // ============================================================================
 // FALSIFIABLE CRITERIA PATTERNS (H7)
 // ============================================================================
-// Single source of truth for the strong/weak language classification — used by
-// both the hard validation and the scoring paths so they can never diverge.
+// Single source of truth for the strong/weak language classification used by
+// the H7 scoring path (calculateFalsifiableScore / calculateCorrectness).
 // Strong patterns indicate verifiable criteria; weak patterns indicate vagueness.
+//
+// NOTE: the hard validation gate in validateAgainstExpected() has always used
+// its own, slightly different weak-pattern list (see HARD_GATE_WEAK_PATTERNS
+// below). Keep the two separate — merging them changes which decompositions
+// pass/fail validation.
 
 const STRONG_CRITERIA_PATTERNS = ['must', 'should', 'required', 'shall', 'contains', 'exists', 'valid'];
 const WEAK_CRITERIA_PATTERNS = ['correct', 'good', 'proper', 'working', 'effective'];
+
+// Weak-pattern list for the hard validation gate (validateAgainstExpected).
+// Intentionally distinct from WEAK_CRITERIA_PATTERNS above — this is the
+// original list the gate has always used.
+const HARD_GATE_WEAK_PATTERNS = ['should', 'must be', 'correct', 'good', 'proper', 'working'];
 
 /**
  * Check if criteria text contains weak (non-falsifiable) language
@@ -26,6 +36,15 @@ const WEAK_CRITERIA_PATTERNS = ['correct', 'good', 'proper', 'working', 'effecti
 function hasWeakCriteriaLanguage(criteria: string | null | undefined): boolean {
   const text = criteria?.toLowerCase() || '';
   return WEAK_CRITERIA_PATTERNS.some(pattern => text.includes(pattern));
+}
+
+/**
+ * Check if criteria text contains weak language per the hard validation gate's
+ * (legacy) pattern list
+ */
+function hasHardGateWeakLanguage(criteria: string | null | undefined): boolean {
+  const text = criteria?.toLowerCase() || '';
+  return HARD_GATE_WEAK_PATTERNS.some(pattern => text.includes(pattern));
 }
 
 /**
@@ -223,7 +242,7 @@ export class DecomposerEvaluator implements AgentEvaluator {
 
       // Check falsifiable criteria quality (H7)
       const nonFalsifiable = dag.tasks.filter(
-        t => t.id !== 't0' && hasWeakCriteriaLanguage(t.acceptance_criteria)
+        t => t.id !== 't0' && hasHardGateWeakLanguage(t.acceptance_criteria)
       );
 
       if (nonFalsifiable.length > 0) {

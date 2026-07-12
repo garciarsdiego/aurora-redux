@@ -28,20 +28,16 @@ import type { TailEvent, TailParser } from '../types.js';
 import {
   asRole,
   eventsFromCapturedCliTranscript,
+  eventsFromRecordArray,
   flattenText,
-  isDir,
-  isFile,
   isRecord,
   maybeParseJson,
-  safeReadFile,
+  parseSessionFiles,
   toEpochMs,
-  walkFilesByMtime,
   warnParse,
 } from './shared.js';
 
 const PARSER_ID = 'gemini';
-
-type GeminiTimestamps = { fileMtime: number; fallback: number };
 
 // ---------------------------------------------------------------------------
 // Per-line / per-record extractors
@@ -49,9 +45,9 @@ type GeminiTimestamps = { fileMtime: number; fallback: number };
 
 function eventFromMessageRecord(
   rec: Record<string, unknown>,
-  ts: GeminiTimestamps,
+  fallbackTs: number,
 ): TailEvent[] {
-  const recTs = toEpochMs(rec['ts'] ?? rec['timestamp'] ?? rec['time'], ts.fallback);
+  const recTs = toEpochMs(rec['ts'] ?? rec['timestamp'] ?? rec['time'], fallbackTs);
 
   // tool_call shape
   if (rec['type'] === 'tool_call' || (typeof rec['name'] === 'string' && 'args' in rec)) {
@@ -87,38 +83,33 @@ function eventFromMessageRecord(
 
 function eventsFromMessagesArray(
   messages: unknown[],
-  ts: GeminiTimestamps,
+  fallbackTs: number,
 ): TailEvent[] {
-  const out: TailEvent[] = [];
-  for (const raw of messages) {
-    if (!isRecord(raw)) continue;
-    out.push(...eventFromMessageRecord(raw, ts));
-  }
-  return out;
+  return eventsFromRecordArray(messages, fallbackTs, eventFromMessageRecord);
 }
 
 function eventsFromSingleDocument(
   doc: Record<string, unknown>,
-  ts: GeminiTimestamps,
+  fallbackTs: number,
 ): TailEvent[] {
   if (Array.isArray(doc['messages'])) {
-    return eventsFromMessagesArray(doc['messages'] as unknown[], ts);
+    return eventsFromMessagesArray(doc['messages'] as unknown[], fallbackTs);
   }
   if (Array.isArray(doc['events'])) {
-    return eventsFromMessagesArray(doc['events'] as unknown[], ts);
+    return eventsFromMessagesArray(doc['events'] as unknown[], fallbackTs);
   }
   if (Array.isArray(doc['turns'])) {
-    return eventsFromMessagesArray(doc['turns'] as unknown[], ts);
+    return eventsFromMessagesArray(doc['turns'] as unknown[], fallbackTs);
   }
   // The doc itself looks like a single message record.
-  return eventFromMessageRecord(doc, ts);
+  return eventFromMessageRecord(doc, fallbackTs);
 }
 
-function eventsFromBuffer(buffer: string, ts: GeminiTimestamps): TailEvent[] {
+function eventsFromBuffer(buffer: string, fallbackTs: number): TailEvent[] {
   const trimmed = buffer.trim();
   if (!trimmed) return [];
 
-  const capturedEvents = eventsFromCapturedCliTranscript(PARSER_ID, buffer, ts.fallback);
+  const capturedEvents = eventsFromCapturedCliTranscript(PARSER_ID, buffer, fallbackTs);
   if (capturedEvents !== null) return capturedEvents;
 
   // Try NDJSON if the buffer has multiple newline-separated JSON objects.
@@ -141,7 +132,7 @@ function eventsFromBuffer(buffer: string, ts: GeminiTimestamps): TailEvent[] {
           continue;
         }
         if (!isRecord(parsed)) continue;
-        out.push(...eventFromMessageRecord(parsed, ts));
+        out.push(...eventFromMessageRecord(parsed, fallbackTs));
       }
       if (out.length > 0) return out;
     }
@@ -152,10 +143,10 @@ function eventsFromBuffer(buffer: string, ts: GeminiTimestamps): TailEvent[] {
     try {
       const doc: unknown = JSON.parse(trimmed);
       if (Array.isArray(doc)) {
-        return eventsFromMessagesArray(doc, ts);
+        return eventsFromMessagesArray(doc, fallbackTs);
       }
       if (isRecord(doc)) {
-        return eventsFromSingleDocument(doc, ts);
+        return eventsFromSingleDocument(doc, fallbackTs);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -164,7 +155,7 @@ function eventsFromBuffer(buffer: string, ts: GeminiTimestamps): TailEvent[] {
   }
 
   // Last resort: treat the file as plain text.
-  return [{ ts: ts.fallback, kind: 'message', text: trimmed }];
+  return [{ ts: fallbackTs, kind: 'message', text: trimmed }];
 }
 
 // ---------------------------------------------------------------------------
@@ -173,43 +164,13 @@ function eventsFromBuffer(buffer: string, ts: GeminiTimestamps): TailEvent[] {
 
 const HISTORY_FILE_RX = /\.(json|jsonl|ndjson|log|txt)$/i;
 
-function resolveFilesToParse(input: string): string[] {
-  if (isFile(input)) return [input];
-  if (isDir(input)) {
-    return walkFilesByMtime(input, (entry) => HISTORY_FILE_RX.test(entry));
-  }
-  return [];
-}
-
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
 const geminiParser: TailParser = {
   parse(filePath: string): TailEvent[] {
-    const files = resolveFilesToParse(filePath);
-    if (files.length === 0) {
-      warnParse(PARSER_ID, `no readable session files at ${filePath}`);
-      return [];
-    }
-
-    const out: TailEvent[] = [];
-    for (const file of files) {
-      const buffer = safeReadFile(file);
-      if (buffer === null) {
-        warnParse(PARSER_ID, `unable to read ${file}`);
-        continue;
-      }
-      const fallbackTs = Date.now();
-      const ts: GeminiTimestamps = { fileMtime: fallbackTs, fallback: fallbackTs };
-      try {
-        out.push(...eventsFromBuffer(buffer, ts));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        warnParse(PARSER_ID, `event extraction failed (${file}): ${msg}`);
-      }
-    }
-    return out;
+    return parseSessionFiles(PARSER_ID, filePath, HISTORY_FILE_RX, undefined, () => Date.now(), eventsFromBuffer);
   },
 };
 

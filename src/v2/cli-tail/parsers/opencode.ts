@@ -46,14 +46,12 @@
 import type { TailEvent, TailParser } from '../types.js';
 import {
   asRole,
+  eventsFromRecordArray,
   flattenText,
-  isDir,
-  isFile,
   isRecord,
   maybeParseJson,
-  safeReadFile,
+  parseSessionFiles,
   toEpochMs,
-  walkFilesByMtime,
   warnParse,
 } from './shared.js';
 
@@ -149,9 +147,11 @@ function handleToolCall(ts: number, update: Record<string, unknown>): TailEvent[
 }
 
 function handleToolResult(ts: number, update: Record<string, unknown>): TailEvent[] {
-  const result = isRecord(update['result']) ? (update['result'] as Record<string, unknown>) : null;
-  const toolOutput =
-    update['output'] ?? update['result'] ?? update['content'] ?? result?.['output'];
+  // Note: a `result?.['output']` fallback after `update['result']` here would be
+  // unreachable — if update['result'] is non-nullish the `??` chain already resolved to
+  // it above, and if it IS nullish then `result` (derived from update['result']) is also
+  // nullish. Dropped as dead code.
+  const toolOutput = update['output'] ?? update['result'] ?? update['content'];
   return [{ ts, kind: 'tool_result', toolOutput }];
 }
 
@@ -346,12 +346,7 @@ function eventFromLegacyRecord(rec: Record<string, unknown>, fallbackTs: number)
 }
 
 function eventsFromLegacyArray(arr: unknown[], fallbackTs: number): TailEvent[] {
-  const out: TailEvent[] = [];
-  for (const item of arr) {
-    if (!isRecord(item)) continue;
-    out.push(...eventFromLegacyRecord(item, fallbackTs));
-  }
-  return out;
+  return eventsFromRecordArray(arr, fallbackTs, eventFromLegacyRecord);
 }
 
 function eventsFromLegacyBuffer(trimmed: string, fallbackTs: number): TailEvent[] {
@@ -422,41 +417,9 @@ function eventsFromBuffer(buffer: string, fallbackTs: number): TailEvent[] {
   return eventsFromLegacyBuffer(trimmed, fallbackTs);
 }
 
-// ---------------------------------------------------------------------------
-// File / directory resolution
-// ---------------------------------------------------------------------------
-
-function resolveFilesToParse(input: string): string[] {
-  if (isFile(input)) return [input];
-  if (isDir(input)) {
-    return walkFilesByMtime(input, (entry) => READABLE_FILE_RX.test(entry));
-  }
-  return [];
-}
-
 const opencodeParser: TailParser = {
   parse(filePath: string): TailEvent[] {
-    const files = resolveFilesToParse(filePath);
-    if (files.length === 0) {
-      warnParse(PARSER_ID, `no readable session files at ${filePath}`);
-      return [];
-    }
-
-    const out: TailEvent[] = [];
-    for (const file of files) {
-      const buffer = safeReadFile(file);
-      if (buffer === null) {
-        warnParse(PARSER_ID, `unable to read ${file}`);
-        continue;
-      }
-      try {
-        out.push(...eventsFromBuffer(buffer, Date.now()));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        warnParse(PARSER_ID, `event extraction failed (${file}): ${msg}`);
-      }
-    }
-    return out;
+    return parseSessionFiles(PARSER_ID, filePath, READABLE_FILE_RX, undefined, () => Date.now(), eventsFromBuffer);
   },
 };
 

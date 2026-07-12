@@ -25,19 +25,15 @@
  *       paths even when the run dir is elsewhere. We surface them as-is.
  */
 
-import * as path from 'node:path';
-
 import type { TailEvent, TailParser } from '../types.js';
 import {
   asRole,
+  eventsFromRecordArray,
   flattenText,
-  isDir,
-  isFile,
   isRecord,
   maybeParseJson,
-  safeReadFile,
+  parseSessionFiles,
   toEpochMs,
-  walkFilesByMtime,
   warnParse,
 } from './shared.js';
 
@@ -113,12 +109,7 @@ function eventFromRecord(rec: Record<string, unknown>, fallbackTs: number): Tail
 }
 
 function eventsFromArray(arr: unknown[], fallbackTs: number): TailEvent[] {
-  const out: TailEvent[] = [];
-  for (const item of arr) {
-    if (!isRecord(item)) continue;
-    out.push(...eventFromRecord(item, fallbackTs));
-  }
-  return out;
+  return eventsFromRecordArray(arr, fallbackTs, eventFromRecord);
 }
 
 function eventsFromBuffer(buffer: string, fallbackTs: number): TailEvent[] {
@@ -174,49 +165,12 @@ function eventsFromBuffer(buffer: string, fallbackTs: number): TailEvent[] {
 }
 
 // ---------------------------------------------------------------------------
-// Path resolution
-// ---------------------------------------------------------------------------
-
-function resolveFilesToParse(input: string): string[] {
-  if (isFile(input)) return [input];
-  if (isDir(input)) {
-    return walkFilesByMtime(input, (entry) => {
-      if (SKIP_FILE_NAMES.has(entry.toLowerCase())) return false;
-      return READABLE_FILE_RX.test(entry);
-    });
-  }
-  return [];
-}
-
-// ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
 const kimiParser: TailParser = {
   parse(filePath: string): TailEvent[] {
-    const files = resolveFilesToParse(filePath);
-    if (files.length === 0) {
-      warnParse(PARSER_ID, `no readable session files at ${filePath}`);
-      return [];
-    }
-
-    const out: TailEvent[] = [];
-    for (const file of files) {
-      // Skip the well-known sidecar files when nested deeper than the root.
-      if (SKIP_FILE_NAMES.has(path.basename(file).toLowerCase())) continue;
-      const buffer = safeReadFile(file);
-      if (buffer === null) {
-        warnParse(PARSER_ID, `unable to read ${file}`);
-        continue;
-      }
-      try {
-        out.push(...eventsFromBuffer(buffer, Date.now()));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        warnParse(PARSER_ID, `event extraction failed (${file}): ${msg}`);
-      }
-    }
-    return out;
+    return parseSessionFiles(PARSER_ID, filePath, READABLE_FILE_RX, SKIP_FILE_NAMES, () => Date.now(), eventsFromBuffer);
   },
 };
 

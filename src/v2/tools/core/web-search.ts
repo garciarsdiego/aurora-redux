@@ -126,7 +126,9 @@ export function parseDuckDuckGoSerpHtml(
     out.push({ title, url: href, snippet });
   }
 
-  return truncateResults(out, limit);
+  // Loop condition (`out.length < limit`) already caps `out` at `limit`
+  // entries — no re-truncation needed here.
+  return out;
 }
 
 async function fetchBraveSerp(query: string, limit: number): Promise<WebSearchResult[]> {

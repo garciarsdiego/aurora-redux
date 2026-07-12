@@ -36,13 +36,16 @@ export function criticalPathSeconds(
   function pathTo(id: string): number {
     const cached = memo.get(id);
     if (cached !== undefined) return cached;
+    if (onStack.has(id)) return 0; // cycle detected — defensive, validator forbids
     const t = byId.get(id);
     if (t === undefined) return 0; // dangling dep — defensive, validator forbids
+    onStack.add(id);
     const deps = t.depends_on.length === 0
       ? 0
       : Math.max(...t.depends_on.map((d) => pathTo(d)));
     const value = deps + (t.timeoutSeconds || 0);
     memo.set(id, value);
+    onStack.delete(id);
     return value;
   }
 

@@ -20,11 +20,9 @@
 import type { ServerResponse } from 'node:http';
 import type Database from 'better-sqlite3';
 
-import { initDb } from '../../db/client.js';
-import { getDbPath } from '../../utils/config.js';
 import { redactContextJson } from '../../context/redaction.js';
 import type { Router } from './types.js';
-import { badRequest, jsonOk } from './_shared.js';
+import { jsonOk, withDb } from './_shared.js';
 
 // ── Public types ──────────────────────────────────────────────────────────
 
@@ -325,15 +323,10 @@ export function listAuditEntries(
 
 function handleAudit(url: URL, res: ServerResponse): void {
   const params = parseQuery(url);
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     const entries = listAuditEntries(db, params);
     jsonOk(res, { entries });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 export const dashboardAuditRouter: Router = async (req, url, res) => {

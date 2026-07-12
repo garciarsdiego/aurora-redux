@@ -103,6 +103,49 @@ const DEFAULT_CONFIG: AnalyticsConfig = {
   enablePredictiveAnalytics: true,
 };
 
+/**
+ * Declarative table/SQL per supported metric, consulted by fetchTimeSeriesData.
+ * Unknown metrics simply have no entry here, which fetchTimeSeriesData treats as "no data".
+ */
+const METRIC_QUERIES: Record<string, { table: string; sql: string }> = {
+  workflow_duration: {
+    table: 'workflows',
+    sql: `
+      SELECT completed_at as timestamp,
+             (completed_at - created_at) / 1000 as value
+      FROM workflows
+      WHERE status = 'completed'
+        AND completed_at >= ?
+        AND completed_at <= ?
+      ORDER BY completed_at ASC
+    `,
+  },
+  task_latency: {
+    table: 'tasks',
+    sql: `
+      SELECT ended_at as timestamp,
+             (ended_at - started_at) as value
+      FROM tasks
+      WHERE status = 'completed'
+        AND ended_at >= ?
+        AND ended_at <= ?
+      ORDER BY ended_at ASC
+    `,
+  },
+  llm_cost: {
+    table: 'events',
+    sql: `
+      SELECT created_at as timestamp,
+             cost_usd as value
+      FROM events
+      WHERE type = 'llm_call'
+        AND created_at >= ?
+        AND created_at <= ?
+      ORDER BY created_at ASC
+    `,
+  },
+};
+
 class AnalyticsEngine {
   private config: AnalyticsConfig;
 
@@ -177,8 +220,8 @@ class AnalyticsEngine {
     const requestsByProvider = this.calculateRequestsByProvider(db);
     const successRateByProvider = this.calculateSuccessRateByProvider(db);
     const avgLatencyByProvider = this.calculateAvgLatencyByProvider(db);
-    const efficiencyScore = this.calculateRoutingEfficiencyScore(db);
-    const providerPerformanceTrend = this.calculateProviderPerformanceTrends(db);
+    const efficiencyScore = this.calculateRoutingEfficiencyScore(successRateByProvider);
+    const providerPerformanceTrend = this.calculateProviderPerformanceTrends(db, Object.keys(requestsByProvider));
     const recommendations = this.generateRoutingRecommendations(
       requestsByProvider,
       successRateByProvider,
@@ -342,10 +385,11 @@ class AnalyticsEngine {
   ): TimeSeriesDataPoint[] {
     // This is a simplified implementation
     // In production, this would query appropriate tables based on the metric
-    const data: TimeSeriesDataPoint[] = [];
+    const queryDef = METRIC_QUERIES[metric];
+    if (!queryDef) return [];
 
     try {
-      // Check if tables exist
+      // Check if the table exists
       const tableExists = (tableName: string) => {
         try {
           db.prepare(`SELECT 1 FROM ${tableName} LIMIT 1`).get();
@@ -355,86 +399,49 @@ class AnalyticsEngine {
         }
       };
 
-      let query = '';
-      let params: any[] = [];
+      if (!tableExists(queryDef.table)) return [];
 
-      switch (metric) {
-        case 'workflow_duration':
-          if (!tableExists('workflows')) return [];
-          query = `
-            SELECT completed_at as timestamp,
-                   (completed_at - created_at) / 1000 as value
-            FROM workflows
-            WHERE status = 'completed'
-              AND completed_at >= ?
-              AND completed_at <= ?
-            ORDER BY completed_at ASC
-          `;
-          params = [start, end];
-          break;
+      const params: number[] = [start, end];
+      const rows = db.prepare(queryDef.sql).all(...params) as Array<{ timestamp: number; value: number }>;
 
-        case 'task_latency':
-          if (!tableExists('tasks')) return [];
-          query = `
-            SELECT ended_at as timestamp,
-                   (ended_at - started_at) as value
-            FROM tasks
-            WHERE status = 'completed'
-              AND ended_at >= ?
-              AND ended_at <= ?
-            ORDER BY ended_at ASC
-          `;
-          params = [start, end];
-          break;
-
-        case 'llm_cost':
-          if (!tableExists('events')) return [];
-          query = `
-            SELECT created_at as timestamp,
-                   cost_usd as value
-            FROM events
-            WHERE type = 'llm_call'
-              AND created_at >= ?
-              AND created_at <= ?
-            ORDER BY created_at ASC
-          `;
-          params = [start, end];
-          break;
-
-        default:
-          return [];
-      }
-
-      const rows = db.prepare(query).all(...params) as Array<{ timestamp: number; value: number }>;
-
-      // Aggregate by period
-      const periodMs = {
-        hour: 60 * 60 * 1000,
-        day: 24 * 60 * 60 * 1000,
-        week: 7 * 24 * 60 * 60 * 1000,
-        month: 30 * 24 * 60 * 60 * 1000,
-      }[period];
-
-      const aggregated = new Map<number, number[]>();
-
-      for (const row of rows) {
-        const bucket = Math.floor(row.timestamp / periodMs) * periodMs;
-        if (!aggregated.has(bucket)) {
-          aggregated.set(bucket, []);
-        }
-        aggregated.get(bucket)!.push(row.value);
-      }
-
-      for (const [timestamp, values] of aggregated.entries()) {
-        const avg = values.reduce((sum, v) => sum + v, 0) / values.length;
-        data.push({ timestamp, value: avg });
-      }
-
-      return data;
+      return this.aggregateByPeriod(rows, period);
     } catch (err) {
-      // Return empty data on error
+      // A SQL/query error is indistinguishable from "no data" here - return empty on error.
       return [];
     }
+  }
+
+  /**
+   * Bucket time-series rows by period and average the values within each bucket.
+   */
+  private aggregateByPeriod(
+    rows: Array<{ timestamp: number; value: number }>,
+    period: 'hour' | 'day' | 'week' | 'month'
+  ): TimeSeriesDataPoint[] {
+    const periodMs = {
+      hour: 60 * 60 * 1000,
+      day: 24 * 60 * 60 * 1000,
+      week: 7 * 24 * 60 * 60 * 1000,
+      month: 30 * 24 * 60 * 60 * 1000,
+    }[period];
+
+    const aggregated = new Map<number, number[]>();
+
+    for (const row of rows) {
+      const bucket = Math.floor(row.timestamp / periodMs) * periodMs;
+      if (!aggregated.has(bucket)) {
+        aggregated.set(bucket, []);
+      }
+      aggregated.get(bucket)!.push(row.value);
+    }
+
+    const data: TimeSeriesDataPoint[] = [];
+    for (const [timestamp, values] of aggregated.entries()) {
+      const avg = values.reduce((sum, v) => sum + v, 0) / values.length;
+      data.push({ timestamp, value: avg });
+    }
+
+    return data;
   }
 
   private calculateTrendDirection(data: TimeSeriesDataPoint[]): 'improving' | 'degrading' | 'stable' {
@@ -478,6 +485,17 @@ class AnalyticsEngine {
     }
   }
 
+  /**
+   * Reduce rows carrying a nullable `model` column into a Record<string, number>,
+   * using 'unknown' as the fallback key. Shared by the by-model/by-provider aggregations below.
+   */
+  private rowsToRecordByModel<R extends { model: string }>(rows: R[], valueFn: (row: R) => number): Record<string, number> {
+    return rows.reduce((acc, row) => {
+      acc[row.model || 'unknown'] = valueFn(row);
+      return acc;
+    }, {} as Record<string, number>);
+  }
+
   private calculateCostByModel(db: Database.Database): Record<string, number> {
     try {
       const rows = db.prepare(`
@@ -487,10 +505,7 @@ class AnalyticsEngine {
         GROUP BY model
       `).all() as Array<{ model: string; total: number }>;
 
-      return rows.reduce((acc, row) => {
-        acc[row.model || 'unknown'] = row.total;
-        return acc;
-      }, {} as Record<string, number>);
+      return this.rowsToRecordByModel(rows, row => row.total);
     } catch {
       return {};
     }
@@ -568,28 +583,7 @@ class AnalyticsEngine {
   }
 
   private getCacheHitRate(db: Database.Database): number {
-    try {
-      const spans = db.prepare("SELECT attributes_json FROM trace_spans WHERE kind = 'llm_call'").all() as Array<{ attributes_json: string | null }>;
-      let cacheHits = 0;
-      let total = 0;
-
-      for (const span of spans) {
-        if (!span.attributes_json) continue;
-        try {
-          const attrs = JSON.parse(span.attributes_json) as { cache_read_input_tokens?: number };
-          total++;
-          if (attrs.cache_read_input_tokens && attrs.cache_read_input_tokens > 0) {
-            cacheHits++;
-          }
-        } catch {
-          // Skip malformed
-        }
-      }
-
-      return total > 0 ? (cacheHits / total) * 100 : 0;
-    } catch {
-      return 0;
-    }
+    return calculateCacheHitRatePct(db) ?? 0;
   }
 
   private calculateTotalRequests(db: Database.Database): number {
@@ -610,10 +604,7 @@ class AnalyticsEngine {
         GROUP BY model
       `).all() as Array<{ model: string; total: number }>;
 
-      return rows.reduce((acc, row) => {
-        acc[row.model || 'unknown'] = row.total;
-        return acc;
-      }, {} as Record<string, number>);
+      return this.rowsToRecordByModel(rows, row => row.total);
     } catch {
       return {};
     }
@@ -630,10 +621,7 @@ class AnalyticsEngine {
         GROUP BY model
       `).all() as Array<{ model: string; success: number; total: number }>;
 
-      return rows.reduce((acc, row) => {
-        acc[row.model || 'unknown'] = (row.success / row.total) * 100;
-        return acc;
-      }, {} as Record<string, number>);
+      return this.rowsToRecordByModel(rows, row => (row.success / row.total) * 100);
     } catch {
       return {};
     }
@@ -649,18 +637,15 @@ class AnalyticsEngine {
         GROUP BY model
       `).all() as Array<{ model: string; avg_latency: number }>;
 
-      return rows.reduce((acc, row) => {
-        acc[row.model || 'unknown'] = row.avg_latency;
-        return acc;
-      }, {} as Record<string, number>);
+      return this.rowsToRecordByModel(rows, row => row.avg_latency);
     } catch {
       return {};
     }
   }
 
-  private calculateRoutingEfficiencyScore(db: Database.Database): number {
+  private calculateRoutingEfficiencyScore(successRateByProvider: Record<string, number>): number {
     try {
-      const successRates = Object.values(this.calculateSuccessRateByProvider(db));
+      const successRates = Object.values(successRateByProvider);
       if (successRates.length === 0) return 50;
 
       const avgSuccessRate = successRates.reduce((sum, r) => sum + r, 0) / successRates.length;
@@ -670,8 +655,7 @@ class AnalyticsEngine {
     }
   }
 
-  private calculateProviderPerformanceTrends(db: Database.Database): Record<string, PerformanceTrend> {
-    const providers = Object.keys(this.calculateRequestsByProvider(db));
+  private calculateProviderPerformanceTrends(db: Database.Database, providers: string[]): Record<string, PerformanceTrend> {
     const trends: Record<string, PerformanceTrend> = {};
 
     for (const provider of providers) {
@@ -811,6 +795,38 @@ class AnalyticsEngine {
  * Global analytics engine instance
  */
 export const analyticsEngine = new AnalyticsEngine();
+
+/**
+ * Cache hit rate (0-100) computed from trace_spans rows with kind='llm_call'.
+ * Returns null when there is no LLM span data to compute a rate from (missing table or zero rows).
+ * Shared by AnalyticsEngine.getCacheHitRate and getLLMUsageMetrics (monitoring-dashboard.ts) so the
+ * two call sites don't drift; each caller decides how to round/default the result for its own shape.
+ */
+export function calculateCacheHitRatePct(db: Database.Database): number | null {
+  try {
+    const spans = db.prepare("SELECT attributes_json FROM trace_spans WHERE kind = 'llm_call'").all() as Array<{ attributes_json: string | null }>;
+    let cacheHits = 0;
+    let total = 0;
+
+    for (const span of spans) {
+      if (!span.attributes_json) continue;
+      try {
+        const attrs = JSON.parse(span.attributes_json) as { cache_read_input_tokens?: number };
+        total++;
+        if (attrs.cache_read_input_tokens && attrs.cache_read_input_tokens > 0) {
+          cacheHits++;
+        }
+      } catch {
+        // Skip malformed attributes
+      }
+    }
+
+    return total > 0 ? (cacheHits / total) * 100 : null;
+  } catch {
+    // trace_spans might not exist yet
+    return null;
+  }
+}
 
 /**
  * Get performance trend for a metric

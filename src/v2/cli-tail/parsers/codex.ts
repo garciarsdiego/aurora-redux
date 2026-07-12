@@ -1,18 +1,7 @@
-import { readFileSync } from 'node:fs';
-
 import type { TailEvent, TailParser } from '../types.js';
+import { asRole, isRecord, maybeParseJson, safeReadFile, warnParse } from './shared.js';
 
-type TailRole = NonNullable<TailEvent['role']>;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-function asRole(value: unknown): TailRole | undefined {
-  return value === 'user' || value === 'assistant' || value === 'system' || value === 'developer'
-    ? value
-    : undefined;
-}
+const PARSER_ID = 'codex';
 
 function textFromParts(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
@@ -28,15 +17,6 @@ function textFromParts(value: unknown): string | undefined {
     .join('');
 
   return text.length > 0 ? text : undefined;
-}
-
-function parseToolInput(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
 }
 
 function payloadFromLine(line: string): { ts: number; payload: Record<string, unknown> } | null {
@@ -72,7 +52,7 @@ function eventFromPayload(ts: number, payload: Record<string, unknown>): TailEve
         ts,
         kind: 'tool_call',
         toolName: typeof payload['name'] === 'string' ? payload['name'] : undefined,
-        toolInput: parseToolInput(payload['arguments']),
+        toolInput: maybeParseJson(payload['arguments']),
       };
     case 'function_call_output':
       return {
@@ -87,7 +67,11 @@ function eventFromPayload(ts: number, payload: Record<string, unknown>): TailEve
 
 const codexParser: TailParser = {
   parse(filePath: string): TailEvent[] {
-    const content = readFileSync(filePath, 'utf8');
+    const content = safeReadFile(filePath);
+    if (content === null) {
+      warnParse(PARSER_ID, `unable to read ${filePath}`);
+      return [];
+    }
     const events: TailEvent[] = [];
 
     for (const line of content.split(/\r?\n/)) {

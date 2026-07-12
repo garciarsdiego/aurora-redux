@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 
 import { insertEvent } from './persist.js';
 import { safeJsonObject } from './safe-json.js';
+import { withSqliteRetrySync } from './sqlite-retry.js';
 import type { CliPermissionMode } from '../executors/cli.js';
 
 function parseMode(value: unknown): CliPermissionMode | undefined {
@@ -33,7 +34,11 @@ export function recordWorkflowCliPermissionMode(
   metadata['cli_permission_mode'] = mode;
   metadata['cli_permission_source'] = source;
   metadata['cli_permission_updated_at'] = now;
-  db.prepare(`UPDATE workflows SET metadata = ? WHERE id = ?`).run(JSON.stringify(metadata), workflowId);
+  // DB-A: every write path retries transient SQLITE_BUSY like the rest of the
+  // package (insertEvent above already retries internally).
+  withSqliteRetrySync(() =>
+    db.prepare(`UPDATE workflows SET metadata = ? WHERE id = ?`).run(JSON.stringify(metadata), workflowId),
+  );
 }
 
 export function resolveWorkflowCliPermissionMode(

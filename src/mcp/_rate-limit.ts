@@ -54,7 +54,7 @@ export function createRateLimiter(opts: RateLimiterOptions): (key: string) => Ra
   const buckets = new Map<string, TokenBucket>();
   const now = opts.now ?? Date.now;
 
-  return function check(key: string): RateLimitDecision {
+  const check = function check(key: string): RateLimitDecision {
     const currentMs = now();
     const existing = buckets.get(key);
     const bucket: TokenBucket = existing
@@ -80,6 +80,8 @@ export function createRateLimiter(opts: RateLimiterOptions): (key: string) => Ra
     buckets.set(key, bucket);
     return { allowed: true, remaining: Math.floor(bucket.tokens) };
   };
+  Object.defineProperty(check, '__buckets__', { value: buckets });
+  return check;
 }
 
 /**

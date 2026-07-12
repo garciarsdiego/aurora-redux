@@ -15,7 +15,7 @@ export const AUTO_TAG_DEFAULTS: Record<AutoModelTag, string> = {
   'auto:cheap': 'cc/claude-haiku-4-5-20251001',
 };
 
-export interface AutoTagOverrides extends Partial<Record<AutoModelTag, string>> {}
+export type AutoTagOverrides = Partial<Record<AutoModelTag, string>>;
 
 const AUTO_TAGS = new Set<AutoModelTag>(
   Object.keys(AUTO_TAG_DEFAULTS) as AutoModelTag[],
@@ -26,7 +26,6 @@ export function resolveAutoTag(
   overrides: AutoTagOverrides = {},
 ): string {
   if (!model) return AUTO_TAG_DEFAULTS.auto;
-  if (!model.startsWith('auto')) return model;
   if (!isAutoModelTag(model)) return model;
   return overrides[model] ?? AUTO_TAG_DEFAULTS[model];
 }

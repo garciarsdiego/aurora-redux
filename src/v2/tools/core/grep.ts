@@ -3,25 +3,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { z } from 'zod';
 import { registerTool, type ToolResult, type ToolContext } from '../registry.js';
-
-// ───────────────────────────────────────────────────────────────────────
-// Sandbox helper (mirrors index.ts)
-// ───────────────────────────────────────────────────────────────────────
-
-function resolveSafeWorkspacePath(rawPath: string, ctx: ToolContext): string {
-  const root = path.resolve(ctx.workspaceRoot);
-  const candidate =
-    path.isAbsolute(rawPath) || /^[A-Za-z]:[/\\]/.test(rawPath)
-      ? path.resolve(rawPath)
-      : path.resolve(root, rawPath);
-  const rel = path.relative(root, candidate);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(
-      `Path escapes workspace sandbox: ${rawPath} (resolved=${candidate}, root=${root})`,
-    );
-  }
-  return candidate;
-}
+import { resolveSafeWorkspacePath } from './sandbox-path.js';
 
 // ───────────────────────────────────────────────────────────────────────
 // Schema & types
@@ -74,7 +56,7 @@ function spawnAsync(cmd: string, args: string[], cwd: string): Promise<{ stdout:
         code: code ?? 0,
       });
     });
-    proc.on('error', () => resolve({ stdout: '', stderr: '', code: 1 }));
+    proc.on('error', (err) => resolve({ stdout: '', stderr: String(err), code: 1 }));
   });
 }
 
@@ -93,16 +75,8 @@ interface RgJsonMatch {
   };
 }
 
-function parseRgJsonOutput(
-  stdout: string,
-  searchRoot: string,
-  contextLines: number,
-  maxResults: number,
-): { matches: GrepMatch[]; truncated: boolean } {
-  const matches: GrepMatch[] = [];
-  let truncated = false;
-
-  // Collect all parsed messages
+/** Parse rg's newline-delimited JSON messages, silently dropping unparseable lines. */
+function parseRgJsonMessages(stdout: string): RgJsonMatch[] {
   const messages: RgJsonMatch[] = [];
   for (const line of stdout.split('\n')) {
     if (!line) continue;
@@ -112,6 +86,43 @@ function parseRgJsonOutput(
       continue;
     }
   }
+  return messages;
+}
+
+/**
+ * Look ahead from a 'match' message at `matchIndex` and collect up to
+ * `contextLines` subsequent 'context' lines for the same file, stopping at
+ * the next 'match' message or a file boundary.
+ */
+function collectAfterContext(
+  messages: RgJsonMatch[],
+  matchIndex: number,
+  file: string,
+  contextLines: number,
+): string[] {
+  const after: string[] = [];
+  for (let j = matchIndex + 1; j < messages.length && after.length < contextLines; j++) {
+    const next = messages[j];
+    if (!next) break;
+    if (next.type === 'context' && next.data.path?.text === file) {
+      after.push((next.data.lines?.text ?? '').replace(/\n$/, ''));
+    } else if (next.type === 'match') {
+      break;
+    }
+  }
+  return after;
+}
+
+function parseRgJsonOutput(
+  stdout: string,
+  searchRoot: string,
+  contextLines: number,
+  maxResults: number,
+): { matches: GrepMatch[]; truncated: boolean } {
+  const matches: GrepMatch[] = [];
+  let truncated = false;
+
+  const messages = parseRgJsonMessages(stdout);
 
   // Build matches with context by scanning messages
   const contextBefore: string[] = [];
@@ -152,18 +163,10 @@ function parseRgJsonOutput(
       };
 
       if (contextLines > 0) {
-        // Collect 'after' context from subsequent messages
-        const after: string[] = [];
-        for (let j = i + 1; j < messages.length && after.length < contextLines; j++) {
-          const next = messages[j];
-          if (!next) break;
-          if (next.type === 'context' && next.data.path?.text === file) {
-            after.push((next.data.lines?.text ?? '').replace(/\n$/, ''));
-          } else if (next.type === 'match') {
-            break;
-          }
-        }
-        match.context = { before: [...contextBefore], after };
+        match.context = {
+          before: [...contextBefore],
+          after: collectAfterContext(messages, i, file, contextLines),
+        };
       }
 
       matches.push(match);
@@ -255,7 +258,7 @@ async function grepWithNode(input: GrepInput, searchRoot: string): Promise<GrepO
 
 export async function grep(input: GrepInput, ctx: ToolContext): Promise<GrepOutput> {
   const searchRoot = input.path
-    ? resolveSafeWorkspacePath(input.path, ctx)
+    ? resolveSafeWorkspacePath(input.path, ctx.workspaceRoot)
     : path.resolve(ctx.workspaceRoot);
 
   const useRg = await rgAvailable().catch(() => false);

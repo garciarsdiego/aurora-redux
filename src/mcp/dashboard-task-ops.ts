@@ -6,7 +6,9 @@
  * - dashboard-task-ops-meta.ts: schemas, types, helper functions
  * - dashboard-task-ops-tasks.ts: task-level operations (patch, AI adjustment)
  * - dashboard-task-ops-workflows.ts: workflow-level operations (retry DAG, retry in-place)
- * - dashboard-task-ops-gates.ts: gate operations (placeholder for future use)
+ *
+ * Gate operations live in dashboard-data-audit.ts (DashboardPendingGate); no
+ * dedicated gate-mutation module exists yet.
  *
  * Original: 884 LOC → Split: ~50 LOC (orchestrator only)
  */

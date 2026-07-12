@@ -235,6 +235,10 @@ export async function waitForWorkflowControlCheckpoint(
   if (initial.state === 'cancel_requested' || initial.state === 'canceled') {
     throw new Error(`Workflow ${workflowId} canceled by operator`);
   }
+  // TS narrowing makes this look unreachable ('pause_requested' | 'paused' are
+  // the only states left), but keep it: with mixed-version processes sharing
+  // the DB (daemon + HTTP + REPL), a newer schema may hold a state this binary
+  // does not know. Returning here beats falling into the poll loop forever.
   if (initial.state !== 'pause_requested' && initial.state !== 'paused') return;
 
   if (initial.state === 'pause_requested') {

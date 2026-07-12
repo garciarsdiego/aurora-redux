@@ -118,6 +118,11 @@ interface AcpPoolProcessEntry {
   shuttingDown: boolean;
 }
 
+/** Shared step of both path normalisers below: forward slashes + trim trailing slash. */
+function toForwardSlashes(value: string): string {
+  return value.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
 /**
  * Pool key normalisation rules:
  *   1. Forward-slash separators (Windows path → forward slashes)
@@ -130,8 +135,7 @@ interface AcpPoolProcessEntry {
  * the per-workspace mutex actually serialises them.
  */
 function normalisePoolPath(value: string): string {
-  const resolved = path.resolve(value);
-  const forward = resolved.replace(/\\/g, '/').replace(/\/+$/, '');
+  const forward = toForwardSlashes(path.resolve(value));
   return process.platform === 'win32' ? forward.toLowerCase() : forward;
 }
 
@@ -157,8 +161,18 @@ function parseMetadata(row: RuntimeSessionRow): Record<string, unknown> {
   }
 }
 
+/**
+ * Resume-safety comparison normaliser (`canResumeRuntimeSession`). Shares the
+ * slash rules with `normalisePoolPath` above but is deliberately kept as a
+ * separate function because the remaining semantics diverge:
+ *   - no `path.resolve()` — stored workspace paths compare as-recorded;
+ *   - lowercases on EVERY platform, so a casing-only difference never blocks
+ *     a resume — at the cost of treating `/Repo` and `/repo` as the same
+ *     workspace on case-sensitive POSIX filesystems.
+ * Changing either rule changes which sessions are considered resumable.
+ */
 function normalizePath(value: string | null | undefined): string | null {
-  return value ? value.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() : null;
+  return value ? toForwardSlashes(value).toLowerCase() : null;
 }
 
 export function canResumeRuntimeSession(

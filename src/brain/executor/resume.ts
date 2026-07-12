@@ -11,7 +11,7 @@ import { loadWorkspaceEnv } from '../../utils/workspace.js';
 import type { ExecuteWorkflowOpts } from './types.js';
 import { continueWorkflowExecution } from './orchestrate.js';
 
-export type ResumeWorkflowOptions = Omit<ExecuteWorkflowOpts, never> & {
+export type ResumeWorkflowOptions = ExecuteWorkflowOpts & {
   /** When true, convert all failed tasks to skipped instead of re-running the latest failure. */
   skipFailedSteps?: boolean;
   /**
@@ -180,38 +180,25 @@ function prepareWorkflowForResumeInTxn(
   }
 
   if (prior === 'cancelled') {
-    if (anchorStep) {
-      const anchor = db
-        .prepare(`SELECT created_at FROM tasks WHERE workflow_id = ? AND id = ?`)
-        .get(workflowId, anchorStep) as { created_at: number } | undefined;
-      if (anchor) {
-        db.prepare(
-          `UPDATE tasks
-              SET status = 'pending',
-                  started_at = NULL,
-                  completed_at = NULL
-            WHERE workflow_id = ?
-              AND status = 'cancelled'
-              AND created_at >= ?`,
-        ).run(workflowId, anchor.created_at);
-      } else {
-        db.prepare(
-          `UPDATE tasks
-              SET status = 'pending',
-                  started_at = NULL,
-                  completed_at = NULL
-            WHERE workflow_id = ? AND status = 'cancelled'`,
-        ).run(workflowId);
-      }
-    } else {
-      db.prepare(
-        `UPDATE tasks
-            SET status = 'pending',
-                started_at = NULL,
-                completed_at = NULL
-          WHERE workflow_id = ? AND status = 'cancelled'`,
-      ).run(workflowId);
-    }
+    // Re-pend every cancelled task, but when an anchor step is known, scope
+    // the re-pend to tasks created at/after the anchor (tasks cancelled
+    // before the resume point stay cancelled). Falls back to the unscoped
+    // UPDATE when there is no anchor, or the anchor row itself vanished.
+    const anchor = anchorStep
+      ? (db
+          .prepare(`SELECT created_at FROM tasks WHERE workflow_id = ? AND id = ?`)
+          .get(workflowId, anchorStep) as { created_at: number } | undefined)
+      : undefined;
+    const anchorClause = anchor ? ' AND created_at >= ?' : '';
+    const params = anchor ? [workflowId, anchor.created_at] : [workflowId];
+    db.prepare(
+      `UPDATE tasks
+          SET status = 'pending',
+              started_at = NULL,
+              completed_at = NULL
+        WHERE workflow_id = ?
+          AND status = 'cancelled'${anchorClause}`,
+    ).run(...params);
   }
 
   if (prior === 'paused' || prior === 'executing') {

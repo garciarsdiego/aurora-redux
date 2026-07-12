@@ -2,6 +2,7 @@ import { glob as nodeGlob } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import { registerTool, type ToolResult, type ToolContext } from '../registry.js';
+import { resolveSafeWorkspacePath } from './sandbox-path.js';
 
 export const GlobInputSchema = z.object({
   pattern: z.string().min(1),
@@ -15,18 +16,6 @@ export type GlobInput = z.infer<typeof GlobInputSchema>;
 export interface GlobOutput {
   matches: string[];
   truncated: boolean;
-}
-
-function resolveSafeWorkspacePath(rawPath: string, ctx: ToolContext): string {
-  const root = path.resolve(ctx.workspaceRoot);
-  const candidate = path.isAbsolute(rawPath) || /^[A-Za-z]:[/\\]/.test(rawPath)
-    ? path.resolve(rawPath)
-    : path.resolve(root, rawPath);
-  const rel = path.relative(root, candidate);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(`Path escapes workspace sandbox: ${rawPath} (resolved=${candidate}, root=${root})`);
-  }
-  return candidate;
 }
 
 const DEFAULT_IGNORE = ['node_modules/**', 'dist/**', '.git/**', 'data/**'];
@@ -44,7 +33,7 @@ function extractIgnoreSegments(patterns: string[]): string[] {
 
 export async function glob(input: GlobInput, ctx: ToolContext): Promise<GlobOutput> {
   const searchRoot = input.path
-    ? resolveSafeWorkspacePath(input.path, ctx)
+    ? resolveSafeWorkspacePath(input.path, ctx.workspaceRoot)
     : path.resolve(ctx.workspaceRoot);
 
   const ignorePatterns = input.ignore ?? DEFAULT_IGNORE;

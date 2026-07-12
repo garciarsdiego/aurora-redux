@@ -8,7 +8,7 @@
 
 import type Database from 'better-sqlite3';
 import { syncWorkflowCostsToOmniRoute } from './cost-sync.js';
-import { updateSyncStatusCache, markSyncInProgress, markSyncComplete, getCachedSyncStatus } from './cost-cache.js';
+import { updateSyncStatusCache, markSyncInProgress, markSyncComplete, isSyncInProgress, getCachedSyncStatus } from './cost-cache.js';
 import { shouldAllowOmniRouteRequest } from './failover.js';
 import { logInfo, logWarn, logError, logDebug } from '../observability/log-aggregation.js';
 import { insertEvent } from '../../db/persist.js';
@@ -61,10 +61,11 @@ export async function syncWorkflowCostsOnCompletion(
   }
 
   // Check if sync is already in progress for this workflow
-  if (markSyncInProgress !== undefined && markSyncInProgress(workflowId)) {
+  if (isSyncInProgress(workflowId)) {
     logDebug('Cost sync already in progress for workflow', { workflowId }, 'omniroute-cost-integration');
     return;
   }
+  markSyncInProgress(workflowId);
 
   try {
     logInfo('Starting cost sync for workflow', { workflowId, workflowStatus }, 'omniroute-cost-integration');

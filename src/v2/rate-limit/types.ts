@@ -46,7 +46,13 @@ export interface AdaptiveLimiterOptions {
   baseRpm: number;
   /** Burst capacity multiplier. */
   burstMultiplier?: number;
-  /** How often to sync with OmniRoute (ms). */
+  /**
+   * @deprecated No longer read by `AdaptiveLimiter`. The self-sync-on-check
+   * mechanism this option controlled was removed (`syncLimits()` was a no-op).
+   * Limits are now pushed externally via `updateOmniRouteLimit()` — see
+   * `RateLimitConfigSync.syncIntervalMs` in ./config-sync.ts for the option
+   * that actually governs sync cadence.
+   */
   syncIntervalMs?: number;
   /** Optional clock injection. */
   now?: () => number;

@@ -60,7 +60,7 @@ function resolvePath(obj: unknown, path: string): unknown {
     // If we still have remaining parts but `current` is a string, try to
     // parse it as JSON — sharedState[taskId] for llm_call outputs is the
     // model's raw text response, not a parsed object.
-    if (typeof current === 'string' && i < parts.length) {
+    if (typeof current === 'string') {
       const parsed = maybeParseJson(current);
       if (parsed === current) return undefined; // not JSON; can't descend
       current = parsed;

@@ -12,6 +12,7 @@ import type { LlmJudgeConfig } from '../types.js';
 import { LlmJudgeConfigSchema } from '../types.js';
 import { callOmnirouteWithUsage } from '../../../utils/omniroute-call.js';
 import { evaluateDeterministic } from '../../../reviewer/deterministic-checks.js';
+import { extractJsonFromResponse } from './prompts/index.js';
 
 /**
  * Schema for LLM judge response.
@@ -32,7 +33,6 @@ interface CacheEntry {
   reason: string;
   raw: string;
   cost_usd: number;
-  timestamp: number;
 }
 
 class JudgeCache {
@@ -46,13 +46,24 @@ class JudgeCache {
     return this.cache.get(key);
   }
 
-  has(key: string): boolean {
-    return this.cache.has(key);
-  }
-
   clear(): void {
     this.cache.clear();
   }
+}
+
+/**
+ * Build a zero-score soft-fail JudgeOutput. Shared by every failure path in
+ * `LLMJudge.evaluate` so score/latency_ms/cache_hit can't drift between them.
+ */
+function softFail(reason: string, raw: string, start: number, cost_usd = 0): JudgeOutput {
+  return {
+    score: 0,
+    reason,
+    raw,
+    cost_usd,
+    latency_ms: Date.now() - start,
+    cache_hit: false,
+  };
 }
 
 /**
@@ -95,9 +106,11 @@ export class LLMJudge implements Judge {
     }
 
     try {
+      // Computed once (not per get/set) and reused below when caching is enabled.
+      const cacheKey = this.config.cache ? this.computeCacheKey(input) : null;
+
       // Check cache if enabled
-      if (this.config.cache) {
-        const cacheKey = this.computeCacheKey(input);
+      if (cacheKey) {
         const cached = this.cache.get(cacheKey);
         if (cached) {
           return {
@@ -124,14 +137,11 @@ export class LLMJudge implements Judge {
         } catch (error) {
           // Soft-fail: log error but don't throw
           if (iterations === 1) {
-            return {
-              score: 0,
-              reason: `LLM judge failed: ${error instanceof Error ? error.message : String(error)}`,
-              raw: JSON.stringify({ error: String(error) }),
-              cost_usd: 0,
-              latency_ms: Date.now() - start,
-              cache_hit: false,
-            };
+            return softFail(
+              `LLM judge failed: ${error instanceof Error ? error.message : String(error)}`,
+              JSON.stringify({ error: String(error) }),
+              start,
+            );
           }
           // If multiple iterations, skip this one and continue
           continue;
@@ -139,14 +149,12 @@ export class LLMJudge implements Judge {
       }
 
       if (results.length === 0) {
-        return {
-          score: 0,
-          reason: 'All LLM judge iterations failed',
-          raw: JSON.stringify({ error: 'All iterations failed' }),
-          cost_usd: totalCost,
-          latency_ms: Date.now() - start,
-          cache_hit: false,
-        };
+        return softFail(
+          'All LLM judge iterations failed',
+          JSON.stringify({ error: 'All iterations failed' }),
+          start,
+          totalCost,
+        );
       }
 
       // Aggregate results
@@ -154,14 +162,12 @@ export class LLMJudge implements Judge {
       const raw = JSON.stringify({ iterations: results, aggregated });
 
       // Cache the result if enabled
-      if (this.config.cache) {
-        const cacheKey = this.computeCacheKey(input);
+      if (cacheKey) {
         this.cache.set(cacheKey, {
           score: aggregated.score,
           reason: aggregated.reason,
           raw,
           cost_usd: totalCost,
-          timestamp: Date.now(),
         });
       }
 
@@ -175,14 +181,11 @@ export class LLMJudge implements Judge {
       };
     } catch (error) {
       // Soft-fail: return score 0 with error reason
-      return {
-        score: 0,
-        reason: `LLM judge evaluation failed: ${error instanceof Error ? error.message : String(error)}`,
-        raw: JSON.stringify({ error: String(error) }),
-        cost_usd: 0,
-        latency_ms: Date.now() - start,
-        cache_hit: false,
-      };
+      return softFail(
+        `LLM judge evaluation failed: ${error instanceof Error ? error.message : String(error)}`,
+        JSON.stringify({ error: String(error) }),
+        start,
+      );
     }
   }
 
@@ -201,17 +204,11 @@ export class LLMJudge implements Judge {
 
     const cost = result.usage?.total_cost_usd ?? 0;
 
-    // Parse the LLM response
+    // Parse the LLM response (shared extractor — handles markdown/plain code
+    // blocks and bare-object fallback more robustly than a single regex pair).
     let responseJson: unknown;
     try {
-      // Try to extract JSON from the response
-      const jsonMatch = result.content.match(/```json\s*([\s\S]*?)\s*```/) ||
-                       result.content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        responseJson = JSON.parse(jsonMatch[1] || jsonMatch[0]);
-      } else {
-        responseJson = JSON.parse(result.content);
-      }
+      responseJson = extractJsonFromResponse(result.content);
     } catch (error) {
       throw new Error(`Failed to parse LLM response as JSON: ${error instanceof Error ? error.message : String(error)}. Response: ${result.content.slice(0, 500)}`);
     }

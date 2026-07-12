@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { listSecrets, getSecret } from './secrets-vault.js';
+import { listSecrets, getSecret, withDbConnection } from './secrets-vault.js';
 
 /**
  * Replace known secret values in `text` with `***REDACTED***`.
@@ -13,16 +13,7 @@ export function redactSecrets(
 ): string {
   if (!text || !workspace) return text;
 
-  const ownDb = db === undefined;
-  const conn = ownDb
-    ? (() => {
-        const { initDb } = require('../../db/client.js') as typeof import('../../db/client.js');
-        const { getDbPath } = require('../../utils/config.js') as typeof import('../../utils/config.js');
-        return initDb(getDbPath());
-      })()
-    : db!;
-
-  try {
+  return withDbConnection(db, (conn) => {
     const secrets = listSecrets(conn, workspace);
     let redacted = text;
     for (const secret of secrets) {
@@ -32,7 +23,5 @@ export function redactSecrets(
       }
     }
     return redacted;
-  } finally {
-    if (ownDb) conn.close();
-  }
+  });
 }

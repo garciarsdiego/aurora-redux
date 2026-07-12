@@ -41,12 +41,8 @@ function filterByProvider(
 
 function filterByCostTier(
   catalog: ModelCandidate[],
-  costTier: CostTier | 'any',
+  costTier: CostTier,
 ): ModelCandidate[] {
-  if (costTier === 'any') {
-    return catalog;
-  }
-
   return catalog.filter((candidate) => candidate.cost_tier === costTier);
 }
 
@@ -66,13 +62,12 @@ function pickCandidates(
   }
 
   if (provider !== 'any') {
-    const anyProvider = filterByProvider(catalog, 'any');
-    const anyProviderAndCost = filterByCostTier(anyProvider, costTier);
+    const anyProviderAndCost = filterByCostTier(catalog, costTier);
     if (anyProviderAndCost.length > 0) {
       return anyProviderAndCost;
     }
 
-    return anyProvider;
+    return catalog;
   }
 
   return [];

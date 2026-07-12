@@ -24,7 +24,6 @@ import { z } from 'zod';
 import { Vault } from '../../vault/store.js';
 
 import { backupFilesForRetry } from '../validators/workspace.js';
-import { verifyFile } from '../validators/filesystem.js';
 import {
   extractFilePathsFromAcceptance,
   hasWriteTool,
@@ -453,9 +452,17 @@ export const WORKER_CLI_SPAWN_PERSONA: AgentPersona<WorkerCliSpawnInput, WorkerC
           mode: 'worker.file_empty',
         };
       }
-      // Markdown-in-code detection — same gate the reviewer applies, via the
-      // shared SOURCE_EXTENSIONS list in validators/filesystem.ts.
-      if (verifyFile(abs).looksLikeMarkdownInCodeFile) {
+      // Markdown-in-code detection. Deliberately NOT the reviewer's shared
+      // SOURCE_EXTENSIONS (validators/filesystem.ts) — that set also covers
+      // .sql/.css/.scss/.tf/.sh/.bash, whose common header-comment convention
+      // ('# Deploy script', '# Module: networking', ...) collides with the
+      // markdown-header regex below and would reject legitimate source files.
+      // Keep this gate scoped to languages with no '#'-comment convention.
+      const codeExt = ['.ts', '.tsx', '.js', '.jsx', '.rs', '.py', '.go', '.java', '.kt', '.swift'].includes(
+        path.extname(rel).toLowerCase(),
+      );
+      const firstLine = content.split('\n').find((l) => l.trim().length > 0)?.trim() ?? '';
+      if (codeExt && /^#\s+/.test(firstLine)) {
         return {
           rejectWithReason: `worker.markdown_in_code_file: ${rel} starts with markdown header but extension is source code`,
           mode: 'worker.markdown_in_code_file',

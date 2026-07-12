@@ -98,6 +98,7 @@ export interface JaegerSpan {
 export function startTraceSpan(db: Database.Database, input: TraceSpanInput): TraceSpanRow {
   const now = input.now ?? Date.now();
   const id = `sp_${crypto.randomUUID()}`;
+  const attributesJson = JSON.stringify(input.attributes ?? {});
   db.prepare(
     `INSERT INTO trace_spans
        (id, workflow_id, task_id, parent_span_id, name, kind, status,
@@ -111,9 +112,23 @@ export function startTraceSpan(db: Database.Database, input: TraceSpanInput): Tr
     input.name,
     input.kind,
     now,
-    JSON.stringify(input.attributes ?? {}),
+    attributesJson,
   );
-  return db.prepare('SELECT * FROM trace_spans WHERE id = ?').get(id) as TraceSpanRow;
+  // Constructed directly from the inputs above instead of a round-trip SELECT: the schema has
+  // no triggers/computed columns on trace_spans, so this mirrors exactly what the INSERT wrote.
+  return {
+    id,
+    workflow_id: input.workflowId,
+    task_id: input.taskId ?? null,
+    parent_span_id: input.parentSpanId ?? null,
+    name: input.name,
+    kind: input.kind,
+    status: 'running',
+    started_at: now,
+    ended_at: null,
+    duration_ms: null,
+    attributes_json: attributesJson,
+  };
 }
 
 export function endTraceSpan(
@@ -171,6 +186,42 @@ export function exportTraceSpans(
   });
 }
 
+/** Sanitize an id to a 16-char lowercase-hex id, as required by Jaeger/Zipkin trace/span IDs. */
+function toHexId16(id: string): string {
+  return id.replace(/[^a-f0-9]/g, '').substring(0, 16);
+}
+
+/**
+ * Derive a 16-char Jaeger/Zipkin trace ID from a workflow ID. Deliberately more permissive than
+ * toHexId16: it only strips hyphens (not all non-hex chars), so workflow IDs that aren't
+ * majority-hex (e.g. test IDs like 'test-workflow-sprint0') still produce a stable 16-char id
+ * instead of collapsing to a few characters.
+ */
+function workflowIdToTraceId16(workflowId: string): string {
+  return workflowId.replace(/-/g, '').substring(0, 16);
+}
+
+/** started_at/duration_ms (ms) converted to the microsecond fields Jaeger/Zipkin expect. */
+function spanTimesMicros(span: ExportedTraceSpan): { startMicros: number; durationMicros: number } {
+  return {
+    startMicros: span.started_at * 1000,
+    durationMicros: (span.duration_ms ?? 0) * 1000,
+  };
+}
+
+/** Standard span.kind/status/workflow.id/task.id tags shared by the Jaeger and Zipkin exporters. */
+function baseTagPairs(span: ExportedTraceSpan): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [
+    ['span.kind', span.kind],
+    ['status', span.status],
+    ['workflow.id', span.workflow_id],
+  ];
+  if (span.task_id) {
+    pairs.push(['task.id', span.task_id]);
+  }
+  return pairs;
+}
+
 /**
  * Sprint 0: Export traces in Jaeger-compatible format for distributed tracing systems
  */
@@ -180,42 +231,33 @@ export function exportTracesJaeger(
   serviceName: string = 'omniforge-aurora',
 ): JaegerSpan[] {
   const spans = exportTraceSpans(db, workflowId);
-  
+
   // Convert workflow ID to Jaeger trace ID (16-char hex)
-  const traceId = workflowId.replace(/-/g, '').substring(0, 16);
-  
+  const traceId = workflowIdToTraceId16(workflowId);
+
   return spans.map((span) => {
-    const spanId = span.id.replace(/[^a-f0-9]/g, '').substring(0, 16);
-    const parentSpanId = span.parent_span_id?.replace(/[^a-f0-9]/g, '').substring(0, 16);
-    
+    const spanId = toHexId16(span.id);
+    const parentSpanId = span.parent_span_id != null ? toHexId16(span.parent_span_id) : undefined;
+
     // Convert attributes to Jaeger tags
     const tags = Object.entries(span.attributes).map(([key, value]) => ({
       key,
       type: typeof value === 'number' ? 'float64' : 'string',
       value: String(value),
     }));
-    
+
     // Add standard tags
-    tags.push(
-      { key: 'span.kind', type: 'string', value: span.kind },
-      { key: 'status', type: 'string', value: span.status },
-      { key: 'workflow.id', type: 'string', value: span.workflow_id },
-    );
-    
-    if (span.task_id) {
-      tags.push({ key: 'task.id', type: 'string', value: span.task_id });
-    }
-    
+    tags.push(...baseTagPairs(span).map(([key, value]) => ({ key, type: 'string', value })));
+
     // Convert to microseconds (Jaeger standard)
-    const startTimeMicros = span.started_at * 1000;
-    const durationMicros = (span.duration_ms ?? 0) * 1000;
-    
+    const { startMicros, durationMicros } = spanTimesMicros(span);
+
     return {
       traceID: traceId,
       spanID: spanId,
       parentSpanID: parentSpanId || undefined,
       operationName: span.name,
-      startTime: startTimeMicros,
+      startTime: startMicros,
       duration: durationMicros,
       tags,
       logs: [],
@@ -255,40 +297,31 @@ export function exportTracesZipkin(
   serviceName: string = 'omniforge-aurora',
 ): ZipkinSpan[] {
   const spans = exportTraceSpans(db, workflowId);
-  
+
   // Convert workflow ID to Zipkin trace ID (16-char hex)
-  const traceId = workflowId.replace(/-/g, '').substring(0, 16);
-  
+  const traceId = workflowIdToTraceId16(workflowId);
+
   return spans.map((span) => {
-    const spanId = span.id.replace(/[^a-f0-9]/g, '').substring(0, 16);
-    const parentSpanId = span.parent_span_id?.replace(/[^a-f0-9]/g, '').substring(0, 16);
-    
-    // Convert attributes to Zipkin tags
-    const tags: Record<string, string> = {
-      'span.kind': span.kind,
-      'status': span.status,
-      'workflow.id': span.workflow_id,
-    };
-    
-    if (span.task_id) {
-      tags['task.id'] = span.task_id;
-    }
-    
+    const spanId = toHexId16(span.id);
+    const parentSpanId = span.parent_span_id != null ? toHexId16(span.parent_span_id) : undefined;
+
+    // Convert attributes to Zipkin tags, starting from the standard tags
+    const tags: Record<string, string> = Object.fromEntries(baseTagPairs(span));
+
     // Add custom attributes
     Object.entries(span.attributes).forEach(([key, value]) => {
       tags[key] = String(value);
     });
-    
+
     // Convert to microseconds (Zipkin standard)
-    const timestampMicros = span.started_at * 1000;
-    const durationMicros = (span.duration_ms ?? 0) * 1000;
-    
+    const { startMicros, durationMicros } = spanTimesMicros(span);
+
     return {
       traceId,
       id: spanId,
       parentId: parentSpanId || undefined,
       name: span.name,
-      timestamp: timestampMicros,
+      timestamp: startMicros,
       duration: durationMicros,
       localEndpoint: {
         serviceName,

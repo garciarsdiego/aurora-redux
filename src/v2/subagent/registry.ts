@@ -51,7 +51,12 @@ export function registerSubagentRun(
 
   // Return the canonical row rather than constructing from params so callers
   // always see what is actually stored (type coercions, defaults, etc.).
-  return getRunById(db, params.runId) as SubagentRunRow;
+  const inserted = getRunById(db, params.runId);
+  if (!inserted) {
+    // Should be unreachable: we just inserted with this run_id.
+    throw new Error(`failed to read back inserted subagent_runs row: ${params.runId}`);
+  }
+  return inserted;
 }
 
 export function markRunStarted(db: Database.Database, runId: string): void {

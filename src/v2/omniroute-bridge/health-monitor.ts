@@ -162,11 +162,7 @@ class HealthMonitor {
           durationMs: this.lastCheckDuration,
         }, 'omniroute-health-monitor');
 
-        const newStatus = 'unhealthy';
-        if (newStatus !== this.lastHealthStatus) {
-          this.lastHealthStatus = newStatus;
-          this.config.onHealthChange?.(this.lastHealthStatus, newStatus, detailedHealthFallback());
-        }
+        this.markUnhealthy();
       }
     } catch (error) {
       this.lastCheckAt = Date.now();
@@ -178,11 +174,20 @@ class HealthMonitor {
         durationMs: this.lastCheckDuration,
       }, 'omniroute-health-monitor');
 
-      const newStatus = 'unhealthy';
-      if (newStatus !== this.lastHealthStatus) {
-        this.lastHealthStatus = newStatus;
-        this.config.onHealthChange?.(this.lastHealthStatus, newStatus, detailedHealthFallback());
-      }
+      this.markUnhealthy();
+    }
+  }
+
+  /**
+   * Transition to 'unhealthy' status, notifying onHealthChange with the
+   * correct oldStatus (captured before lastHealthStatus is overwritten).
+   */
+  private markUnhealthy(): void {
+    const newStatus = 'unhealthy';
+    if (newStatus !== this.lastHealthStatus) {
+      const oldStatus = this.lastHealthStatus;
+      this.lastHealthStatus = newStatus;
+      this.config.onHealthChange?.(oldStatus, newStatus, detailedHealthFallback());
     }
   }
 

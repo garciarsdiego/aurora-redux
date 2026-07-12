@@ -7,13 +7,27 @@ export interface TriggerMatch {
 const CODE_BLOCK_RE = /```\w+/g;
 const URL_RE = /https?:\/\/[^\s)>\]"']+/g;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/** Defensive string read off an unknown attachment: tries each key in order, skipping non-string values. */
+function readAttachmentField(att: unknown, ...keys: string[]): string {
+  if (!isRecord(att)) return '';
+  for (const key of keys) {
+    const value = att[key];
+    if (typeof value === 'string') return value;
+  }
+  return '';
+}
+
 export function detectTriggers(prompt: string, attachments?: any[]): TriggerMatch[] {
   const matches: TriggerMatch[] = [];
 
   if (Array.isArray(attachments)) {
-    for (const att of attachments) {
-      const mime: string = att?.mime_type ?? att?.type ?? '';
-      const name: string = att?.name ?? att?.filename ?? '';
+    for (const att of attachments as unknown[]) {
+      const mime = readAttachmentField(att, 'mime_type', 'type');
+      const name = readAttachmentField(att, 'name', 'filename');
       if (mime.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name)) {
         matches.push({ kind: 'image', payload: name || mime, specialist_persona_hint: 'worker.advisor_call' });
       } else if (mime === 'application/pdf' || /\.pdf$/i.test(name)) {

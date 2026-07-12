@@ -15,14 +15,12 @@
 //     stats: PersonaInvocationStats[] (per agent_id)
 
 import type { ServerResponse } from 'node:http';
-import { initDb } from '../../db/client.js';
-import { getDbPath } from '../../utils/config.js';
 import {
   getPersonaMetrics,
   getPersonaVsLegacyShare,
 } from '../../v2/observability/persona-metrics.js';
 import type { Router } from './types.js';
-import { badRequest, jsonOk } from './_shared.js';
+import { badRequest, jsonOk, withDb } from './_shared.js';
 
 function handleMetrics(url: URL, res: ServerResponse): void {
   const workflowId = url.searchParams.get('workflow_id') ?? undefined;
@@ -32,19 +30,14 @@ function handleMetrics(url: URL, res: ServerResponse): void {
     badRequest(res, 'since_ms must be a valid epoch millisecond timestamp');
     return;
   }
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     const stats = getPersonaMetrics(db, {
       ...(workflowId ? { workflowId } : {}),
       ...(sinceMs != null ? { sinceMs } : {}),
     });
     const share = getPersonaVsLegacyShare(db, sinceMs);
     jsonOk(res, { share, stats });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 export const dashboardPersonaMetricsRouter: Router = async (req, url, res) => {

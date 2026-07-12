@@ -51,7 +51,6 @@ const DEFAULT_CONFIG: FailoverConfig = {
 class FailoverManager {
   private config: FailoverConfig;
   private state: FailoverState;
-  private failureHistory: FailureEvent[] = [];
   private maxHistorySize = 100;
 
   constructor(config: Partial<FailoverConfig> = {}) {
@@ -174,13 +173,13 @@ class FailoverManager {
       providerStatuses: health?.providers,
     };
 
-    this.failureHistory.push(event);
+    this.state.failureHistory.push(event);
     this.state.lastFailureAt = now;
     this.state.consecutiveFailures++;
 
     // Trim history
-    if (this.failureHistory.length > this.maxHistorySize) {
-      this.failureHistory = this.failureHistory.slice(-this.maxHistorySize);
+    if (this.state.failureHistory.length > this.maxHistorySize) {
+      this.state.failureHistory = this.state.failureHistory.slice(-this.maxHistorySize);
     }
 
     // Clean old failures outside the window
@@ -192,8 +191,7 @@ class FailoverManager {
    */
   private cleanOldFailures(now: number): void {
     const cutoff = now - this.config.failureWindowMs;
-    this.failureHistory = this.failureHistory.filter(f => f.timestamp > cutoff);
-    this.state.failureHistory = this.failureHistory;
+    this.state.failureHistory = this.state.failureHistory.filter(f => f.timestamp > cutoff);
   }
 
   /**
@@ -206,7 +204,7 @@ class FailoverManager {
     // total-failures-in-window threshold is exceeded
     if (
       this.state.consecutiveFailures >= this.config.failureThreshold ||
-      this.failureHistory.length >= this.config.failureThreshold
+      this.state.failureHistory.length >= this.config.failureThreshold
     ) {
       if (!this.state.isFailoverActive) {
         this.activateFailover(now);
@@ -225,7 +223,7 @@ class FailoverManager {
     this.state.failoverActivatedAt = now;
     logError('OmniRoute failover ACTIVATED', {
       consecutiveFailures: this.state.consecutiveFailures,
-      failureCount: this.failureHistory.length,
+      failureCount: this.state.failureHistory.length,
       failOpen: this.config.failOpen,
     }, 'omniroute-failover');
   }
@@ -258,7 +256,7 @@ class FailoverManager {
    * Get current failover state
    */
   getFailoverState(): FailoverState {
-    return { ...this.state, failureHistory: [...this.failureHistory] };
+    return { ...this.state, failureHistory: [...this.state.failureHistory] };
   }
 
   /**
@@ -325,7 +323,6 @@ class FailoverManager {
       lastHealthCheckAt: null,
       currentHealthStatus: 'unknown',
     };
-    this.failureHistory = [];
   }
 }
 
@@ -372,18 +369,16 @@ export function getFailoverState(): FailoverState {
 
 /**
  * Manually activate failover mode
- * TODO: Implement proper manual failover activation
  */
 export async function manualActivateFailover(): Promise<{ success: boolean; message: string }> {
-  logWarn('Manual failover activation not yet implemented', {}, 'omniroute-failover');
-  return { success: false, message: 'Manual failover activation not yet implemented' };
+  failoverManager.manualActivateFailover();
+  return { success: true, message: 'Failover activated manually' };
 }
 
 /**
  * Manually deactivate failover mode
- * TODO: Implement proper manual failover deactivation
  */
 export async function manualDeactivateFailover(): Promise<{ success: boolean; message: string }> {
-  logWarn('Manual failover deactivation not yet implemented', {}, 'omniroute-failover');
-  return { success: false, message: 'Manual failover deactivation not yet implemented' };
+  failoverManager.manualDeactivateFailover();
+  return { success: true, message: 'Failover deactivated manually' };
 }

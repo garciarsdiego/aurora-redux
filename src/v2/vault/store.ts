@@ -1,7 +1,5 @@
-import { createReadStream, existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 
 import { insertEvent } from '../../db/persist.js';
@@ -34,7 +32,7 @@ function validatePath(vaultPath: string): void {
   }
 }
 
-function detectContentType(vaultPath: string, content: string): string {
+function detectContentType(vaultPath: string): string {
   const ext = path.extname(vaultPath).toLowerCase();
   const extMap: Record<string, string> = {
     '.json': 'application/json',
@@ -82,7 +80,7 @@ export class Vault {
     await fs.rename(tmp, idxPath);
   }
 
-  private async workspaceTotalBytes(workspace: string, index: VaultIndex): Promise<number> {
+  private totalBytes(index: VaultIndex): number {
     return Object.values(index).reduce((sum, e) => sum + e.sizeBytes, 0);
   }
 
@@ -103,7 +101,7 @@ export class Vault {
     await fs.mkdir(wsDir, { recursive: true });
 
     const index = await this.readIndex(workspace);
-    const currentTotal = await this.workspaceTotalBytes(workspace, index);
+    const currentTotal = this.totalBytes(index);
     const existingSize = index[vaultPath]?.sizeBytes ?? 0;
     const newTotal = currentTotal - existingSize + sizeBytes;
 
@@ -121,7 +119,7 @@ export class Vault {
     await fs.rename(tmp, destPath);
 
     const now = Date.now();
-    const contentType = detectContentType(vaultPath, content);
+    const contentType = detectContentType(vaultPath);
     const createdAt = index[vaultPath]?.createdAt ?? now;
 
     index[vaultPath] = { contentType, createdAt, updatedAt: now, sizeBytes };

@@ -153,6 +153,50 @@ export const MODEL_CONFIGS = {
 export const ALL_MODELS = Object.keys(MODEL_CONFIGS);
 
 // ============================================================================
+// SHARED EVALUATION HELPERS
+// ============================================================================
+// AgentEvaluationFramework.evaluate() and the standalone runEvaluation() below
+// both loop over test cases building up EvaluationResult[]/summaries the same
+// way — these helpers keep the two paths from silently diverging.
+
+/** Mean of a number array; 0 for an empty array (matches the `xs.length > 0 ? … : 0` guard used throughout this file). */
+function mean(xs: number[]): number {
+  return xs.length > 0 ? xs.reduce((sum, x) => sum + x, 0) / xs.length : 0;
+}
+
+/** Zeroed quality-metric fields shared by base metrics and failed-test-case results. */
+function zeroQualityMetrics(): Pick<EvaluationMetrics, 'qualityScore' | 'accuracy' | 'completeness' | 'correctness' | 'agentSpecific'> {
+  return { qualityScore: 0, accuracy: 0, completeness: 0, correctness: 0, agentSpecific: {} };
+}
+
+/** Build an EvaluationResult for a test case that threw before producing output. */
+function buildErrorResult(
+  testCaseId: string,
+  agent: AgentType,
+  model: string,
+  duration: number,
+  latency: number,
+  error: unknown,
+): EvaluationResult {
+  return {
+    testCaseId,
+    agent,
+    model,
+    success: false,
+    duration,
+    cost: 0,
+    output: null,
+    error: error instanceof Error ? error.message : String(error),
+    metrics: {
+      ...zeroQualityMetrics(),
+      latency,
+      tokenUsage: 0,
+      cost: 0,
+    },
+  };
+}
+
+// ============================================================================
 // EVALUATION FRAMEWORK CLASS
 // ============================================================================
 
@@ -220,28 +264,9 @@ export class AgentEvaluationFramework {
 
         results.push(evaluationResult);
         totalCost += result.cost;
-      } catch (error: any) {
+      } catch (error) {
         const duration = Date.now() - startTime;
-        results.push({
-          testCaseId: testCase.id,
-          agent: config.agent,
-          model: config.model,
-          success: false,
-          duration,
-          cost: 0,
-          output: null,
-          error: error.message,
-          metrics: {
-            qualityScore: 0,
-            accuracy: 0,
-            completeness: 0,
-            correctness: 0,
-            latency: duration,
-            tokenUsage: 0,
-            cost: 0,
-            agentSpecific: {}
-          }
-        });
+        results.push(buildErrorResult(testCase.id, config.agent, config.model, duration, duration, error));
       }
     }
 
@@ -282,7 +307,8 @@ export class AgentEvaluationFramework {
    */
   async evaluateAll(): Promise<ComparativeMatrix> {
     const agents: AgentType[] = ['decomposer', 'planner', 'reviewer', 'orchestrator'];
-    const allResults: Record<AgentType, Record<string, BenchmarkSummary>> = {} as any;
+    const allResults: Record<AgentType, Record<string, BenchmarkSummary>> =
+      {} as Record<AgentType, Record<string, BenchmarkSummary>>;
 
     for (const agent of agents) {
       console.log(`\n${'='.repeat(60)}`);
@@ -310,14 +336,10 @@ export class AgentEvaluationFramework {
   ): EvaluationMetrics {
     // Base metrics
     const metrics: EvaluationMetrics = {
-      qualityScore: 0,
-      accuracy: 0,
-      completeness: 0,
-      correctness: 0,
+      ...zeroQualityMetrics(),
       latency: duration,
       tokenUsage: result.tokenUsage || 0,
       cost: result.cost || 0,
-      agentSpecific: {}
     };
 
     // Calculate quality metrics based on agent type
@@ -339,31 +361,22 @@ export class AgentEvaluationFramework {
    */
   private generateSummary(results: EvaluationResult[], totalCost: number): BenchmarkSummary {
     const successful = results.filter(r => r.success);
-    const successRate = results.length > 0 ? successful.length / results.length : 0;
-    const avgQuality = results.length > 0
-      ? results.reduce((sum, r) => sum + r.metrics.qualityScore, 0) / results.length
-      : 0;
-    const avgLatency = results.length > 0
-      ? results.reduce((sum, r) => sum + r.metrics.latency, 0) / results.length
-      : 0;
-    const avgCost = results.length > 0
-      ? results.reduce((sum, r) => sum + r.metrics.cost, 0) / results.length
-      : 0;
+    const successRate = mean(results.map(r => (r.success ? 1 : 0)));
+    const avgQuality = mean(results.map(r => r.metrics.qualityScore));
+    const avgLatency = mean(results.map(r => r.metrics.latency));
+    const avgCost = mean(results.map(r => r.metrics.cost));
 
-    // Group by complexity
-    const byComplexity: any = {
+    // Group by complexity / category — always zeroed below: EvaluationResult
+    // carries no test-case metadata (complexity/category) to group by, only
+    // testCaseId. The fields stay populated with zeros because they're part
+    // of the exported BenchmarkSummary shape; a real breakdown would need
+    // callers to pass the originating TestCase[] alongside results.
+    const byComplexity: BenchmarkSummary['byComplexity'] = {
       simple: { successRate: 0, avgQuality: 0, count: 0 },
       medium: { successRate: 0, avgQuality: 0, count: 0 },
       complex: { successRate: 0, avgQuality: 0, count: 0 }
     };
-
-    // Group by category
-    const byCategory: Record<string, { successRate: number; avgQuality: number; count: number }> = {};
-
-    // Calculate groupings (simplified for now)
-    results.forEach(r => {
-      // Would need test case metadata to properly group
-    });
+    const byCategory: BenchmarkSummary['byCategory'] = {};
 
     // Identify strengths and weaknesses
     const strengths: string[] = [];
@@ -397,7 +410,8 @@ export class AgentEvaluationFramework {
   private generateComparativeMatrix(
     allResults: Record<AgentType, Record<string, BenchmarkSummary>>
   ): ComparativeMatrix {
-    const bestModelByAgent: Record<AgentType, { model: string; summary: BenchmarkSummary }> = {} as any;
+    const bestModelByAgent: Record<AgentType, { model: string; summary: BenchmarkSummary }> =
+      {} as Record<AgentType, { model: string; summary: BenchmarkSummary }>;
 
     // Find best model for each agent
     for (const [agent, models] of Object.entries(allResults)) {
@@ -419,7 +433,8 @@ export class AgentEvaluationFramework {
       }
     }
 
-    // Find best model for each metric
+    // Find best model for each metric — not computed yet (kept empty; field is
+    // part of the exported ComparativeMatrix shape for future per-metric ranking).
     const bestModelByMetric: Record<string, { agent: AgentType; model: string; value: number }> = {};
 
     // Generate recommendations
@@ -514,54 +529,22 @@ export async function runEvaluation(
       };
 
       results.push(result);
-    } catch (error: any) {
+    } catch (error) {
       const duration = Date.now() - testStartTime;
-
-      results.push({
-        testCaseId: testCase.id,
-        agent: config.agent,
-        model: config.model,
-        success: false,
-        duration,
-        cost: 0,
-        output: null,
-        error: error.message,
-        metrics: {
-          qualityScore: 0,
-          accuracy: 0,
-          completeness: 0,
-          correctness: 0,
-          latency: 0,
-          tokenUsage: 0,
-          cost: 0,
-          agentSpecific: {}
-        },
-      });
+      // NB: latency is 0 here (not `duration`) — pre-existing behavior for the
+      // timeout/throw path, kept as-is via the explicit `latency` argument.
+      results.push(buildErrorResult(testCase.id, config.agent, config.model, duration, 0, error));
     }
   }
 
   const totalDuration = Date.now() - startTime;
 
   // Calculate summary statistics
-  const successfulResults = results.filter(r => r.success);
-  const successRate = results.length > 0 ? successfulResults.length / results.length : 0;
-
-  const averageQualityScore = results.length > 0
-    ? results.reduce((sum, r) => sum + r.metrics.qualityScore, 0) / results.length
-    : 0;
-
-  const averageAccuracy = results.length > 0
-    ? results.reduce((sum, r) => sum + r.metrics.accuracy, 0) / results.length
-    : 0;
-
-  const averageCost = results.length > 0
-    ? results.reduce((sum, r) => sum + r.cost, 0) / results.length
-    : 0;
-
-  const averageLatency = results.length > 0
-    ? results.reduce((sum, r) => sum + r.duration, 0) / results.length
-    : 0;
-
+  const successRate = mean(results.map(r => (r.success ? 1 : 0)));
+  const averageQualityScore = mean(results.map(r => r.metrics.qualityScore));
+  const averageAccuracy = mean(results.map(r => r.metrics.accuracy));
+  const averageCost = mean(results.map(r => r.cost));
+  const averageLatency = mean(results.map(r => r.duration));
   const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
 
   return {

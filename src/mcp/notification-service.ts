@@ -130,6 +130,40 @@ export async function createNotification(
 
 // ── Notification preferences ─────────────────────────────────────────────────
 
+/** Raw row shape shared by the single-row and list preference queries. */
+interface PreferenceRow {
+  id: string;
+  user_id: string;
+  notification_type: string;
+  enabled: number;
+  channels_json: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
+ * Maps a raw preference row to the public shape. `channels_json` is parsed
+ * tolerantly — a corrupted row falls back to `[]` instead of throwing, so it
+ * cannot take down the rest of a list query.
+ */
+function toPreference(row: PreferenceRow): NotificationPreference {
+  let channels: string[] = [];
+  try {
+    channels = JSON.parse(row.channels_json) as string[];
+  } catch {
+    channels = [];
+  }
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    notification_type: row.notification_type,
+    enabled: row.enabled === 1,
+    channels,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
 /**
  * Gets the notification preference for a specific user and notification type.
  */
@@ -143,27 +177,9 @@ export async function getNotificationPreference(
       `SELECT id, user_id, notification_type, enabled, channels_json, created_at, updated_at
        FROM notification_preferences
        WHERE user_id = ? AND notification_type = ?`,
-    ).get(userId, notificationType) as {
-      id: string;
-      user_id: string;
-      notification_type: string;
-      enabled: number;
-      channels_json: string;
-      created_at: number;
-      updated_at: number;
-    } | undefined;
+    ).get(userId, notificationType) as PreferenceRow | undefined;
 
-    if (!row) return null;
-
-    return {
-      id: row.id,
-      user_id: row.user_id,
-      notification_type: row.notification_type,
-      enabled: row.enabled === 1,
-      channels: JSON.parse(row.channels_json) as string[],
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-    };
+    return row ? toPreference(row) : null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[notification-service] get preference error: ${msg}\n`);
@@ -186,25 +202,9 @@ export async function getAllNotificationPreferences(
        FROM notification_preferences
        WHERE user_id = ?
        ORDER BY notification_type`,
-    ).all(userId) as Array<{
-      id: string;
-      user_id: string;
-      notification_type: string;
-      enabled: number;
-      channels_json: string;
-      created_at: number;
-      updated_at: number;
-    }>;
+    ).all(userId) as PreferenceRow[];
 
-    return rows.map((row) => ({
-      id: row.id,
-      user_id: row.user_id,
-      notification_type: row.notification_type,
-      enabled: row.enabled === 1,
-      channels: JSON.parse(row.channels_json) as string[],
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-    }));
+    return rows.map(toPreference);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[notification-service] get all preferences error: ${msg}\n`);

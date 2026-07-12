@@ -22,8 +22,7 @@
 // /evals/:id branch LAST so it only catches the bare run id form.
 
 import type { ServerResponse } from 'node:http';
-import { initDb } from '../../db/client.js';
-import { getDbPath } from '../../utils/config.js';
+import type { initDb } from '../../db/client.js';
 import {
   ListEvalRunsFilterSchema,
   ListABTestsFilterSchema,
@@ -51,7 +50,7 @@ import {
   type EvalRun as HarnessEvalRun,
 } from '../../v2/evals/harness.js';
 import type { Router } from './types.js';
-import { badRequest, jsonOk, notFound, readBodyOr400 } from './_shared.js';
+import { jsonOk, notFound, readBodyOr400, withDb, withDbAsync } from './_shared.js';
 
 // ────────────────────────────────────────────────────────────────────
 //  EVAL CASES + SIMPLE RUN (Aurora EvalSuite screen)
@@ -135,16 +134,11 @@ function countPassedResults(
 
 function handleListEvalCases(url: URL, res: ServerResponse): void {
   const workspace = url.searchParams.get('workspace') ?? DEFAULT_EVAL_WORKSPACE;
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     const cases = listEvalCases(db, { workspace });
     // BARE JSON array (no envelope) — FE request<T> does not unwrap.
     jsonOk(res, cases.map(toDashboardEvalCase));
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 async function handleRunEvalSuite(body: unknown, res: ServerResponse): Promise<void> {
@@ -164,8 +158,7 @@ async function handleRunEvalSuite(body: unknown, res: ServerResponse): Promise<v
     ? input.suite_name
     : DEFAULT_EVAL_SUITE_NAME;
 
-  const db = initDb(getDbPath());
-  try {
+  await withDbAsync(res, async (db) => {
     // Default contract runner: echo the case input so a freshly-registered
     // case where input === expected passes under the harness exact-match judge.
     // The harness exact-match judge is the default (we pass no judge).
@@ -178,16 +171,11 @@ async function handleRunEvalSuite(body: unknown, res: ServerResponse): Promise<v
     const casesPassed = countPassedResults(db, run.id);
     // SINGLE EvalRun object (no envelope), same light shape as GET /evals/:id.
     jsonOk(res, toDashboardEvalRun(run, casesPassed));
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 function handleGetSimpleEvalRun(runId: string, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     const run = getEvalRun(db, runId);
     if (!run) {
       notFound(res, `Eval run not found: ${runId}`);
@@ -195,11 +183,7 @@ function handleGetSimpleEvalRun(runId: string, res: ServerResponse): void {
     }
     const casesPassed = countPassedResults(db, run.id);
     jsonOk(res, toDashboardEvalRun(run, casesPassed));
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -245,8 +229,7 @@ function mapEvalRunSummary(row: EvalRunRow): EvalRunSummary {
 }
 
 function handleListEvalRuns(url: URL, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     // Parse INSIDE the try so an invalid query param answers 400 instead of
     // throwing an uncaught ZodError out of the router (contract in types.ts).
     const filters = ListEvalRunsFilterSchema.parse({
@@ -309,16 +292,11 @@ function handleListEvalRuns(url: URL, res: ServerResponse): void {
     ).get(...condParams) as { total: number };
 
     jsonOk(res, { runs, total: countRow.total });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 function handleGetEvalRun(runId: string, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     // Fetch run
     const runRow = db.prepare(`
       SELECT
@@ -477,16 +455,11 @@ function handleGetEvalRun(runId: string, res: ServerResponse): void {
     };
 
     jsonOk(res, details);
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 function handleGetEvalRunMetrics(runId: string, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     const rows = db.prepare(`
       SELECT
         ems.id, ems.metric_name, ems.score, ems.threshold, ems.passed,
@@ -541,11 +514,7 @@ function handleGetEvalRunMetrics(runId: string, res: ServerResponse): void {
     }
 
     jsonOk(res, { metrics });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -553,8 +522,7 @@ function handleGetEvalRunMetrics(runId: string, res: ServerResponse): void {
 // ────────────────────────────────────────────────────────────────────
 
 function handleListABTests(url: URL, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     // Parse inside the try — invalid params answer 400, never throw uncaught.
     const filters = ListABTestsFilterSchema.parse({
       workspace: url.searchParams.get('workspace') ?? undefined,
@@ -636,16 +604,11 @@ function handleListABTests(url: URL, res: ServerResponse): void {
     }));
 
     jsonOk(res, { tests, total: tests.length });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 function handleGetABTest(testId: string, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     const testRow = db.prepare(`
       SELECT
         ab.id, ab.workspace, ab.variant_a_id, ab.variant_b_id,
@@ -736,11 +699,7 @@ function handleGetABTest(testId: string, res: ServerResponse): void {
     };
 
     jsonOk(res, details);
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -748,8 +707,7 @@ function handleGetABTest(testId: string, res: ServerResponse): void {
 // ────────────────────────────────────────────────────────────────────
 
 function handleListVariants(url: URL, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     // Parse inside the try — invalid params answer 400, never throw uncaught.
     const filters = ListVariantsFilterSchema.parse({
       workspace: url.searchParams.get('workspace') ?? undefined,
@@ -804,16 +762,11 @@ function handleListVariants(url: URL, res: ServerResponse): void {
     }));
 
     jsonOk(res, { variants, total: variants.length });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 function handleActivateVariant(variantId: string, body: unknown, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     // Validate-only parse (the schema carries no fields we consume here);
     // inside the try so an invalid body answers 400, never throws uncaught.
     ActivateVariantRequestSchema.parse(body);
@@ -842,11 +795,7 @@ function handleActivateVariant(variantId: string, body: unknown, res: ServerResp
     );
 
     jsonOk(res, { success: true, activated_at: Date.now() });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -854,8 +803,7 @@ function handleActivateVariant(variantId: string, body: unknown, res: ServerResp
 // ────────────────────────────────────────────────────────────────────
 
 function handleListOptimizations(url: URL, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     // Parse inside the try — invalid params answer 400, never throw uncaught.
     const filters = ListOptimizationsFilterSchema.parse({
       workspace: url.searchParams.get('workspace') ?? undefined,
@@ -943,16 +891,11 @@ function handleListOptimizations(url: URL, res: ServerResponse): void {
     }));
 
     jsonOk(res, { optimizations, total: optimizations.length });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 function handleGetOptimization(optimizationId: string, res: ServerResponse): void {
-  const db = initDb(getDbPath());
-  try {
+  withDb(res, (db) => {
     const runRow = db.prepare(`
       SELECT
         id, workspace, base_variant_id, strategy, target_metric,
@@ -1047,11 +990,7 @@ function handleGetOptimization(optimizationId: string, res: ServerResponse): voi
     };
 
     jsonOk(res, details);
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1082,11 +1021,16 @@ export const dashboardEvalsRouter: Router = async (req, url, res) => {
     return true;
   }
   if (req.method === 'GET' && url.pathname.startsWith('/api/dashboard/evals/runs/')) {
-    const runId = url.pathname.split('/').pop();
     if (url.pathname.endsWith('/metrics')) {
+      // Path is /api/dashboard/evals/runs/:id/metrics — the run id is the
+      // second-to-last segment, NOT .pop() (that would return 'metrics'
+      // itself, so handleGetEvalRunMetrics would query WHERE run_id =
+      // 'metrics' and always return an empty list).
+      const runId = url.pathname.split('/').slice(-2, -1)[0];
       handleGetEvalRunMetrics(runId!, res);
       return true;
     }
+    const runId = url.pathname.split('/').pop();
     handleGetEvalRun(runId!, res);
     return true;
   }

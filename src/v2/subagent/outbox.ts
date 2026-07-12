@@ -8,39 +8,57 @@ import {
   validatePayload,
   wrapInMemoryFence,
   newSubagentMessageId,
+  MESSAGE_COLUMNS,
+  parseMessageRow,
   type SubagentMessageInput,
   type SubagentMessageRow,
-  SubagentMessageRowSchema,
+  type SubagentMessageType,
+  type AnnouncementPayload,
+  type QueryPayload,
+  type SteerPayload,
+  type CompletePayload,
 } from './messages.js';
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
+// Tagged union mirroring the per-type Zod payload schemas in messages.ts.
+// `validatePayload`'s public signature returns `data: unknown` (frozen —
+// it's the shared validation entry point), so `toFenceableMessage` below is
+// the single, explicit bridge from that `unknown` into this proper union,
+// instead of fenceBody re-deriving the shape via manual typeof checks.
+type FenceableMessage =
+  | { type: 'announcement'; payload: AnnouncementPayload }
+  | { type: 'query'; payload: QueryPayload }
+  | { type: 'steer'; payload: SteerPayload }
+  | { type: 'complete'; payload: CompletePayload };
+
+function toFenceableMessage(type: SubagentMessageType, data: unknown): FenceableMessage {
+  return { type, payload: data } as FenceableMessage;
+}
+
 /**
  * Extract the primary user-facing string from a validated payload for memory
- * fencing. Returns the string we want to fence, per the spec:
+ * fencing, per the spec:
  *   announcement → summary
  *   query        → question
  *   steer        → instruction
  *   complete     → result_text ?? error_msg ?? '(no body)'
+ *
+ * summary/question/instruction are `z.string().min(1)` in messages.ts, so
+ * once `msg` has passed validatePayload, those fields are guaranteed
+ * present — no fallback needed for them. result_text/error_msg are both
+ * optional, so 'complete' keeps its fallback chain.
  */
-function fenceBody(
-  type: SubagentMessageInput['type'],
-  payload: unknown,
-): string {
-  if (typeof payload !== 'object' || payload === null) return '(no body)';
-  const p = payload as Record<string, unknown>;
-  switch (type) {
+function fenceBody(msg: FenceableMessage): string {
+  switch (msg.type) {
     case 'announcement':
-      return typeof p['summary'] === 'string' ? p['summary'] : '(no body)';
+      return msg.payload.summary;
     case 'query':
-      return typeof p['question'] === 'string' ? p['question'] : '(no body)';
+      return msg.payload.question;
     case 'steer':
-      return typeof p['instruction'] === 'string' ? p['instruction'] : '(no body)';
-    case 'complete': {
-      if (typeof p['result_text'] === 'string') return p['result_text'];
-      if (typeof p['error_msg'] === 'string') return p['error_msg'];
-      return '(no body)';
-    }
+      return msg.payload.instruction;
+    case 'complete':
+      return msg.payload.result_text ?? msg.payload.error_msg ?? '(no body)';
   }
 }
 
@@ -69,7 +87,7 @@ export function enqueue(
 
   const id = newSubagentMessageId();
   const now = Date.now();
-  const body = fenceBody(input.type, validation.data);
+  const body = fenceBody(toFenceableMessage(input.type, validation.data));
   const fenced = wrapInMemoryFence(body, input.fromTaskId, input.type);
   const payloadJson = JSON.stringify({ fenced, raw: validation.data });
 
@@ -175,20 +193,12 @@ export function getMessageById(
   messageId: string,
 ): SubagentMessageRow | null {
   const row = db.prepare(
-    `SELECT id, workflow_id, from_task_id, to_task_id,
-            message_type, payload_json, status, created_at, delivered_at
+    `SELECT ${MESSAGE_COLUMNS}
      FROM subagent_messages
      WHERE id = ?`,
   ).get(messageId);
 
   if (row === undefined) return null;
 
-  const parsed = SubagentMessageRowSchema.safeParse(row);
-  if (!parsed.success) {
-    process.stderr.write(
-      `[outbox] getMessageById parse error for ${messageId}: ${parsed.error.message}\n`,
-    );
-    return null;
-  }
-  return parsed.data;
+  return parseMessageRow(row, `outbox.getMessageById(id=${messageId})`);
 }

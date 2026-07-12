@@ -64,6 +64,23 @@ export function safeReadFile(filePath: string): string | null {
 }
 
 /**
+ * Resolve a discovery path (file or directory) to the list of files a parser should read.
+ * A file path is returned as-is. A directory is walked in mtime order, filtered by `fileRx`,
+ * with `skipNames` (lowercased basenames) excluded when the CLI has known sidecar files.
+ * Shared by the directory-based parsers (kimi, cursor, gemini, opencode).
+ */
+export function resolveFilesToParse(input: string, fileRx: RegExp, skipNames?: Set<string>): string[] {
+  if (isFile(input)) return [input];
+  if (isDir(input)) {
+    return walkFilesByMtime(input, (entry) => {
+      if (skipNames?.has(entry.toLowerCase())) return false;
+      return fileRx.test(entry);
+    });
+  }
+  return [];
+}
+
+/**
  * Recursively collect all files in `dir` matching the optional `predicate`.
  * The result is sorted by file mtime ascending so callers replay events in
  * roughly the order they were produced. Errors at any directory level are
@@ -190,6 +207,66 @@ export function maybeParseJson(value: unknown): unknown {
   } catch {
     return value;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Record-array / whole-file parsing pipeline
+// ---------------------------------------------------------------------------
+
+/**
+ * Map an array of unknown items into TailEvents via `recordFn`, skipping non-record
+ * items. Shared by every parser's "array of turns/messages/events" → TailEvent[] expansion
+ * (kimi, cursor, gemini, opencode). `Ctx` carries whatever per-buffer context the caller's
+ * `recordFn` needs (a fallback timestamp, in every current parser).
+ */
+export function eventsFromRecordArray<Ctx>(
+  arr: unknown[],
+  ctx: Ctx,
+  recordFn: (rec: Record<string, unknown>, ctx: Ctx) => TailEvent[],
+): TailEvent[] {
+  const out: TailEvent[] = [];
+  for (const item of arr) {
+    if (!isRecord(item)) continue;
+    out.push(...recordFn(item, ctx));
+  }
+  return out;
+}
+
+/**
+ * Standard `TailParser.parse()` shell: resolve session files, read each with
+ * `safeReadFile`, hand the buffer to `eventsFromBuffer`, and warn (never throw) on
+ * any failure. `makeCtx` is invoked once per file so callers needing per-file context
+ * can vary it; parsers that just need a fallback timestamp pass `() => Date.now()`.
+ */
+export function parseSessionFiles<Ctx>(
+  parserId: string,
+  filePath: string,
+  fileRx: RegExp,
+  skipNames: Set<string> | undefined,
+  makeCtx: () => Ctx,
+  eventsFromBuffer: (buffer: string, ctx: Ctx) => TailEvent[],
+): TailEvent[] {
+  const files = resolveFilesToParse(filePath, fileRx, skipNames);
+  if (files.length === 0) {
+    warnParse(parserId, `no readable session files at ${filePath}`);
+    return [];
+  }
+
+  const out: TailEvent[] = [];
+  for (const file of files) {
+    const buffer = safeReadFile(file);
+    if (buffer === null) {
+      warnParse(parserId, `unable to read ${file}`);
+      continue;
+    }
+    try {
+      out.push(...eventsFromBuffer(buffer, makeCtx()));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnParse(parserId, `event extraction failed (${file}): ${msg}`);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

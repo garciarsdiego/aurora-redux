@@ -173,14 +173,19 @@ export function stripJsonComments(src: string): string {
 // Snapshot extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
-const EMPTY_SNAPSHOT: OpencodeConfigSnapshot = Object.freeze({
-  configPath: null,
-  raw: Object.freeze({}) as Record<string, unknown>,
-  defaultModel: null,
-  declaredProviders: Object.freeze([]) as unknown as string[],
-  declaredModels: Object.freeze([]) as unknown as string[],
-  errors: Object.freeze([]) as unknown as string[],
-});
+// Factory (not a frozen singleton) so declaredProviders/declaredModels/errors
+// stay genuinely `string[]`-typed without an `as unknown as string[]` lie —
+// each call gets its own fresh, empty arrays instead of a shared frozen one.
+function emptySnapshot(): OpencodeConfigSnapshot {
+  return {
+    configPath: null,
+    raw: {},
+    defaultModel: null,
+    declaredProviders: [],
+    declaredModels: [],
+    errors: [],
+  };
+}
 
 function extractDefaultModel(raw: Record<string, unknown>): string | null {
   const direct = raw['defaultModel'];
@@ -240,7 +245,7 @@ export function readOpencodeConfig(
     }
   }
 
-  if (found.length === 0) return EMPTY_SNAPSHOT;
+  if (found.length === 0) return emptySnapshot();
 
   const primary = found[0];
   const additional = found.slice(1);
@@ -297,11 +302,15 @@ export function readOpencodeConfig(
 // Resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NONE_RESULT: OpencodeModelResolution = Object.freeze({
-  model: null,
-  source: 'none',
-  warnings: Object.freeze(['No model resolvable']) as unknown as string[],
-});
+// Factory for the same reason as emptySnapshot() above — a fresh `warnings`
+// array per call avoids the readonly-array cast a frozen singleton would need.
+function noneResult(): OpencodeModelResolution {
+  return {
+    model: null,
+    source: 'none',
+    warnings: ['No model resolvable'],
+  };
+}
 
 function trimOrNull(value: string | null | undefined): string | null {
   if (typeof value !== 'string') return null;
@@ -372,7 +381,7 @@ export function resolveOpencodeModelForWorkflow(
   // Nothing resolvable. Preserve any snapshot warnings, append the canonical
   // "no model" message expected by tests + downstream UX.
   if (warnings.length === 0) {
-    return NONE_RESULT;
+    return noneResult();
   }
   return Object.freeze({
     model: null,

@@ -67,10 +67,11 @@ export async function runToolCallTask(task: Task, signal?: AbortSignal): Promise
   const rawToolName = inputCtx['tool_name'];
   const toolName = (typeof rawToolName === 'string' ? rawToolName : undefined) ?? task.tool_name ?? '';
   if (!toolName) throw new Error(`tool_call task '${task.name}' has no tool_name`);
+  // Only default to {} when args is absent (null/undefined) — any other
+  // value (string, number, ...) must flow through to schema validation so
+  // a malformed `args` fails loudly instead of silently running with {}.
   const rawArgs = inputCtx['args'];
-  const args = rawArgs !== null && typeof rawArgs === 'object'
-    ? rawArgs as Record<string, unknown>
-    : {};
+  const args = (rawArgs ?? {}) as Record<string, unknown>;
 
   // WS3 — per-task tool allowlist. When the task declares `allowed_tools`, deny
   // any tool outside it BEFORE resolution/execution (auto-deny the rest). This

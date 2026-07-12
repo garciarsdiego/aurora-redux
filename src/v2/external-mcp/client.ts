@@ -43,6 +43,7 @@ import {
   type ExternalMcpTool,
   type ExternalMcpCallResult,
   prefixToolName,
+  parsePrefixedToolName,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -101,7 +102,7 @@ export function decryptBearer(envelope: string): string {
   if (parts.length !== 3) {
     throw new Error('invalid bearer_enc envelope (expected iv:tag:ct hex)');
   }
-  const [ivHex, tagHex, ctHex] = parts as unknown as [string, string, string];
+  const [ivHex, tagHex, ctHex] = parts;
   const key = readOrCreateMasterKey();
   const iv = Buffer.from(ivHex, 'hex');
   const tag = Buffer.from(tagHex, 'hex');
@@ -369,16 +370,14 @@ export class ExternalMcpManager {
     args: Record<string, unknown>,
     db?: Database,
   ): Promise<ExternalMcpCallResult> {
-    const match = /^mcp:([^:]+):(.+)$/.exec(prefixed);
-    if (!match) {
+    const parsed = parsePrefixedToolName(prefixed);
+    if (!parsed) {
       throw new Error(
         `invalid external MCP tool name: "${prefixed}" (expected mcp:<server>:<tool>)`,
       );
     }
-    const serverName = match[1] as string;
-    const toolName = match[2] as string;
-    const conn = await this.getConnection(serverName, db);
-    return this.client.callTool(conn, toolName, args);
+    const conn = await this.getConnection(parsed.serverName, db);
+    return this.client.callTool(conn, parsed.toolName, args);
   }
 
   /**
@@ -405,7 +404,7 @@ export class ExternalMcpManager {
     name: string,
     db?: Database,
   ): Promise<ExternalMcpConnection> {
-    const { servers: _ignored, ownsDb, dbHandle } = this.resolveServers(db);
+    const { ownsDb, dbHandle } = this.resolveDb(db);
     try {
       const server = getServer(dbHandle, name);
       if (!server) {
@@ -422,15 +421,23 @@ export class ExternalMcpManager {
     }
   }
 
+  /**
+   * Open (or reuse) a DB handle without listing servers. Used by
+   * openConnection, which only needs a single row via getServer() —
+   * listServers() would run a full SELECT of every active server just to
+   * obtain a handle.
+   */
+  private resolveDb(db?: Database): { ownsDb: boolean; dbHandle: Database } {
+    if (db) return { ownsDb: false, dbHandle: db };
+    return { ownsDb: true, dbHandle: initDb(getDbPath()) };
+  }
+
   private resolveServers(db?: Database): {
     servers: ExternalMcpServer[];
     ownsDb: boolean;
     dbHandle: Database;
   } {
-    if (db) {
-      return { servers: listServers(db, true), ownsDb: false, dbHandle: db };
-    }
-    const dbHandle = initDb(getDbPath());
-    return { servers: listServers(dbHandle, true), ownsDb: true, dbHandle };
+    const { ownsDb, dbHandle } = this.resolveDb(db);
+    return { servers: listServers(dbHandle, true), ownsDb, dbHandle };
   }
 }

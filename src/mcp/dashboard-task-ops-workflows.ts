@@ -86,8 +86,9 @@ export function prepareDashboardTaskRetryInPlace(
     .map((dagTask, index) => selectedDagIds.has(dagTask.id) ? tasks[index]?.id : null)
     .filter((id): id is string => Boolean(id));
   if (selectedTaskIds.length === 0) throw new Error('No tasks selected for retry');
+  const selectedTaskIdSet = new Set(selectedTaskIds);
 
-  const runningSelected = tasks.filter((task) => selectedTaskIds.includes(task.id) && task.status === 'running');
+  const runningSelected = tasks.filter((task) => selectedTaskIdSet.has(task.id) && task.status === 'running');
   if (runningSelected.length > 0) {
     throw new Error(`Cannot retry running tasks: ${runningSelected.map((task) => task.id).join(', ')}`);
   }
@@ -101,7 +102,7 @@ export function prepareDashboardTaskRetryInPlace(
       WHERE workflow_id = ? AND id = ?`,
   );
   for (const task of tasks) {
-    if (!selectedTaskIds.includes(task.id)) continue;
+    if (!selectedTaskIdSet.has(task.id)) continue;
     const normalized = normalizeCliExecutorHintForModel(task.kind, task.executor_hint, task.model);
     if (normalized !== (task.executor_hint ?? null)) {
       withSqliteRetrySync(() => normalizeSelected.run(normalized, workflowId, task.id));

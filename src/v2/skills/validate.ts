@@ -29,16 +29,11 @@ export function validateSkillDefinition(content: string): ValidateSkillResult {
     return { valid: errors.length === 0, errors };
   }
 
-  let raw: Record<string, unknown>;
-  try {
-    // Minimal inline YAML parse — only handles simple key: value pairs to
-    // avoid pulling js-yaml at validation time (callers may not have it).
-    // For full YAML support the registry uses js-yaml directly.
-    raw = parseSimpleYaml(match[1]);
-  } catch {
-    errors.push('Frontmatter YAML is not parseable');
-    return { valid: false, errors };
-  }
+  // Minimal inline YAML parse — only handles simple key: value pairs to
+  // avoid pulling js-yaml at validation time. parseSimpleYaml is pure
+  // string splitting and never throws. For full YAML support the registry
+  // uses js-yaml directly.
+  const raw = parseSimpleYaml(match[1]);
 
   if (!raw['name'] || typeof raw['name'] !== 'string' || !raw['name'].trim()) {
     errors.push("Frontmatter missing required field 'name'");

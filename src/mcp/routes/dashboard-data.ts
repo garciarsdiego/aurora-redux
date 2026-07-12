@@ -555,7 +555,10 @@ async function handleDashboardConfig(body: unknown, res: ServerResponse): Promis
   const db = initDb(getDbPath());
   try {
     const input = body as { key?: string; value?: unknown };
-    if (!input?.key || !input.value) {
+    // Explicit undefined/null check — a bare falsy check would also reject
+    // legitimate values like 0, false, or '' and silently no-op instead of
+    // persisting them.
+    if (!input?.key || input.value === undefined || input.value === null) {
       jsonOk(res, { current: dashboardConfigState(db), advisor_modes: getDashboardAdvisorModes(db) });
       return;
     }
@@ -575,6 +578,14 @@ async function handleDashboardConfig(body: unknown, res: ServerResponse): Promis
         current: dashboardConfigState(db),
         auto_tag_overrides: overrides,
       });
+      return;
+    }
+    // Generic keys persist as a raw string (setConfigTool writes it straight
+    // into process.env / .env), so an object/array value would silently
+    // coerce to the useless '[object Object]' via String() below — reject
+    // it instead of writing garbage into config.
+    if (typeof input.value === 'object') {
+      badRequest(res, `Invalid value for key '${input.key}': expected a string, number, or boolean`);
       return;
     }
     const text = await setConfigTool({ key: input.key, value: String(input.value) });

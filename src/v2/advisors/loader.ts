@@ -32,7 +32,12 @@ import './version/index.js';
 
 import { registry } from './index.js';
 
-/** Snapshot of registered advisor names. Useful for MCP tool fan-out. */
+/**
+ * Snapshot of registered advisor names. Useful for MCP tool fan-out.
+ * Intentional public API: no internal caller yet (src/executors/advisor.ts
+ * only needs getAdvisor + the side-effect imports above) — kept exported
+ * for external/MCP consumers rather than removed.
+ */
 export function listAdvisorNames(): string[] {
   return [...registry.keys()].sort();
 }

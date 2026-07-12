@@ -81,9 +81,14 @@ export async function saveArtifact(
 export async function loadArtifactContent(artifact: Artifact): Promise<string> {
   if (artifact.content_inline !== null) return artifact.content_inline;
   if (artifact.content_path !== null) return readFile(artifact.content_path, 'utf-8');
-  // Every artifact row must carry one of the two — both null means the
-  // record is corrupted; fail loudly instead of masking it with ''.
-  throw new Error(`Artifact ${artifact.id} has neither content_inline nor content_path`);
+  // Every artifact row is expected to carry one of the two — both null means
+  // the record is corrupted. Callers (e.g. collectUpstreamArtifacts) rely on
+  // the old "empty content" contract with a plain `if (!content) continue;`
+  // and have no try/catch around this call, so throwing here would crash the
+  // whole task instead of just skipping the bad artifact. Warn and degrade
+  // gracefully instead.
+  console.warn(`[artifacts] Artifact ${artifact.id} has neither content_inline nor content_path — treating as empty`);
+  return '';
 }
 
 export async function loadArtifactsForTask(

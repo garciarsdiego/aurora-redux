@@ -54,6 +54,51 @@ function readTaskRow(
     .get(taskId) as TaskStatusRow;
 }
 
+/** Aborts the AbortController registered for `id`, if any. Returns whether one was found. */
+function abortIfRegistered(id: string): boolean {
+  const ac = _controllerMap.get(id);
+  if (ac === undefined) return false;
+  ac.abort();
+  return true;
+}
+
+/**
+ * Shared terminal-state transition used by both kill() and
+ * broadcastCancelToWorkflow(): aborts the task's controller if registered,
+ * flips tasks.status to a terminal value, marks any still-active
+ * subagent_runs 'killed', and cancels pending mailbox messages for the
+ * task. Callers remain responsible for their own insertEvent calls — kill()
+ * and broadcastCancelToWorkflow() emit different event types/payloads, one
+ * of which needs the message count this function returns.
+ */
+function terminateTaskState(
+  db: Database.Database,
+  taskId: string,
+  taskStatus: 'failed' | 'cancelled',
+  errorMsg: string,
+  now: number,
+): { had_controller: boolean; messages_cancelled: number } {
+  const had_controller = abortIfRegistered(taskId);
+
+  withSqliteRetrySync(() =>
+    db.prepare(
+      `UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?`,
+    ).run(taskStatus, now, taskId),
+  );
+
+  withSqliteRetrySync(() =>
+    db.prepare(
+      `UPDATE subagent_runs
+        SET status = 'killed', error_msg = ?, ended_at = ?
+      WHERE task_id = ? AND status IN ('pending', 'running')`,
+    ).run(errorMsg, now, taskId),
+  );
+
+  const messages_cancelled = cancelPendingForTask(db, taskId);
+
+  return { had_controller, messages_cancelled };
+}
+
 // ─── steer ─────────────────────────────────────────────────────────────────
 
 export function steer(
@@ -79,10 +124,7 @@ export function steer(
     payload: { instruction, source: 'control_api' },
   });
 
-  const ac = _controllerMap.get(taskId);
-  if (ac !== undefined) {
-    ac.abort();
-  }
+  abortIfRegistered(taskId);
 
   return 'accepted';
 }
@@ -98,18 +140,8 @@ export function kill(
   if (row === undefined) return 'not_found';
   if (TERMINAL_STATUSES.has(row.status)) return 'already_done';
 
-  const ac = _controllerMap.get(taskId);
-  if (ac !== undefined) {
-    ac.abort();
-  }
-
   const now = Date.now();
-
-  withSqliteRetrySync(() =>
-    db.prepare(
-      "UPDATE tasks SET status = 'failed', completed_at = ? WHERE id = ?",
-    ).run(now, taskId),
-  );
+  const { messages_cancelled } = terminateTaskState(db, taskId, 'failed', reason, now);
 
   insertEvent(db, {
     workflow_id: row.workflow_id,
@@ -118,25 +150,16 @@ export function kill(
     payload: { reason },
   });
 
-  withSqliteRetrySync(() =>
-    db.prepare(
-      `UPDATE subagent_runs
-       SET status = 'killed', error_msg = ?, ended_at = ?
-     WHERE task_id = ? AND status IN ('pending', 'running')`,
-    ).run(reason, now, taskId),
-  );
-
   // Killed tasks must not leave dangling messages in the queue (R-HIGH-4).
   // Cancel both outbound (from_task_id=killedTaskId) and inbound
   // (to_task_id=killedTaskId) — the consumer is dead, the producer's
   // results no longer feed anything downstream.
-  const cancelled = cancelPendingForTask(db, taskId);
-  if (cancelled > 0) {
+  if (messages_cancelled > 0) {
     insertEvent(db, {
       workflow_id: row.workflow_id,
       task_id: taskId,
       type: 'subagent_messages_cancelled',
-      payload: { count: cancelled, cause: 'task_killed' },
+      payload: { count: messages_cancelled, cause: 'task_killed' },
     });
   }
 
@@ -183,29 +206,16 @@ export function broadcastCancelToWorkflow(
   let messagesCancelled = 0;
 
   for (const row of rows) {
-    const ac = _controllerMap.get(row.id);
-    if (ac !== undefined) {
-      ac.abort();
-      controllersAborted++;
-    }
-
-    withSqliteRetrySync(() =>
-      db.prepare(
-        "UPDATE tasks SET status = 'cancelled', completed_at = ? WHERE id = ?",
-      ).run(now, row.id),
+    const { had_controller, messages_cancelled } = terminateTaskState(
+      db,
+      row.id,
+      'cancelled',
+      reason ?? 'workflow_cancelled',
+      now,
     );
+    if (had_controller) controllersAborted++;
     tasksCancelled++;
-
-    withSqliteRetrySync(() =>
-      db.prepare(
-        `UPDATE subagent_runs
-          SET status = 'killed', error_msg = ?, ended_at = ?
-        WHERE task_id = ? AND status IN ('pending', 'running')`,
-      ).run(reason ?? 'workflow_cancelled', now, row.id),
-    );
-
-    const cancelled = cancelPendingForTask(db, row.id);
-    messagesCancelled += cancelled;
+    messagesCancelled += messages_cancelled;
 
     insertEvent(db, {
       workflow_id: workflowId,
@@ -213,9 +223,9 @@ export function broadcastCancelToWorkflow(
       type: 'task_cancelled_by_workflow',
       payload: {
         reason: reason ?? null,
-        had_controller: ac !== undefined,
+        had_controller,
         prior_status: row.status,
-        messages_cancelled: cancelled,
+        messages_cancelled,
       },
     });
   }

@@ -17,16 +17,11 @@ export function pathsOverlap(a: string[], b: string[]): boolean {
       const cleanB = prefixB ? pb.slice(0, -2) : pb;
       if (cleanA === cleanB) return true;
 
-      // Check prefix overlap
+      // Check prefix overlap. When both sides are globs, one prefix
+      // containing the other is already caught here: pb (or pa) still
+      // starts with the shorter prefix even with its own "/*" suffix.
       if (prefixA && pb.startsWith(prefixA)) return true;
       if (prefixB && pa.startsWith(prefixB)) return true;
-      if (prefixA && prefixB) {
-        if (prefixA.startsWith(prefixB) || prefixB.startsWith(prefixA))
-          return true;
-      }
-
-      // Exact file path match
-      if (pa === pb) return true;
     }
   }
   return false;

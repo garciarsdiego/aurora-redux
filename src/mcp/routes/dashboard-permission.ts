@@ -16,11 +16,9 @@
 
 import type { ServerResponse } from 'node:http';
 
-import { initDb } from '../../db/client.js';
-import { getDbPath } from '../../utils/config.js';
 import { insertEvent } from '../../db/persist.js';
 import type { Router } from './types.js';
-import { badRequest, jsonOk, readJsonBody } from './_shared.js';
+import { badRequest, jsonOk, readJsonBody, withDb } from './_shared.js';
 
 interface DecideBody {
   ask_id?: unknown;
@@ -95,13 +93,12 @@ async function handleDecide(req: Parameters<Router>[0], res: ServerResponse): Pr
     : parsed.agent_id;
   const tool = typeof body.tool === 'string' && body.tool.length > 0 ? body.tool : parsed.tool;
 
-  const db = initDb(getDbPath());
   const now = Date.now();
   let recorded = false;
   let alreadyDecided = false;
   let existingDecision: string | null = null;
   let existingDecidedBy: string | null = null;
-  try {
+  withDb(res, (db) => {
     // Upsert: insert if absent (a decision is allowed even when the ask wasn't
     // pre-recorded, since the ask itself flows through events not this table).
     // If a row already exists with a non-null decision, the second call is a
@@ -160,11 +157,7 @@ async function handleDecide(req: Parameters<Router>[0], res: ServerResponse): Pr
       already_decided: alreadyDecided,
       recorded,
     });
-  } catch (err) {
-    badRequest(res, err instanceof Error ? err.message : String(err));
-  } finally {
-    db.close();
-  }
+  });
 }
 
 export const dashboardPermissionRouter: Router = async (req, url, res) => {
